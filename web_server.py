@@ -7065,6 +7065,18 @@ def _list_available_download_sources() -> tuple:
         if client:
             sources.append(_make_entry(download_mode))
 
+    # [usenet-debug] which sources the search will actually query, and the
+    # usenet is_configured() verdict — remove once the usenet issue is root-caused.
+    try:
+        _u = download_orchestrator.client('usenet')
+        logger.info(
+            "[usenet-debug] available sources (mode=%s): %s | usenet client=%s is_configured=%s",
+            download_mode, [s['id'] for s in sources],
+            _u is not None, (_u.is_configured() if _u else 'n/a'),
+        )
+    except Exception as _e:
+        logger.info("[usenet-debug] availability log failed: %s", _e)
+
     return download_mode, sources
 
 
