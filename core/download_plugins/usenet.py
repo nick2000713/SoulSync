@@ -97,7 +97,14 @@ class UsenetDownloadPlugin(DownloadSourcePlugin):
         timeout: Optional[int] = None,
         progress_callback=None,
     ) -> Tuple[List[TrackResult], List[AlbumResult]]:
+        # [usenet-debug] temporary diagnostics for "search returns no usenet
+        # results until the usenet_client test is run" — remove once root-caused.
         if not self._prowlarr.is_configured():
+            logger.info(
+                "[usenet-debug] search(%r) SKIPPED — prowlarr not configured "
+                "(url=%s, api_key=%s)",
+                query, bool(self._prowlarr._url), bool(self._prowlarr._api_key),
+            )
             return ([], [])
         try:
             indexer_ids = _parse_indexer_id_filter()
@@ -109,7 +116,18 @@ class UsenetDownloadPlugin(DownloadSourcePlugin):
         except Exception as e:
             logger.error("Usenet plugin search failed: %s", e)
             return ([], [])
-        return self._project_results(results)
+        tracks, albums = self._project_results(results)
+        # [usenet-debug] how many Prowlarr rows came back vs survived the
+        # protocol=='usenet' projection — pinpoints "no results" vs "filtered out".
+        protocols = {}
+        for r in results:
+            protocols[r.protocol] = protocols.get(r.protocol, 0) + 1
+        logger.info(
+            "[usenet-debug] search(%r): prowlarr_rows=%d by_protocol=%s "
+            "usenet_tracks_after_projection=%d indexer_filter=%s",
+            query, len(results), protocols or "{}", len(tracks), indexer_ids or "all",
+        )
+        return tracks, albums
 
     def _project_results(
         self, results: List[ProwlarrSearchResult]
