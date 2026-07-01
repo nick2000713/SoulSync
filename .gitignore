@@ -28,5 +28,7 @@ bin/
 
 # Development compose/config files
 *.dev.yml
+docker-compose.local-image.yml
+*-container-inspect.json
 # Any hidden folders
 **/.*/
