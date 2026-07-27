@@ -1926,6 +1926,8 @@ dieselben Änderungen in folgenden eigenständigen Commits:
 ### Bewusst offen oder zurückgestellt — nicht automatisch Release-Blocker
 
 - T-06 Genre-Beschaffungsvertrag (Nutzerentscheidung: offen lassen);
+- T-08 UI-Bezeichnung/Abgrenzung von „Refresh & Scan“ gegenüber dem
+  separaten Provider-/Discography-Enrich bleibt Partial;
 - Artwork-Negativcache für bildlose Entities;
 - generischer Track-Zeilen-Fold; die konkrete Test-DB wird nicht repariert;
 - F-09 Playlist-UI und F-12 Acquisition-Review-UI;
