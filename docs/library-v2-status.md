@@ -11,17 +11,17 @@ Orphan-Approve-Materialisierung, F-10-Korrelation, Artwork-Kaltstart-
 Nachlieferung), §26 (nativer Subject-Row-Versatz in den Repair-Scannern,
 Abbau der vorbestehenden Testfehler), §27 (erster Lauf gegen einen Snapshot
 der Produktiv-DB, Album-Twin-Scan für jeden Artist, Frontend-Gate), §28
-(Reconcile-Unmapped-Artists-Diagnose: Namens-only-Matching, fehlender
-Cooldown — beide Pending, Korrektur folgt vor dem geplanten
-Post-Import-Autotrigger), §29 (Werkzeug-↔-V2-Konvergenz: Legacy-Findings,
+(Reconcile-Unmapped-Artists-Diagnose), §29 (Werkzeug-↔-V2-Konvergenz:
+Legacy-Findings,
 Cover-/Tag-Schreibpfad, Verification-Spalte — fünf Korrekturen, Genre-Lücke
-als Produktentscheidung offen) sowie §34–§36 (Live-Feedback iss27-12/13/14,
+als Produktentscheidung offen), §30 (Strong-ID-Reconcile, Cooldown,
+Post-Import-Trigger und abgeschlossener Deep-Dive über alle 25 Repair-Jobs)
+sowie §34–§36 (Live-Feedback iss27-12/13/14,
 Multi-Provider-Track-Reconcile, sofortige UI-Neuladung und Python-3.14-
 Async-Deadlock) und §37 (Abschluss der offenen F-13/F-15/UI-03/UI-05-
 Oberflächenpunkte plus zwei unabhängige Webclient-Fehler).
-Playlist UI bleibt geparkt. Der werkzeugweise Integrations-Deep-Dive über alle
-25 registrierten Repair-Jobs ist beauftragt und offen
-([issues.md §18](library-v2-issues.md#18-auftrag-werkzeugweiser-integrations-deep-dive-offen-nach-17)).
+Playlist UI bleibt geparkt. Der in Issues §18 beauftragte werkzeugweise
+Integrations-Deep-Dive ist laut §30 abgeschlossen.
 
 ## 1. Statusbegriffe
 
@@ -49,8 +49,8 @@ Der Release-Gate-Stand steht in Abschnitt 8.
 | [F-04](library-v2-features.md#feat-discography) | Discography, Tracklists, `monitor_new_items` | Verified | `2249f5d7`, `8f965d31` (später gesquasht) | Content-Filter und nie manuell expandierte Artists abgedeckt |
 | [F-05](library-v2-features.md#feat-bootstrap) | Automatischer Initialimport | Verified | Review 4/5, `c2d99eda`, `e9730afe` | Bounded Transactions und Streaming; Owner-/Fresh-Install-Fixes im Regression-Checkpoint |
 | [F-06](library-v2-features.md#feat-alias) | Artist Alias Registry und Scope | Verified | `ce7b4516`, `a95e5309` | Listen, Suche, Totals und artist-weite Actions gezielt geprüft |
-| [F-07](library-v2-features.md#feat-duplicate) | Artist-/Album-/Edition-Dedup | Implemented | §62/§63, P3, §27 | Album-Twin-Pass läuft seit §27 für jeden Artist, nicht nur für Merge-Survivor; Dry Run gegen die Produktiv-DB gelaufen. Rest: Track-Zeilen-Duplikate (§27 Teil 3) brauchen eine Produktentscheidung |
-| [F-08](library-v2-features.md#feat-unmapped) | V2-native/Collaboration Artists | Implemented | §68, Regression M-11, §28 | Enrich/Smart-Split und globale Suche abgedeckt; Reconcile-Job bleibt namensbasiert ohne Strong-ID-Cross-Check und ohne Cooldown, siehe §28 |
+| [F-07](library-v2-features.md#feat-duplicate) | Artist-/Album-/Edition-Dedup | Implemented | §62/§63, P3, §27/§30 | Album-Twin-Pass läuft seit §27 für jeden Artist; Dry Run gegen die Produktiv-DB gelaufen. Ein generischer Track-Zeilen-Fold ist nach Nutzerentscheidung zurückgestellt, weil die beobachtete lokale DB Testmaterial ist |
+| [F-08](library-v2-features.md#feat-unmapped) | V2-native/Collaboration Artists | Verified | §68, Regression M-11, §28/§30 | Enrich/Smart-Split und globale Suche abgedeckt; Strong-ID-Cross-Check, Cooldown und entprellter Post-Import-Trigger umgesetzt und gezielt geprüft |
 | [F-09](library-v2-features.md#feat-playlists) | Library-v2-Playlist-Oberfläche | Deferred | `library-v2-playlist-ui` | Vollständig aus dem aktiven Overhaul entfernt und separat geparkt |
 | [F-10](library-v2-features.md#feat-history) | Korrelierte Pipeline-History | Implemented | §35/§37/§57/§58, §17, §23 | Feed, File-Ergebnis und Albumzweig vorhanden; `previous_file_replaced` (§17) sowie `human_verified`/`rejected` über die neue `library_history`-Korrelation (§23) im Eventvokabular. Rest: kein Backfill für Altzeilen |
 | [F-11](library-v2-features.md#feat-playback) | Track Playback / Preview | Implemented | §36, Regression H-14 | Bestehender Player reused; typisierte ID-Korrektur im Regression-Checkpoint |
@@ -394,7 +394,9 @@ oder nicht erneut auf dem finalen Clean HEAD belegt sind:
 - produktiver LV2-012/LV2-017 Datenrepair ausschließlich nach Dry Run — der
   Dry Run ist in §27 Teil 1 gelaufen (LV2-012: keine Merge-Kandidaten;
   LV2-017: kein Drift), der schreibende Lauf bleibt offen;
-- F-12 Acquisition-Review-Browser-E2E mit mehrdeutigem Bundle und Restart;
+- mehrdeutiger Bundle-Import und Restart über die gemeinsame
+  Acquisition-Pipeline; ein F-12-Browser-E2E ist nach der ausdrücklichen
+  Entfernung der Acquisition-Review-UI kein Gate mehr;
 - ~~Bestätigung oder Widerlegung des Quarantäne-Approve-Orphan-Bugs~~ —
   bestätigt (§16) und korrigiert (§22).
 
@@ -478,7 +480,7 @@ Pending-Tabellen zurückwandern:
 | M3U/Roster Export | Deferred |
 | Track Redownload Modal | Deferred |
 | Reidentify / I Have This | Deferred |
-| Resizable Columns | Deferred |
+| Resizable Columns | Implemented / Verified in §37 |
 
 ---
 
@@ -1833,7 +1835,104 @@ Features, Issues und den realen Codefluss geprüft und umgesetzt.
   Build, Ruff, `compileall` und `git diff --check`: grün.
 
 Die absichtlichen Nicht-Features und externen Release-Gates ändern sich
-dadurch nicht: T-06 (Genre-Lücke), Artwork-Negativcache,
-Track-Duplikat-Produktentscheidung, Live-Prowlarr/Download-Clients sowie
-Restart- und Windows-/Docker-Path-Mapping-Runtime-Gates bleiben bei ihrem
-zuvor dokumentierten Stand.
+dadurch nicht: T-06 (Genre-Lücke), Artwork-Negativcache, der bewusst
+zurückgestellte generische Track-Zeilen-Fold, Live-Prowlarr/Download-Clients
+sowie Restart- und Windows-/Docker-Path-Mapping-Runtime-Gates bleiben bei
+ihrem zuvor dokumentierten Stand.
+
+## 38. Vertiefter Abschluss-Audit und Python-3.14-Runtime-Härtung — Verified, 27. Juli 2026
+
+Ein weiterer statischer und dynamischer Audit hat die bestehenden
+Library-v2-Verträge an mehreren Systemgrenzen abgesichert:
+
+- Track-Versionen verwenden nun dieselbe Qualifier-Erkennung für Klammer-
+  und Dash-Schreibweisen. Das verhindert falsche Quarantäne bei realen
+  Remix-/Edit-/Slowed-/Clean-/Explicit-Titeln, ohne normale Bindestrich-Titel
+  zu beschädigen.
+- Exakte Provider-ID-Lookups erkennen `allow_fallback` vor dem Aufruf über
+  die Signatur. Interne Provider-`TypeError`s können keine zweite,
+  unkontrollierte Fallbacksuche mehr auslösen.
+- Die parallele Artist-Bildsuche respektiert deterministisch die
+  konfigurierte Quellenpriorität, auch wenn eine Fallbackquelle schneller
+  dieselbe URL liefert.
+- Server-seitige Torrent-Downloads verwenden einen begrenzten gemeinsamen
+  Worker-Pool, ohne den Default-Executor des Besitzer-Loops anzulegen. Damit
+  beendet Python 3.14.6 den längeren Testprozess sauber.
+- Wishlist-Retry-Backoff versteht die kanonische
+  `track_id::album_id`-Identität und bewahrt die Abwärtskompatibilität alter
+  bare Track-IDs.
+- Native Findings enthalten durchgehend navigierbare Artist-IDs; der
+  qBittorrent-Adapter besitzt nur noch eine getestete Share-Limit-
+  Implementierung. Ruff-Funde zu Closure-Capture, nicht-striktem `zip()` und
+  stummen Exceptions wurden ebenfalls beseitigt.
+
+Verifikation:
+
+- Library-v2: **1.078 passed**;
+- Backend-Komplettlauf vor den letzten zwei isolierten Testhärtungen:
+  **12.285 passed, 3 skipped, 2 deselected, 2 failed** in rund zehn Minuten;
+- beide verbliebenen Fehler danach gezielt behoben und verifiziert:
+  Wishlist **51 passed**, Async-/Candidate-/Torrent-Scope **79 passed**;
+- weitere betroffene Scopes: Titelmatching **31 passed**,
+  Provider/Monitor **40 passed**, Adapter/Wishlist/Expiry **68 passed**,
+  Repair **19 passed**, native Findings **78 passed**;
+- WebUI: **301 passed** in 50 Dateien; `npm run check` und Production Build
+  grün;
+- Ruff grün; abschließende schnelle Syntax-/Diff-Prüfungen grün.
+
+Der redundante zehnminütige Backend-Komplettlauf wurde nach den zwei
+zielgenauen Fixes auf Benutzerwunsch nicht erneut gestartet. Die bekannten
+nicht-blockierenden Warnungen bleiben die `sqlite3`-Datetime-Deprecation und
+der bestehende Vite-Chunkgrößenhinweis. Die absichtlichen Nicht-Features und
+externen Release-Gates aus §37 bleiben unverändert offen.
+
+## 39. Scope-Korrektur, offene Arbeit und PR-Split (27. Juli 2026)
+
+Der Audit-Commit `38833e12a` war fachlich zu breit: Er enthielt
+Library-v2-Katalog-/Identity-Fixes, gemeinsam genutzte Pipeline-Fixes,
+Torrent/qBittorrent-Infrastruktur, Diagnose-Logging, Teststabilisierung und
+eine reine Formatter-Änderung. Das widerspricht nicht der Reuse-First-Regel,
+wohl aber der Split-Regel aus Guide §3.5: Generische Verbesserungen sollen
+separat reviewbar bleiben.
+
+Der nicht-destruktive Split-Branch `library-overhaul-audit-split` bewahrt
+dieselben Änderungen in folgenden eigenständigen Commits:
+
+| Commit | Scope | Eigenständige PR |
+|---|---|---|
+| `9a52fa158` | Library-v2: exakte Provider-Tracklists und providerqualifizierte Monitor-IDs | Library V2 |
+| `722c42656` | Geteiltes Titelmatching/Audio-Verifikation | Main Pipeline |
+| `52f2dd687` | Geteilter Artist-Image-Providerstack | Metadata |
+| `de7bd3413` | Wishlist Composite-Identität und Retry-Backoff | Wishlist/Foundation |
+| `665106aa7` | Library-v2-Navigation aus Repair-Findings | Library V2 / Repair |
+| `66845eeb1` | Torrent-Fetch ohne Event-Loop-Default-Executor | Torrent, sauber separat |
+| `690879453` | qBittorrent Share-Limit-Duplikat und API-Vertrag | qBittorrent, sauber separat |
+| `e24eb151f` | Diagnose-Logging für zuvor stumme Fallbacks | Main Pipeline |
+| `6dab08a95` | Wall-clock-/Timing-unabhängige Regressionstests | Test-Infrastruktur |
+| `6cb9cd854` | Rein mechanische WebUI-Formatierung | Style |
+
+### Tatsächlich noch zu erledigen vor einem Production Release
+
+- vollständige Backend-Suite auf dem finalen Clean HEAD;
+- reale Soulseek-/Torrent-/Usenet- und Prowlarr/SABnzbd/NZBGet-E2E-Läufe;
+- Restart-/Failure-Injection während Transfer, Quarantäne, Bootstrap,
+  gemeinsamem Bundle-Import und Repair-Apply;
+- Fresh-Install-/Upgrade- und großer Produktiv-DB-Soak;
+- Windows-/Docker-Pfad-Mappings sowie ungesunder bzw. read-only Storage-Root;
+- realer Post-Import-Reconcile-Trigger während laufender Importe;
+- produktive LV2-012-/LV2-017-Reparatur nur, falls ein erneuter
+  backup-gestützter Dry Run überhaupt Kandidaten findet.
+
+### Bewusst offen oder zurückgestellt — nicht automatisch Release-Blocker
+
+- T-06 Genre-Beschaffungsvertrag (Nutzerentscheidung: offen lassen);
+- Artwork-Negativcache für bildlose Entities;
+- generischer Track-Zeilen-Fold; die konkrete Test-DB wird nicht repariert;
+- F-09 Playlist-UI und F-12 Acquisition-Review-UI;
+- F-10-History-Backfill für Altzeilen;
+- physische Entfernung der `legacy_*`-IDs und Legacy-Importer bis zu einem
+  expliziten Migrations-/Rollback-Fenster;
+- Fanart.tv als neuer Provider sowie M3U/Roster Export, Track-Redownload,
+  Reidentify/„I Have This“, Provider-Modal-Merge und konfigurierbare
+  Interactive-Search-Spalten;
+- restliche BR-09-SQL-Helper-/Scope-/Progress-Aufräumarbeiten.

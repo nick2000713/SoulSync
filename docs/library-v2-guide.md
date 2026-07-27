@@ -467,7 +467,8 @@ Vor einem Release werden mindestens geprüft:
 - Windows-/Docker-Pfad-Mappings und ungesunder Storage-Root;
 - Delete/Recycle/Recovery und Replacement;
 - Jobs über fünf Minuten ohne erfundenen UI-Endstatus;
-- mehrdeutiger Bundle-Import über die Acquisition-Review-UI.
+- mehrdeutiger Bundle-Import über die gemeinsame Acquisition-Pipeline; die
+  eigenständige Acquisition-Review-UI ist für diese PR ausdrücklich entfernt.
 
 Die jeweilige aktuelle Freigabeentscheidung gehört ausschließlich in die
 Statusdatei.
