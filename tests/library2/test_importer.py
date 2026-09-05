@@ -2492,3 +2492,58 @@ def test_a_reset_without_a_legacy_source_does_not_empty_the_catalogue(legacy_db)
     after = conn.execute("SELECT COUNT(*) c FROM lib2_tracks").fetchone()["c"]
     conn.close()
     assert after == before, "the reset wiped the catalogue for a source it never had"
+
+
+# --- the upgrade snapshot must fill, never overwrite (§legacy-mirror) --------
+
+def test_reimport_never_resets_a_healed_track_number(legacy_db):
+    """The legacy catalogue is a frozen upgrade snapshot, not a sync source.
+
+    ``completeness._unique_untouched_title_match`` heals a track onto its
+    provider slot; a second import used to write the legacy number straight
+    back over it, so every click of the Import tile undid the healing.
+    """
+    import_legacy_library(legacy_db)
+
+    conn = legacy_db._get_connection()
+    try:
+        conn.execute("UPDATE lib2_tracks SET track_number=7 WHERE title='Hotline Bling'")
+        conn.commit()
+    finally:
+        conn.close()
+
+    import_legacy_library(legacy_db)
+
+    conn = legacy_db._get_connection()
+    try:
+        assert conn.execute(
+            "SELECT track_number FROM lib2_tracks WHERE title='Hotline Bling'"
+        ).fetchone()[0] == 7
+    finally:
+        conn.close()
+
+
+def test_reimport_leaves_a_track_on_the_album_a_fold_moved_it_to(legacy_db):
+    """§63 duplicate folds move tracks between lib2 albums. Re-pointing them at
+    the legacy album on every re-import would undo every fold."""
+    import_legacy_library(legacy_db)
+
+    conn = legacy_db._get_connection()
+    try:
+        moved_to = conn.execute(
+            "SELECT id FROM lib2_albums WHERE title='One Dance'").fetchone()[0]
+        conn.execute("UPDATE lib2_tracks SET album_id=? WHERE title='Hotline Bling'",
+                     (moved_to,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    import_legacy_library(legacy_db)
+
+    conn = legacy_db._get_connection()
+    try:
+        assert conn.execute(
+            "SELECT album_id FROM lib2_tracks WHERE title='Hotline Bling'"
+        ).fetchone()[0] == moved_to
+    finally:
+        conn.close()

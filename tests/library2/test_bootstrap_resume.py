@@ -66,22 +66,31 @@ def _counts(db):
         conn.close()
 
 
-def _title_of_legacy_track(db, legacy_track_id):
+def _duration_of_legacy_track(db, legacy_track_id):
     conn = db._get_connection()
     try:
         row = conn.execute(
-            "SELECT title FROM lib2_tracks WHERE legacy_track_id=?",
+            "SELECT duration FROM lib2_tracks WHERE legacy_track_id=?",
             (str(legacy_track_id),),
         ).fetchone()
-        return row["title"] if row else None
+        return row["duration"] if row else None
     finally:
         conn.close()
 
 
-def _rename_legacy_track(db, track_id, title):
+def _clear_lib2_durations(db):
     conn = db._get_connection()
     try:
-        conn.execute("UPDATE tracks SET title=? WHERE id=?", (title, track_id))
+        conn.execute("UPDATE lib2_tracks SET duration=NULL")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _set_legacy_duration(db, track_id, duration):
+    conn = db._get_connection()
+    try:
+        conn.execute("UPDATE tracks SET duration=? WHERE id=?", (duration, track_id))
         conn.commit()
     finally:
         conn.close()
@@ -179,16 +188,23 @@ def test_resume_continues_the_walk_after_the_checkpoint_rowid(legacy_db):
 
     # Both rows change while we are down; only the one after the checkpoint
     # may be picked up by the resumed walk.
-    _rename_legacy_track(legacy_db, 100, "Renamed Before Checkpoint")
-    _rename_legacy_track(legacy_db, 101, "Renamed After Checkpoint")
+    #
+    # The probe is a HOLE, not an overwrite: the legacy catalogue is a frozen
+    # upgrade snapshot, so a walk may only fill columns lib2 has no value for
+    # (see the UPDATE in importer.py). Clearing both durations first makes
+    # "did the walk reach this row?" observable again — it used to be read off
+    # a renamed title, which the walk no longer writes over.
+    _clear_lib2_durations(legacy_db)
+    _set_legacy_duration(legacy_db, 100, 111_000)
+    _set_legacy_duration(legacy_db, 101, 222_000)
 
     import_legacy_library(
         legacy_db,
         resume=ResumePoint(stage="tracks", rowid=100, run_id=first.run_id),
     )
 
-    assert _title_of_legacy_track(legacy_db, 100) == "One Dance"
-    assert _title_of_legacy_track(legacy_db, 101) == "Renamed After Checkpoint"
+    assert _duration_of_legacy_track(legacy_db, 100) is None
+    assert _duration_of_legacy_track(legacy_db, 101) == 222_000
 
 
 def test_resume_reports_absolute_progress(legacy_db):

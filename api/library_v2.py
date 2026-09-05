@@ -5289,7 +5289,10 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
         guard = _guard()
         if guard:
             return guard
-        reset = bool((request.get_json(silent=True) or {}).get("reset")) if request.is_json else False
+        payload = (request.get_json(silent=True) or {}) if request.is_json else {}
+        reset = bool(payload.get("reset"))
+        force = bool(payload.get("force"))
+
         with _import_lock:
             if _import_state["running"]:
                 return jsonify({"success": False, "error": "Import already running"}), 409
@@ -5298,6 +5301,33 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
                     "success": False,
                     "error": "Artwork caching is still running; retry when it finishes",
                 }), 409
+            # Ordered AFTER the in-progress checks on purpose: "a run is
+            # already happening" is the more specific answer, and the existing
+            # contract tests read it back.
+            #
+            # The Import tile posts this with no confirmation, and a completed
+            # migration has nothing left to add: the legacy catalogue is a
+            # frozen snapshot (nothing has written it since the cutover), so a
+            # re-run only re-applies it over rows lib2 has healed since. The
+            # automatic bootstrap already declines exactly this case —
+            # `run_bootstrap_if_needed` returns `{"skipped": "already_done"}`
+            # while the status is done and the source watermark is unchanged —
+            # but this endpoint calls `try_claim` directly and so claimed
+            # straight past it. `reset` (an explicit rebuild, which wipes the
+            # tables first) and `force` still run.
+            if not (reset or force):
+                database = get_database()
+                state = lib2_bootstrap.get_state(database)
+                if (state.get("status") == "done"
+                        and state.get("source_watermark")
+                        == lib2_bootstrap.source_watermark(database)):
+                    return jsonify({
+                        "success": False,
+                        "error": ("Library import already completed and the "
+                                  "legacy catalogue has not changed since. "
+                                  "Re-running risks re-applying stale data — "
+                                  "send force to run it anyway."),
+                    }), 409
             # Shares the persisted claim with the automatic first-run bootstrap
             # (core/library2/bootstrap.py) so a manual click can never run
             # import_legacy_library() concurrently with the background autostart.

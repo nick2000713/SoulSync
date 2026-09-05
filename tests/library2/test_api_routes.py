@@ -4046,3 +4046,55 @@ def test_a_lost_lease_fails_the_manual_import_instead_of_reporting_done(api, mon
     assert state["stage"] == "failed"
     assert "lease" in (state["error"] or "").lower()
     assert artwork_calls == []
+
+
+def test_import_refuses_a_repeat_run_over_a_converged_library(api):
+    """The Import tile posts with no confirmation at all. Once the migration is
+    done and the legacy source has not grown, another run is pure risk — it
+    re-applies a frozen snapshot over rows lib2 has healed since. The automatic
+    bootstrap already declines this exact case (``skipped: already_done``); the
+    manual endpoint used to claim straight past it."""
+    from core.library2 import bootstrap as lib2_bootstrap
+
+    client, db, _ids = api
+    owner = lib2_bootstrap.try_claim(db)
+    assert owner
+    assert lib2_bootstrap.mark_done(
+        db, owner, watermark=lib2_bootstrap.source_watermark(db))
+
+    response = client.post("/api/library/v2/import", json={})
+
+    assert response.status_code == 409
+    assert "already" in response.get_json()["error"].lower()
+
+
+def test_a_forced_import_still_runs_over_a_converged_library(api, monkeypatch):
+    """The guard is a safety net, not a wall: an explicit ``force`` still runs
+    (and so does ``reset``, which wipes the tables first anyway)."""
+    from core.library2 import artwork, bootstrap as lib2_bootstrap, completeness
+    from core.library2 import importer, tag_cache
+    from api import library_v2 as api_module
+
+    client, db, _ids = api
+    owner = lib2_bootstrap.try_claim(db)
+    assert lib2_bootstrap.mark_done(
+        db, owner, watermark=lib2_bootstrap.source_watermark(db))
+
+    monkeypatch.setattr(importer, "import_legacy_library",
+                        lambda *_a, **_k: {"artists": 0, "albums": 0, "tracks": 0})
+    monkeypatch.setattr(completeness, "precache_tracklists", lambda *_a, **_k: 0)
+    monkeypatch.setattr(tag_cache, "precache_tag_cache", lambda *_a, **_k: {})
+    monkeypatch.setattr(artwork, "precache_all_artwork", lambda *_a, **_k: {})
+    api_module._import_state.update(running=False, stage=None, current=0, total=0,
+                                    stats=None, error=None, finished_at=None)
+    api_module._reset_artwork_cache_state()
+
+    response = client.post("/api/library/v2/import", json={"force": True})
+
+    assert response.status_code == 200
+
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if not client.get("/api/library/v2/import/status").get_json()["running"]:
+            break
+        time.sleep(0.01)

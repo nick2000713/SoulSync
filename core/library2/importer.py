@@ -1579,14 +1579,33 @@ def import_legacy_library(database, *, reset: bool = False, progress: ProgressCb
             )
             existing = track_map.get(_legacy_key(row["id"]))
             if existing is not None:
-                previous = cursor.execute(
-                    "SELECT album_id FROM lib2_tracks WHERE id=?", (existing,),
-                ).fetchone()
-                if previous is not None:
-                    dirty_credit_album_ids.add(int(previous["album_id"]))
+                # The legacy catalogue is a frozen upgrade snapshot, not a sync
+                # source (nothing has written it since the cutover). So an
+                # UPDATE here is always a RE-RUN over rows lib2 has since
+                # healed, and it may only FILL HOLES: `col=COALESCE(col, ?)`
+                # keeps whatever lib2 already knows. The proven casualty was
+                # track_number — `completeness._unique_untouched_title_match`
+                # heals it onto the provider slot and this statement wrote the
+                # stale number straight back on every click of the Import tile.
+                #
+                # The enrichment columns below keep the opposite order
+                # (`COALESCE(?, col)`): they were never lib2-authored, so there
+                # the snapshot wins and the COALESCE only stops a legacy NULL
+                # from erasing a value.
+                #
+                # `album_id` is absent on purpose, and is not a COALESCE case:
+                # it is never NULL, and §63 duplicate folds deliberately move
+                # tracks between lib2 albums. Writing it back would undo every
+                # fold. Nothing moves, so the old previous-album credit
+                # bookkeeping (an extra SELECT per track in this hot walk) went
+                # with it — `dirty_credit_album_ids` gets this album below.
                 cursor.execute(
-                    "UPDATE lib2_tracks SET album_id=?, title=?, track_number=?, "
-                    "disc_number=?, duration=?, isrc=?, musicbrainz_id=?, spotify_id=?, "
+                    "UPDATE lib2_tracks SET title=COALESCE(title, ?), "
+                    "track_number=COALESCE(track_number, ?), "
+                    "disc_number=COALESCE(disc_number, ?), "
+                    "duration=COALESCE(duration, ?), isrc=COALESCE(isrc, ?), "
+                    "musicbrainz_id=COALESCE(musicbrainz_id, ?), "
+                    "spotify_id=COALESCE(spotify_id, ?), "
                     "bpm=COALESCE(?, bpm), explicit=COALESCE(?, explicit), "
                     "genius_lyrics=COALESCE(?, genius_lyrics), "
                     "copyright=COALESCE(?, copyright), "
@@ -1599,7 +1618,8 @@ def import_legacy_library(database, *, reset: bool = False, progress: ProgressCb
                     "server_id=COALESCE(?, server_id), "
                     "added_at=COALESCE(?, added_at), "
                     "legacy_import_run_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                    (*tfields, *_server_identity(row), _pick(row, "created_at"),
+                    # tfields[0] is album_id — deliberately not written here.
+                    (*tfields[1:], *_server_identity(row), _pick(row, "created_at"),
                      run_id, existing),
                 )
                 track_id = existing
