@@ -249,3 +249,29 @@ def test_a_corrected_artist_name_reaches_the_path(imported_conn):
     assert plan["artist"] == "Corrected Artist"
     assert seen[0]["artist"]["name"] == "Corrected Artist"
     assert seen[0]["context"]["track_info"]["artists"][0]["name"] == "Corrected Artist"
+
+
+def test_a_track_landing_on_an_unchanged_file_is_a_collision(imported_conn):
+    """An `unchanged` track is one already sitting at its destination. It never
+    moves — but it is still the file another track would land on top of, and
+    the detection used to skip unchanged rows outright, so the single most
+    destructive shape was the one it could not see: a second track replacing a
+    file the plan reported as needing no work at all.
+
+    The occupant stays unflagged (it has nothing to skip); the mover is the one
+    that must not run."""
+    conn = imported_conn
+    _, album_id, track_ids = _seed(conn, tracks=(("Keep", 1, 1), ("Move", 2, 1)))
+    conn.execute("UPDATE lib2_track_files SET path='/music/out/Keep.flac' "
+                 "WHERE track_id=?", (track_ids[0],))
+    conn.commit()
+
+    def build(_context, _artist, _album_info, _file_ext, create_dirs=True):
+        return "/music/out/Keep.flac", True
+
+    plan = _plan(conn, album_id, build)
+
+    by_title = {t["title"]: t for t in plan["tracks"]}
+    assert by_title["Keep"]["unchanged"] is True
+    assert by_title["Keep"]["collision"] is False
+    assert by_title["Move"]["collision"] is True

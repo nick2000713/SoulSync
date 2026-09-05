@@ -754,15 +754,39 @@ class _ArtistResolver:
                 row_ids.setdefault(source, value)
             external_json = (json.dumps(row_ids, sort_keys=True, separators=(",", ":"))
                              if row_ids else "{}")
+            # ...and the same is true of the columns lib2 AUTHORS after the
+            # cutover. `genres` and `aliases` are NOT NULL DEFAULT '[]', so
+            # their hole is the empty list rather than NULL: `native_enrich`
+            # fills genres from the provider, and a plain assignment blanked
+            # that back out on every re-import whose legacy row carried none.
+            # `summary` and `sort_name` fill holes for the same reason.
+            # `image_url` gains the COALESCE the album upsert already has —
+            # unlocked art used to be erased outright by a legacy row with no
+            # thumbnail of its own.
+            #
+            # The identity triple `name`/`name_key`/`sort_name`… `name` and
+            # `name_key` stay plain assignments on purpose: nothing in lib2
+            # renames an artist (the §40 merge links rows via
+            # `canonical_artist_id` instead), while adoption DOES reach here
+            # with a stub row created from a parsed credit string, whose name
+            # the legacy catalogue improves on. They must also move together —
+            # `name_key` is `normalize_name(name)` and a stale key is a
+            # dedup-lookup miss.
             self.cursor.execute(
-                "UPDATE lib2_artists SET name=?, name_key=?, sort_name=?, spotify_id=?, "
+                "UPDATE lib2_artists SET name=?, name_key=?, "
+                "sort_name=COALESCE(sort_name, ?), spotify_id=?, "
                 "musicbrainz_id=?, external_ids=?, "
-                "image_url=CASE WHEN COALESCE(art_locked,0)=1 THEN image_url ELSE ? END, "
+                "image_url=CASE WHEN COALESCE(art_locked,0)=1 THEN image_url "
+                "               ELSE COALESCE(?, image_url) END, "
                 "art_locked=MAX(COALESCE(art_locked,0),COALESCE(?,0)), "
-                "genres=?, summary=?, "
+                "genres=CASE WHEN genres IS NULL OR genres IN ('', '[]') "
+                "            THEN ? ELSE genres END, "
+                "summary=COALESCE(summary, ?), "
                 "style=COALESCE(?, style), mood=COALESCE(?, mood), "
                 "label=COALESCE(?, label), banner_url=COALESCE(?, banner_url), "
-                "aliases=?, soul_id=COALESCE(?, soul_id), "
+                "aliases=CASE WHEN aliases IS NULL OR aliases IN ('', '[]') "
+                "             THEN ? ELSE aliases END, "
+                "soul_id=COALESCE(?, soul_id), "
                 "soul_id_path=COALESCE(?, soul_id_path), "
                 "server_source=COALESCE(?, server_source), "
                 "server_id=COALESCE(?, server_id), "
@@ -823,6 +847,53 @@ def _discography_album_index(cursor) -> Dict[Tuple[int, str], List[Dict[str, Any
             (int(row["primary_artist_id"]), release_title_key(row["title"])), []
         ).append(dict(row))
     return index
+
+
+class _CanonicalArtists:
+    """The row that actually owns an artist identity, per the §40 alias
+    registry (``lib2_artists.canonical_artist_id``).
+
+    A merge — ``native_enrich``'s artist fold, ``dedup_repair``'s duplicate
+    repair — leaves the folded-away row in place pointing at the survivor, and
+    moves its albums and credits across. The legacy catalogue still names the
+    folded row, so a re-import wrote that id straight back as the album's
+    primary artist and re-derived the track credits onto it, splitting the
+    discography again on every run. Worse for credits: the featured names go
+    through ``get_or_create_by_name``, which finds the folded row by name and
+    hands back exactly the id the merge was undoing.
+
+    Resolving through the registry is what makes a re-import idempotent
+    against a merge. Cached because the walk asks per album and per credit,
+    and nothing creates a canonical link mid-import.
+    """
+
+    def __init__(self, cursor: Any) -> None:
+        self._cursor = cursor
+        self._cache: Dict[int, int] = {}
+
+    def resolve(self, artist_id: Optional[int]) -> Optional[int]:
+        if artist_id is None:
+            return None
+        start = int(artist_id)
+        hit = self._cache.get(start)
+        if hit is not None:
+            return hit
+        chain = {start}
+        current = start
+        while True:
+            row = self._cursor.execute(
+                "SELECT canonical_artist_id FROM lib2_artists WHERE id=?",
+                (current,),
+            ).fetchone()
+            nxt = row["canonical_artist_id"] if row is not None else None
+            # A cycle would be corrupt data, not a merge; stop rather than spin.
+            if nxt is None or int(nxt) in chain:
+                break
+            current = int(nxt)
+            chain.add(current)
+        for member in chain:
+            self._cache[member] = current
+        return current
 
 
 def _claim_discography_album(
@@ -1183,6 +1254,7 @@ def import_legacy_library(database, *, reset: bool = False, progress: ProgressCb
         default_profile_id = default_quality_profile_id(conn)
         resolver = _ArtistResolver(cursor, default_profile_id)
         resolver.seed_existing()
+        canonical_artists = _CanonicalArtists(cursor)
         discography_albums = _discography_album_index(cursor)
         conn.commit()
 
@@ -1344,7 +1416,10 @@ def import_legacy_library(database, *, reset: bool = False, progress: ProgressCb
                          after_rowid=album_from or 0)
             if album_from is not None else ()
         ):
-            lib2_artist = resolver.get_legacy(row["artist_id"])
+            # Through the alias registry: a merge moved this release onto the
+            # surviving artist, and the legacy row still names the folded one.
+            lib2_artist = canonical_artists.resolve(
+                resolver.get_legacy(row["artist_id"]))
             if lib2_artist is None:
                 continue  # orphan album with no artist; skip
             # actual track rows for single-detection
@@ -1396,14 +1471,40 @@ def import_legacy_library(database, *, reset: bool = False, progress: ProgressCb
                 if existing is not None:
                     album_map[_legacy_key(row["id"])] = existing
             if existing is not None:
+                # Same rule the track UPDATE below follows, for the same
+                # reason: the legacy catalogue is a frozen upgrade snapshot,
+                # so reaching an EXISTING row means either a re-run over rows
+                # lib2 has healed since, or a discography row being claimed —
+                # and in both the row on disk knows more than the snapshot.
+                # For every column lib2 authors, a re-run may only FILL HOLES.
+                #
+                # `track_count` and `expected_track_count` are the concrete
+                # casualties: `media_server_sync` and `worker_support` write
+                # the real totals after the cutover, and a §63 fold recomputes
+                # them — all of which a plain assignment reset to the frozen
+                # legacy number, which then fed the missing/completeness
+                # counters. `year` is authored by `metadata/source.py`.
+                # `genres` is NOT NULL DEFAULT '[]', so its hole is the empty
+                # list rather than NULL: `native_enrich` fills it from the
+                # provider, and a plain assignment blanked that back out
+                # whenever the legacy row had no genres of its own.
+                #
+                # `title`/`album_type` stay plain assignments: the legacy
+                # catalogue is their only author, and a re-import over a
+                # source that HAS changed (the watermark's whole purpose) is
+                # meant to carry a correction through.
                 cursor.execute(
                     "UPDATE lib2_albums SET primary_artist_id=?, title=?, album_type=?, "
-                    "release_date=?, year=?, spotify_id=COALESCE(?, spotify_id), "
+                    "release_date=COALESCE(release_date, ?), "
+                    "year=COALESCE(year, ?), spotify_id=COALESCE(?, spotify_id), "
                     "musicbrainz_id=COALESCE(?, musicbrainz_id), "
                     "image_url=CASE WHEN COALESCE(art_locked,0)=1 THEN image_url "
                     "               ELSE COALESCE(?, image_url) END, "
                     "art_locked=MAX(COALESCE(art_locked,0),COALESCE(?,0)), "
-                    "genres=?, track_count=?, expected_track_count=?, "
+                    "genres=CASE WHEN genres IS NULL OR genres IN ('', '[]') "
+                    "            THEN ? ELSE genres END, "
+                    "track_count=COALESCE(track_count, ?), "
+                    "expected_track_count=COALESCE(expected_track_count, ?), "
                     "explicit=COALESCE(?, explicit), label=COALESCE(?, label), "
                     "upc=COALESCE(?, upc), "
                     "style=COALESCE(?, style), mood=COALESCE(?, mood), "
@@ -1677,7 +1778,8 @@ def import_legacy_library(database, *, reset: bool = False, progress: ProgressCb
 
             # Artist credits: primary = album artist; plus track_artist + title feats.
             primary_legacy = _pick(row, "artist_id")
-            primary_lib2 = resolver.get_legacy(primary_legacy) if primary_legacy else None
+            primary_lib2 = (canonical_artists.resolve(resolver.get_legacy(primary_legacy))
+                            if primary_legacy else None)
             credits: List[Tuple[int, str, int]] = []  # (artist_id, role, position)
             if primary_lib2 is not None:
                 credits.append((primary_lib2, "primary", 0))
@@ -1696,11 +1798,23 @@ def import_legacy_library(database, *, reset: bool = False, progress: ProgressCb
             )
             pos = 1
             for nm in extra_names:
-                aid = resolver.get_or_create_by_name(nm)
+                # `get_or_create_by_name` matches the folded-away row by name,
+                # so without the registry hop this credit re-created exactly
+                # the split the merge closed.
+                aid = canonical_artists.resolve(resolver.get_or_create_by_name(nm))
                 if aid not in {c[0] for c in credits}:
                     credits.append((aid, "featured", pos))
                     pos += 1
             # Reset this track's junction rows (idempotent re-run) then insert.
+            # The reset is what lets a re-import over a CHANGED legacy source
+            # drop a credit the source no longer names, so it stays — but every
+            # id above now goes through the alias registry first, which is what
+            # stops the re-derivation from undoing an artist merge. What it
+            # still cannot tell apart is a credit lib2 authored after the
+            # cutover (`completeness`, `media_server_sync`, `autolink`) from
+            # one this walk wrote: the junction carries no provenance, so an
+            # explicit re-import re-derives those away. Recording provenance is
+            # the fix, and it is a schema change, not a line here.
             cursor.execute("DELETE FROM lib2_track_artists WHERE track_id=?", (track_id,))
             if credits:
                 cursor.executemany(
@@ -1756,6 +1870,21 @@ def import_legacy_library(database, *, reset: bool = False, progress: ProgressCb
                 dirty_credit_album_ids.clear()
                 checkpoint("tracks", track_done + i + 1, track_total,
                            int(row["__lib2_source_rowid"]))
+        # The walk marks the album a track's LEGACY row maps to. A §63
+        # duplicate fold deliberately moves a track onto a different lib2
+        # album, and that fold target is never the legacy-mapped id — so its
+        # derived credits kept whatever the fold left behind, which reads as a
+        # featured artist still listing a release it no longer has a track on.
+        # One set query over the rows this run stamped catches both halves,
+        # without restoring the per-track SELECT the hot walk dropped.
+        if track_from is not None:
+            dirty_credit_album_ids.update(
+                int(r[0]) for r in cursor.execute(
+                    "SELECT DISTINCT album_id FROM lib2_tracks "
+                    "WHERE legacy_import_run_id=? AND album_id IS NOT NULL",
+                    (run_id,),
+                ).fetchall()
+            )
         _rebuild_album_artist_credits(cursor, dirty_credit_album_ids)
         if track_from is not None:
             checkpoint("tracks", track_total, track_total)

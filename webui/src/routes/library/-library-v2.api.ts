@@ -1807,11 +1807,41 @@ export async function fetchLibraryV2Track(trackId: number): Promise<LibraryV2Tra
   return payload.track;
 }
 
-export async function startLibraryV2Import(reset = false): Promise<void> {
-  const payload = await readJson<{ success: boolean; error?: string }>(
-    apiClient.post('library/v2/import', { json: { reset } }),
+/** The import endpoint's `already_completed` refusal, told apart from every
+ *  other failure so the caller can offer the `force` the message names.
+ *  Without this the one affordance an empty library has — the Import tile —
+ *  is a button that reports a remedy the UI has no way to send. */
+export class LibraryV2ImportAlreadyCompletedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'LibraryV2ImportAlreadyCompletedError';
+  }
+}
+
+/** True when a thrown error is the endpoint's `already_completed` refusal —
+ *  either raised below, or surfaced by ky as an HTTPError whose pre-parsed
+ *  body carries the code (a 409 rejects before `readJson` sees the payload). */
+export function isLibraryV2ImportAlreadyCompleted(error: unknown): boolean {
+  if (error instanceof LibraryV2ImportAlreadyCompletedError) return true;
+  const data = (error as { data?: unknown } | null)?.data;
+  return (
+    typeof data === 'object' &&
+    data !== null &&
+    (data as { code?: unknown }).code === 'already_completed'
   );
-  if (!payload.success) throw new Error(payload.error || 'Failed to start import');
+}
+
+export async function startLibraryV2Import(reset = false, force = false): Promise<void> {
+  const payload = await readJson<{ success: boolean; error?: string; code?: string }>(
+    apiClient.post('library/v2/import', { json: { reset, force } }),
+  );
+  if (!payload.success) {
+    const message = payload.error || 'Failed to start import';
+    if (payload.code === 'already_completed') {
+      throw new LibraryV2ImportAlreadyCompletedError(message);
+    }
+    throw new Error(message);
+  }
 }
 
 export async function fetchLibraryV2ImportStatus(): Promise<LibraryV2ImportState> {

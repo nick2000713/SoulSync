@@ -4068,6 +4068,70 @@ def test_import_refuses_a_repeat_run_over_a_converged_library(api):
     assert "already" in response.get_json()["error"].lower()
 
 
+def test_import_runs_when_the_state_says_done_but_the_catalogue_is_empty(
+        api, monkeypatch):
+    """The refusal reads a state ROW, and the state row is a claim about lib2 —
+    not lib2. They come apart: the documented DB-reset wipes the catalogue
+    tables and leaves ``lib2_bootstrap_state`` standing, a finalize killed
+    partway marks done over a half-empty catalogue, and iss29-A01 is the
+    marked-done-imported-nothing shape outright.
+
+    In every one of those a first upgrader sees an empty library, presses the
+    only button the empty state offers, and was told forever to send a flag the
+    Import tile cannot send. An empty catalogue has nothing stale to protect."""
+    from core.library2 import artwork, bootstrap as lib2_bootstrap, completeness
+    from core.library2 import importer, tag_cache
+    from api import library_v2 as api_module
+
+    client, db, _ids = api
+    owner = lib2_bootstrap.try_claim(db)
+    assert lib2_bootstrap.mark_done(
+        db, owner, watermark=lib2_bootstrap.source_watermark(db))
+
+    conn = db._get_connection()
+    conn.execute("DELETE FROM lib2_album_artists")
+    conn.execute("DELETE FROM lib2_albums")
+    conn.execute("DELETE FROM lib2_artists")
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(importer, "import_legacy_library",
+                        lambda *_a, **_k: {"artists": 0, "albums": 0, "tracks": 0})
+    monkeypatch.setattr(completeness, "precache_tracklists", lambda *_a, **_k: 0)
+    monkeypatch.setattr(tag_cache, "precache_tag_cache", lambda *_a, **_k: {})
+    monkeypatch.setattr(artwork, "precache_all_artwork", lambda *_a, **_k: {})
+    api_module._import_state.update(running=False, stage=None, current=0, total=0,
+                                    stats=None, error=None, finished_at=None)
+    api_module._reset_artwork_cache_state()
+
+    response = client.post("/api/library/v2/import", json={})
+
+    assert response.status_code == 200
+
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if not client.get("/api/library/v2/import/status").get_json()["running"]:
+            break
+        time.sleep(0.01)
+
+
+def test_the_repeat_run_refusal_is_machine_readable(api):
+    """The message names ``force`` as the way through, so the Import tile has to
+    be able to tell THIS refusal from every other failure to offer it. Matching
+    on the prose would break the moment the wording is edited."""
+    from core.library2 import bootstrap as lib2_bootstrap
+
+    client, db, _ids = api
+    owner = lib2_bootstrap.try_claim(db)
+    assert lib2_bootstrap.mark_done(
+        db, owner, watermark=lib2_bootstrap.source_watermark(db))
+
+    response = client.post("/api/library/v2/import", json={})
+
+    assert response.status_code == 409
+    assert response.get_json()["code"] == "already_completed"
+
+
 def test_a_forced_import_still_runs_over_a_converged_library(api, monkeypatch):
     """The guard is a safety net, not a wall: an explicit ``force`` still runs
     (and so does ``reset``, which wipes the tables first anyway)."""

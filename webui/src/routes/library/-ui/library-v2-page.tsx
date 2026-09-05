@@ -60,6 +60,7 @@ import {
   LIBRARY_V2_ALBUM_TYPES,
   LIBRARY_V2_QUERY_KEY,
   invalidateLibraryV2,
+  isLibraryV2ImportAlreadyCompleted,
   libraryV2AlbumMatchStatusQueryOptions,
   libraryV2AlbumQueryOptions,
   libraryV2ArtistAliasesQueryOptions,
@@ -11584,19 +11585,29 @@ export function ImportButton({
   const importQuery = useQuery(libraryV2ImportStatusQueryOptions(pollIntervalMs));
   const observedRunning = useRef(false);
   const [message, setMessage] = useState<string | null>(null);
+  // The endpoint refuses a repeat run over a converged library and names
+  // `force` as the way through. Nothing here could send it, so that refusal
+  // was a dead end for the one user who legitimately needs to re-run: someone
+  // whose catalogue is gone but whose bootstrap row still says done. Offer the
+  // force it asks for, and only after it has actually asked.
+  const [canForce, setCanForce] = useState(false);
   const startImport = useMutation({
-    mutationFn: () => {
+    mutationFn: ({ force }: { force: boolean } = { force: false }) => {
       if (!canWrite) throw new Error('Library changes require the admin profile');
-      return startLibraryV2Import(false);
+      return startLibraryV2Import(false, force);
     },
     onMutate: () => setMessage(null),
     onSuccess: () => {
       observedRunning.current = true;
+      setCanForce(false);
       return queryClient.invalidateQueries({
         queryKey: [...LIBRARY_V2_QUERY_KEY, 'import-status'],
       });
     },
-    onError: (error) => setMessage(mutationErrorMessage(error, 'Import failed')),
+    onError: (error) => {
+      setCanForce(isLibraryV2ImportAlreadyCompleted(error));
+      setMessage(mutationErrorMessage(error, 'Import failed'));
+    },
   });
 
   const importState = importQuery.data;
@@ -11682,10 +11693,24 @@ export function ImportButton({
           disabled={busy || artworkRunning || !canWrite}
           title={migrating ? 'Your library is being migrated in the background' : undefined}
           onClick={() => {
-            if (canWrite) startImport.mutate();
+            if (canWrite) startImport.mutate({ force: false });
           }}
         >
           {migrating ? 'Migrating…' : busy ? 'Importing…' : 'Import library'}
+        </button>
+      ) : null}
+      {canForce && !hideImportAction ? (
+        <button
+          type="button"
+          className={styles.btnGhost}
+          data-requires-write=""
+          disabled={busy || artworkRunning || !canWrite}
+          title="Runs the migration again over the existing catalogue. A re-run only fills gaps; it never overwrites what the library has learned since."
+          onClick={() => {
+            if (canWrite) startImport.mutate({ force: true });
+          }}
+        >
+          Import anyway
         </button>
       ) : null}
       {statusMessage ? (

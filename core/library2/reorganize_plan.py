@@ -263,17 +263,28 @@ def plan_album_reorganize(
             item["reason"] = f"Couldn't compute destination path: {exc}"
         planned.append(item)
 
-    # Two tracks planned onto one path would overwrite each other on apply.
+    # Two tracks planned onto one path would overwrite each other on apply:
+    # post-processing publishes through `safe_move_file`, an atomic
+    # `os.replace` that never refuses an occupied destination.
+    #
+    # An `unchanged` track is one already sitting at its destination. It does
+    # not move, but it is still the file another track would land on top of —
+    # so it takes part in the detection as an occupant while never being
+    # flagged itself. Skipping unchanged rows outright (as this did) left the
+    # single most destructive shape invisible: a second track silently
+    # replacing a file the plan reported as needing no work at all.
     seen: Dict[str, Dict[str, Any]] = {}
     for item in planned:
-        if not item["matched"] or item["unchanged"] or not item["new_path"]:
+        if not item["matched"] or not item["new_path"]:
             continue
         key = _canonical_file_path(item.get("new_path_abs") or item["new_path"])
-        if key in seen:
-            item["collision"] = True
-            seen[key]["collision"] = True
-        else:
+        first = seen.get(key)
+        if first is None:
             seen[key] = item
+            continue
+        for clashing in (first, item):
+            if not clashing["unchanged"]:
+                clashing["collision"] = True
 
     return {"success": True, "status": "planned", **common, "tracks": planned}
 

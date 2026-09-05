@@ -1429,17 +1429,23 @@ def preview_album_reorganize(
         preview_tracks.append(item)
 
     # Collision detection: multiple matched tracks mapping to the same
-    # destination would overwrite each other on apply.
+    # destination would overwrite each other on apply. An `unchanged` track is
+    # already AT that destination — it never moves, but it is still the file
+    # another track would land on top of, so it counts as an occupant here
+    # while never being flagged itself. (Mirrors the catalogue planner in
+    # core/library2/reorganize_plan.py.)
     seen = {}
     for it in preview_tracks:
-        if not it['matched'] or it['unchanged'] or not it['new_path']:
+        if not it['matched'] or not it['new_path']:
             continue
         norm = _canonical_file_path(it.get('new_path_abs') or it['new_path'])
-        if norm in seen:
-            it['collision'] = True
-            seen[norm]['collision'] = True
-        else:
+        first = seen.get(norm)
+        if first is None:
             seen[norm] = it
+            continue
+        for clashing in (first, it):
+            if not clashing['unchanged']:
+                clashing['collision'] = True
 
     return {
         'success': True, 'status': 'planned',

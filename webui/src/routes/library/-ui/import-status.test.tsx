@@ -448,4 +448,54 @@ describe('automatic migration of an upgrading installation', () => {
 
     expect(await screen.findByText('Your library is empty')).toBeInTheDocument();
   });
+
+  it('offers the force the refusal names when a repeat run is declined', async () => {
+    // The endpoint declines a re-run over a converged library and tells the
+    // user to "send force". Nothing in the UI could send it, and the button is
+    // only rendered for an empty library -- so the one user who legitimately
+    // needs the re-run (catalogue gone, bootstrap row still says done) was
+    // reading a remedy they had no way to apply.
+    const posted: Array<{ reset: boolean; force: boolean }> = [];
+    server.use(
+      http.get('/api/library/v2/import/status', () =>
+        HttpResponse.json(importState({ running: false, stage: null })),
+      ),
+      http.post('/api/library/v2/import', async ({ request }) => {
+        const body = (await request.json()) as { reset: boolean; force: boolean };
+        posted.push(body);
+        if (!body.force) {
+          return HttpResponse.json(
+            {
+              success: false,
+              code: 'already_completed',
+              error:
+                'Library import already completed and the legacy catalogue has not changed since.',
+            },
+            { status: 409 },
+          );
+        }
+        return HttpResponse.json({ success: true, started: true });
+      }),
+    );
+    const queryClient = createTestQueryClient();
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <LibraryV2CanWriteContext.Provider value>
+          <ImportButton hasArtists={false} pollIntervalMs={0} />
+        </LibraryV2CanWriteContext.Provider>
+      </QueryClientProvider>,
+    );
+
+    expect(screen.queryByRole('button', { name: 'Import anyway' })).toBeNull();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Import library' }));
+
+    expect(await screen.findByText(/already completed/)).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole('button', { name: 'Import anyway' }));
+
+    await waitFor(() => expect(posted).toHaveLength(2));
+    expect(posted[0]).toEqual({ reset: false, force: false });
+    expect(posted[1]).toEqual({ reset: false, force: true });
+  });
 });

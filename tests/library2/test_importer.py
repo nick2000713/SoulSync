@@ -2547,3 +2547,177 @@ def test_reimport_leaves_a_track_on_the_album_a_fold_moved_it_to(legacy_db):
         ).fetchone()[0] == moved_to
     finally:
         conn.close()
+
+
+def test_reimport_keeps_the_album_totals_lib2_recomputed(legacy_db):
+    """`track_count` / `expected_track_count` are lib2-authored after the
+    cutover — the media-server sync and `worker_support` write the real totals,
+    and a §63 fold recomputes them. The re-import used to assign the frozen
+    legacy numbers straight back, and those feed the missing/completeness
+    counters, so a healed album read as incomplete again."""
+    import_legacy_library(legacy_db)
+
+    conn = legacy_db._get_connection()
+    try:
+        conn.execute(
+            "UPDATE lib2_albums SET track_count=19, expected_track_count=20, year=2016 "
+            "WHERE title='Views'")
+        conn.commit()
+    finally:
+        conn.close()
+
+    import_legacy_library(legacy_db)
+
+    conn = legacy_db._get_connection()
+    try:
+        row = conn.execute(
+            "SELECT track_count, expected_track_count, year FROM lib2_albums "
+            "WHERE title='Views'").fetchone()
+        assert (row["track_count"], row["expected_track_count"]) == (19, 20)
+        assert row["year"] == 2016
+    finally:
+        conn.close()
+
+
+def test_reimport_keeps_provider_genres_a_legacy_row_does_not_carry(legacy_db):
+    """`genres` is NOT NULL DEFAULT '[]', so its hole is the empty list, not
+    NULL — which is why a plain assignment silently blanked out everything
+    `native_enrich` had fetched whenever the legacy row had no genres."""
+    import_legacy_library(legacy_db)
+
+    conn = legacy_db._get_connection()
+    try:
+        conn.execute("UPDATE lib2_albums SET genres='[\"hip hop\"]' WHERE title='Views'")
+        conn.execute("UPDATE lib2_artists SET genres='[\"rap\"]', summary='Bio.' "
+                     "WHERE name='Drake'")
+        conn.commit()
+    finally:
+        conn.close()
+
+    import_legacy_library(legacy_db)
+
+    conn = legacy_db._get_connection()
+    try:
+        assert conn.execute(
+            "SELECT genres FROM lib2_albums WHERE title='Views'").fetchone()[0] \
+            == '["hip hop"]'
+        artist = conn.execute(
+            "SELECT genres, summary FROM lib2_artists WHERE name='Drake'").fetchone()
+        assert artist["genres"] == '["rap"]'
+        assert artist["summary"] == 'Bio.'
+    finally:
+        conn.close()
+
+
+def test_reimport_does_not_blank_artwork_a_legacy_row_has_none_for(legacy_db):
+    """The artist upsert wrote `image_url = ?` outright when art was unlocked,
+    so a legacy row with no thumbnail erased whatever the artwork worker had
+    found. The album upsert had the COALESCE already; this is the same rule."""
+    import_legacy_library(legacy_db)
+
+    conn = legacy_db._get_connection()
+    try:
+        conn.execute("UPDATE lib2_artists SET image_url='http://art/drake.jpg', "
+                     "art_locked=0 WHERE name='Drake'")
+        conn.commit()
+    finally:
+        conn.close()
+    legacy = _conn(legacy_db)
+    legacy.execute("UPDATE artists SET thumb_url=NULL WHERE name='Drake'")
+    legacy.commit()
+    legacy.close()
+
+    import_legacy_library(legacy_db)
+
+    conn = legacy_db._get_connection()
+    try:
+        assert conn.execute(
+            "SELECT image_url FROM lib2_artists WHERE name='Drake'").fetchone()[0] \
+            == 'http://art/drake.jpg'
+    finally:
+        conn.close()
+
+
+def test_reimport_does_not_undo_an_artist_merge(legacy_db):
+    """§40: a merge leaves the folded-away row in place pointing at the survivor
+    and moves its releases across. The legacy catalogue still names the folded
+    row, so the re-import hung the album back on it — and the credit walk, which
+    resolves featured names with `get_or_create_by_name`, found it by name and
+    re-created exactly the split the merge had closed."""
+    import_legacy_library(legacy_db)
+
+    conn = legacy_db._get_connection()
+    try:
+        folded = conn.execute(
+            "SELECT id FROM lib2_artists WHERE name='Drake'").fetchone()[0]
+        survivor = conn.execute(
+            "INSERT INTO lib2_artists(name, sort_name) VALUES('Drizzy','Drizzy') "
+            "RETURNING id").fetchone()[0]
+        conn.execute("UPDATE lib2_artists SET canonical_artist_id=? WHERE id=?",
+                     (survivor, folded))
+        conn.commit()
+    finally:
+        conn.close()
+
+    import_legacy_library(legacy_db)
+
+    conn = legacy_db._get_connection()
+    try:
+        owners = {
+            row[0] for row in conn.execute(
+                "SELECT DISTINCT primary_artist_id FROM lib2_albums "
+                "WHERE legacy_album_id IS NOT NULL")
+        }
+        assert owners == {survivor}
+        credited = {
+            row[0] for row in conn.execute(
+                "SELECT DISTINCT artist_id FROM lib2_track_artists")
+        }
+        assert folded not in credited
+    finally:
+        conn.close()
+
+
+def test_reimport_rebuilds_credits_on_the_album_a_fold_moved_a_track_to(legacy_db):
+    """The walk marks the album a track's LEGACY row maps to, and the batch
+    seed covers every album the album walk touched — so a fold between two
+    legacy albums is caught by accident. A fold onto a DISCOGRAPHY album is
+    not: it has no legacy row, so nothing ever marks it, and its derived
+    credits keep whatever the fold left behind — a featured artist still
+    listing a release it has no track on."""
+    import_legacy_library(legacy_db)
+
+    conn = legacy_db._get_connection()
+    try:
+        artist = conn.execute(
+            "SELECT id FROM lib2_artists WHERE name='Drake'").fetchone()[0]
+        # A provider-only release: origin='discography', no legacy_album_id.
+        moved_to = conn.execute(
+            "INSERT INTO lib2_albums(primary_artist_id, title, album_type, origin) "
+            "VALUES(?, 'Scary Hours', 'ep', 'discography') RETURNING id",
+            (artist,)).fetchone()[0]
+        conn.execute("UPDATE lib2_tracks SET album_id=? WHERE title='Hotline Bling'",
+                     (moved_to,))
+        ghost = conn.execute(
+            "INSERT INTO lib2_artists(name, sort_name) VALUES('Ghost','Ghost') "
+            "RETURNING id").fetchone()[0]
+        conn.execute(
+            "INSERT INTO lib2_album_artists(album_id, artist_id, role) "
+            "VALUES(?,?,'featured')", (moved_to, ghost))
+        conn.commit()
+    finally:
+        conn.close()
+
+    import_legacy_library(legacy_db)
+
+    conn = legacy_db._get_connection()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM lib2_album_artists WHERE album_id=? AND artist_id=?",
+            (moved_to, ghost)).fetchone()[0] == 0
+        # ...and the real credit the moved track carries is there.
+        assert conn.execute(
+            "SELECT COUNT(*) FROM lib2_album_artists WHERE album_id=? AND artist_id=?",
+            (moved_to, artist)).fetchone()[0] == 1
+    finally:
+        conn.close()

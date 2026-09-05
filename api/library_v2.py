@@ -89,6 +89,33 @@ _NOT_CONSOLIDATED_SQL = """
 """
 
 
+def _lib2_has_catalogue_rows(database: Any) -> bool:
+    """Does lib2 actually hold a catalogue right now?
+
+    `lib2_bootstrap_state` records what the LAST import claimed; this asks the
+    catalogue itself.  Anything that empties the tables without clearing the
+    state row (the DB-reset procedure, a killed finalize, iss29-A01's
+    marked-done-imported-nothing) leaves the two disagreeing, and a guard that
+    trusts the claim alone locks the user out of the only repair they have.
+
+    Artists, not tracks: a library whose files are all gone is still a
+    catalogue, and re-importing it is exactly what the guard exists to refuse.
+    Unreadable/absent tables answer False, which only ever costs a refusal.
+    """
+    try:
+        conn = database._get_connection()
+    except Exception as exc:  # noqa: BLE001 - a guard must never 500
+        logger.debug("lib2 row probe could not open a connection: %s", exc)
+        return False
+    try:
+        return conn.execute("SELECT 1 FROM lib2_artists LIMIT 1").fetchone() is not None
+    except Exception as exc:  # noqa: BLE001 - missing table on a fresh install
+        logger.debug("lib2 row probe failed: %s", exc)
+        return False
+    finally:
+        conn.close()
+
+
 def _artwork_cache_snapshot() -> Dict[str, Any]:
     with _artwork_cache_lock:
         return dict(_artwork_cache_state)
@@ -5315,14 +5342,30 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
             # but this endpoint calls `try_claim` directly and so claimed
             # straight past it. `reset` (an explicit rebuild, which wipes the
             # tables first) and `force` still run.
+            #
+            # `_lib2_has_catalogue_rows` is the third condition, and it is the
+            # one that keeps a first upgrader out of a dead end: the state row
+            # is a CLAIM about lib2, not lib2 itself. The two can disagree —
+            # the documented DB-reset procedure wipes the catalogue tables and
+            # leaves `lib2_bootstrap_state` standing, a finalize killed partway
+            # can mark done over a half-empty catalogue, and iss29-A01 is
+            # exactly the "marked done, imported nothing" shape. In all three
+            # the user sees an empty library, presses the one button the empty
+            # state offers, and would be told forever to send a flag that tile
+            # cannot send. An empty catalogue has nothing stale to protect, so
+            # it is never the case this guard is for.
             if not (reset or force):
                 database = get_database()
                 state = lib2_bootstrap.get_state(database)
                 if (state.get("status") == "done"
                         and state.get("source_watermark")
-                        == lib2_bootstrap.source_watermark(database)):
+                        == lib2_bootstrap.source_watermark(database)
+                        and _lib2_has_catalogue_rows(database)):
                     return jsonify({
                         "success": False,
+                        # Machine-readable so the Import tile can offer the
+                        # force it names, instead of matching on prose.
+                        "code": "already_completed",
                         "error": ("Library import already completed and the "
                                   "legacy catalogue has not changed since. "
                                   "Re-running risks re-applying stale data — "
