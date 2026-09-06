@@ -94,81 +94,104 @@ describe('Library v2 retag preview', () => {
     );
 
     expect(await screen.findByText(/set by hand/i)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /Keep mine/i })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /Use "One Dance"/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Keep mine \(/i })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    );
+    expect(screen.getByText('Current file')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Use "One Dance"/ })).toHaveAttribute(
+      'aria-pressed',
+      'false',
+    );
+    expect(screen.getByRole('button', { name: /Use "One Dance"/ })).toHaveTextContent(
+      'Discovery / provider',
+    );
   });
 
-  it('sends only the fields the user actually released', async () => {
-    let body: Record<string, unknown> = {};
-    server.use(
-      http.get('/api/library/v2/albums/5/tag-preview', () =>
-        HttpResponse.json({
-          success: true,
-          tracks: [
-            {
-              track_id: 1,
-              title: 'One Dance',
-              track_number: 1,
-              album_id: 10,
-              album_title: 'Views',
-              album_type: 'album',
-              file_path: '/music/1.flac',
-              diff: [
-                {
-                  field: 'Title',
-                  file_value: 'a',
-                  db_value: 'b',
-                  changed: true,
-                  manual: true,
-                  manual_key: 'title',
-                  provider_value: 'c',
-                },
-                {
-                  field: 'Album',
-                  file_value: 'd',
-                  db_value: 'e',
-                  changed: true,
-                  manual: true,
-                  manual_key: 'album_title',
-                  provider_value: 'f',
-                },
-              ],
-              has_changes: true,
-              has_manual_conflict: true,
-            },
-          ],
-          changed_count: 1,
-          truncated: false,
+  it.each(['keep', 'release-title', 'keep-all'])(
+    'preserves manual edits unless explicitly released (release title: %s)',
+    async (choice) => {
+      let body: Record<string, unknown> = {};
+      server.use(
+        http.get('/api/library/v2/albums/5/tag-preview', () =>
+          HttpResponse.json({
+            success: true,
+            tracks: [
+              {
+                track_id: 1,
+                title: 'One Dance',
+                track_number: 1,
+                album_id: 10,
+                album_title: 'Views',
+                album_type: 'album',
+                file_path: '/music/1.flac',
+                diff: [
+                  {
+                    field: 'Title',
+                    file_value: 'a',
+                    db_value: 'b',
+                    changed: true,
+                    manual: true,
+                    manual_key: 'title',
+                    provider_value: 'c',
+                  },
+                  {
+                    field: 'Album',
+                    file_value: 'd',
+                    db_value: 'e',
+                    changed: true,
+                    manual: true,
+                    manual_key: 'album_title',
+                    provider_value: 'f',
+                  },
+                ],
+                has_changes: true,
+                has_manual_conflict: true,
+              },
+            ],
+            changed_count: 1,
+            truncated: false,
+          }),
+        ),
+        http.post('/api/library/v2/tags/write', async ({ request }) => {
+          body = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ success: true, job_id: 'j-1' });
         }),
-      ),
-      http.post('/api/library/v2/tags/write', async ({ request }) => {
-        body = (await request.json()) as Record<string, unknown>;
-        return HttpResponse.json({ success: true, job_id: 'j-1' });
-      }),
-      http.get('/api/library/v2/jobs/status', () =>
-        HttpResponse.json({
-          success: true,
-          running: false,
-          current: 1,
-          total: 1,
-          result: { written: 1, skipped: 0, failed: 0 },
-        }),
-      ),
-    );
+        http.get('/api/library/v2/jobs/status', () =>
+          HttpResponse.json({
+            success: true,
+            running: false,
+            current: 1,
+            total: 1,
+            result: { written: 1, skipped: 0, failed: 0 },
+          }),
+        ),
+      );
 
-    render(
-      <QueryClientProvider client={createTestQueryClient()}>
-        <RetagModal entity="albums" id={5} title="Views" onClose={vi.fn()} />
-      </QueryClientProvider>,
-    );
+      render(
+        <QueryClientProvider client={createTestQueryClient()}>
+          <RetagModal entity="albums" id={5} title="Views" onClose={vi.fn()} />
+        </QueryClientProvider>,
+      );
 
-    // Release the title only; the album title keeps the hand-set value.
-    fireEvent.click(await screen.findByRole('button', { name: /Use "c"/ }));
-    fireEvent.click(screen.getByRole('button', { name: /Write tags/ }));
-    await screen.findByText(/Done: 1 written/);
+      // Release the title only; the album title keeps the hand-set value.
+      const useProvider = await screen.findByRole('button', { name: /Use "c"/ });
+      if (choice !== 'keep') fireEvent.click(useProvider);
+      if (choice === 'keep-all') {
+        fireEvent.click(screen.getByRole('button', { name: /Use "f"/ }));
+        fireEvent.click(screen.getByRole('button', { name: /Keep mine for all/ }));
+        for (const button of screen.getAllByRole('button', { name: /Keep mine \(/ })) {
+          expect(button).toHaveAttribute('aria-pressed', 'true');
+        }
+      }
+      fireEvent.click(screen.getByRole('button', { name: /Write tags/ }));
+      await screen.findByText(/Done: 1 written/);
 
-    // Per (track, field), not a blanket flag: settling the title must not hand
-    // the album title over with it.
-    expect(body.overwrite_manual).toEqual([[1, 'title']]);
-  });
+      // Per (track, field), not a blanket flag: settling the title must not hand
+      // the album title over with it.
+      expect(body.overwrite_manual).toEqual(
+        choice === 'release-title' ? [[1, 'title']] : undefined,
+      );
+    },
+  );
 });

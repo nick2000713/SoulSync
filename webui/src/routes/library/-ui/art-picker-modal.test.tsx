@@ -28,7 +28,7 @@ describe('ArtistImagePickerModal', () => {
       </QueryClientProvider>,
     );
 
-    await screen.findByAltText('Cover option from deezer');
+    await screen.findByAltText('Photo option from deezer');
     expect(seenRefreshParams).toEqual([null]);
 
     fireEvent.click(

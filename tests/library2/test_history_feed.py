@@ -451,6 +451,14 @@ def test_an_acoustid_scan_event_says_the_verdict_not_just_the_field_names(import
     # Detail carries the reasoning — not the same field doing double duty.
     assert scan_event["status"] == "Mismatch"
     assert "Wrong Song" in scan_event["detail"]
+    assert scan_event["track_id"] == drake["track_id"]
+    assert scan_event["track_title"] == "One Dance"
+    assert scan_event["album_title"] == "Views"
+    assert scan_event["changed_fields"] == ["file_snapshot"]
+    # Older journals have no verdict snapshot. Never present today's file
+    # state as if it had been recorded at the time of the event.
+    assert scan_event["status_basis"] == "current_file"
+    assert scan_event["job_id"] == "acoustid_scanner"
 
 
 def test_acoustid_scan_event_says_unverified_not_skipped_when_the_check_ran(imported_conn):
@@ -679,3 +687,34 @@ def test_unsupported_scope_raises(imported_conn):
 def test_limit_out_of_range_raises(imported_conn, limit):
     with pytest.raises(ValueError):
         scoped_history(imported_conn, scope="artist", entity_id=1, limit=limit)
+
+
+@pytest.mark.parametrize("stored,expected", [
+    ('{"track_number": 3}', []),
+    ('7', []),
+    ('"track_number"', []),
+    ('["track_number"]', ["track_number"]),
+])
+def test_changed_fields_is_always_the_list_the_ui_is_promised(
+        imported_conn, stored, expected):
+    """`changed_fields_json` is free-form JSON written by whatever repair job
+    produced the row, but the feed serves it as `changed_fields: string[]`. A
+    stored object or scalar decoded straight through, reaching the UI as a
+    shape its own types promise cannot occur — and the detail line's
+    `', '.join` would silently render a dict's KEYS as if they were the fields
+    that changed."""
+    from core.library2.maintenance_sync import ensure_maintenance_event_schema
+
+    drake = _drake_ids(imported_conn)
+    ensure_maintenance_event_schema(imported_conn.cursor())
+    imported_conn.execute(
+        "INSERT INTO lib2_maintenance_events(job_id, action, lib2_track_id, "
+        "changed_fields_json) VALUES('track_number_repair', 'track_updated', ?, ?)",
+        (drake["track_id"], stored),
+    )
+    imported_conn.commit()
+
+    history = scoped_history(imported_conn, scope="track", entity_id=drake["track_id"])
+    event = next(e for e in history if e["event_type"] == "track_updated")
+
+    assert event["changed_fields"] == expected

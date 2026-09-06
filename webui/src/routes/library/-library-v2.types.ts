@@ -38,7 +38,9 @@ export const libraryV2SearchSchema = z.object({
   page: z.coerce.number().int().positive().default(1).catch(1),
   artist: z.coerce.number().int().positive().optional().catch(undefined),
   album: z.coerce.number().int().positive().optional().catch(undefined),
-  /** Artist detail: show only owned releases or the full provider discography. */
+  /** Artist detail: release collection or on-demand music videos. */
+  artistView: z.enum(['releases', 'videos']).default('releases').catch('releases'),
+  /** Show owned releases or the full provider discography. */
   releases: z.enum(['library', 'all']).default('library').catch('library'),
   wantedKind: z.enum(LIBRARY_V2_WANTED_KINDS).default('missing').catch('missing'),
   /** ldp-01/ldp-02 discovery mode: `<source>:<provider id>` of an artist that
@@ -345,6 +347,8 @@ export interface LibraryV2ReorganizeTrackPreview {
   disc_number: number | null;
   current_path: string | null;
   new_path: string | null;
+  current_path_abs?: string | null;
+  new_path_abs?: string | null;
   file_exists: boolean;
   unchanged: boolean;
   collision: boolean;

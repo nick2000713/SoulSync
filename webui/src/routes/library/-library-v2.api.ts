@@ -1208,18 +1208,27 @@ export interface LibraryV2HistoryEntry {
   title: string | null;
   detail: string | null;
   source: string | null;
-  status?: 'passed' | 'failed' | 'skipped' | 'not_run' | 'error' | null;
+  status?: string | null;
+  /** Legacy maintenance events resolve today's file verdict, not a snapshot. */
+  status_basis?: 'current_file' | null;
+  track_id?: number | null;
+  track_title?: string | null;
+  album_id?: number | null;
+  album_title?: string | null;
+  changed_fields?: string[];
+  job_id?: string | null;
   payload?: Record<string, unknown>;
 }
 
 export async function fetchLibraryV2ArtistHistory(
   artistId: number,
+  limit = 50,
 ): Promise<LibraryV2HistoryEntry[]> {
   const payload = await readJson<{
     success: boolean;
     history?: LibraryV2HistoryEntry[];
     error?: string;
-  }>(apiClient.get(`library/v2/artists/${artistId}/history`));
+  }>(apiClient.get(`library/v2/artists/${artistId}/history`, { searchParams: { limit } }));
   if (!payload.success) throw new Error(payload.error || 'History failed');
   return payload.history ?? [];
 }
@@ -1242,12 +1251,13 @@ export async function fetchLibraryV2TrackHistory(
  * to just this release. */
 export async function fetchLibraryV2AlbumHistory(
   albumId: number,
+  limit = 50,
 ): Promise<LibraryV2HistoryEntry[]> {
   const payload = await readJson<{
     success: boolean;
     history?: LibraryV2HistoryEntry[];
     error?: string;
-  }>(apiClient.get(`library/v2/albums/${albumId}/history`));
+  }>(apiClient.get(`library/v2/albums/${albumId}/history`, { searchParams: { limit } }));
   if (!payload.success) throw new Error(payload.error || 'History failed');
   return payload.history ?? [];
 }
@@ -2041,8 +2051,7 @@ export interface LibraryV2UnmatchedSummary {
 export function libraryV2UnmatchedQueryOptions() {
   return queryOptions({
     queryKey: [...LIBRARY_V2_QUERY_KEY, 'unmatched'] as const,
-    queryFn: () =>
-      readJson<LibraryV2UnmatchedSummary>(apiClient.get('library/unmatched-summary')),
+    queryFn: () => readJson<LibraryV2UnmatchedSummary>(apiClient.get('library/unmatched-summary')),
     staleTime: 60_000,
   });
 }

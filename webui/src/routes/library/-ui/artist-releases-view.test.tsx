@@ -139,6 +139,36 @@ describe('Library V2 artist detail — All Releases views', () => {
     );
   });
 
+  it('loads music videos only when opened and preserves the release view', async () => {
+    const searches = vi.fn();
+    server.use(
+      http.post('/api/enhanced-search/source/youtube_videos', () => {
+        searches();
+        return HttpResponse.text('{"type":"videos","data":[]}\n');
+      }),
+    );
+    const { router } = renderArtist('/library?artist=1&releases=all&releaseView=cards');
+    await screen.findByRole('heading', { name: 'Portishead' });
+    expect(searches).not.toHaveBeenCalled();
+    expect(screen.queryByRole('heading', { name: 'Music Videos' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Music Videos', exact: true }));
+    await screen.findByText('No music videos found for this artist.');
+    expect(searches).toHaveBeenCalledTimes(1);
+    expect(router.state.location.search).toMatchObject({
+      artistView: 'videos',
+      releases: 'all',
+      releaseView: 'cards',
+    });
+    expect(screen.queryByRole('button', { name: 'Discover View' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /All Releases/ }));
+    await screen.findByRole('button', { name: 'Discover View' });
+    expect(router.state.location.search).toMatchObject({
+      artistView: 'releases',
+      releaseView: 'cards',
+    });
+    expect(screen.queryByRole('heading', { name: 'Music Videos' })).not.toBeInTheDocument();
+  });
+
   it('offers the Table ↔ Discover switch only on All Releases (ldp-03)', async () => {
     const { router } = renderArtist('/library?artist=1');
     await screen.findByRole('heading', { name: 'Portishead' });
@@ -329,7 +359,7 @@ describe('Library V2 artist detail — All Releases views', () => {
     renderArtist('/library?artist=1');
     await screen.findByText('Nothing Wanted');
 
-    expect(screen.getByText('not in library')).toBeInTheDocument();
+    expect(screen.getByText('0/10')).toHaveAttribute('data-presence', 'empty');
     expect(screen.queryByText('complete')).not.toBeInTheDocument();
   });
 
@@ -378,7 +408,7 @@ describe('Library V2 artist detail — All Releases views', () => {
     renderArtist('/library?artist=1');
     await screen.findByText('Fully Owned');
 
-    expect(screen.getByText('complete')).toBeInTheDocument();
+    expect(screen.getByText('10/10')).toHaveAttribute('data-presence', 'complete');
     expect(screen.queryByText('not in library')).not.toBeInTheDocument();
   });
 
@@ -555,9 +585,7 @@ describe('Library V2 artist detail — All Releases views', () => {
     // The monitor toggle by its own label, not "the first icon in the hero" —
     // the hero actions gained a Play button in front of it, and a positional
     // lookup silently compares against whatever happens to be leftmost.
-    const monitor = screen
-      .getByLabelText(/^(Start|Stop) monitoring$/)
-      .querySelector('svg path');
+    const monitor = screen.getByLabelText(/^(Start|Stop) monitoring$/).querySelector('svg path');
     expect(bookmark.querySelector('svg path')?.getAttribute('d')).toBe(monitor?.getAttribute('d'));
   });
 });

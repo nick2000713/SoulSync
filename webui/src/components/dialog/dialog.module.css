@@ -40,6 +40,32 @@
   min-width: 0;
 }
 
+.headerCompact {
+  padding: 10px 16px;
+  align-items: center;
+  gap: 12px;
+}
+
+.headerCompact .headerContent {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 3px 14px;
+}
+
+.headerCompact .title {
+  font-size: 18px;
+  line-height: 1.4;
+}
+.headerCompact .headerMeta {
+  margin-top: 0;
+}
+.headerCompact .close {
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+}
+
 .headerMeta {
   margin-top: 6px;
 }
@@ -119,6 +145,10 @@
 
   .header {
     padding: 18px;
+  }
+
+  .headerCompact {
+    padding: 10px 14px;
   }
 
   .body {

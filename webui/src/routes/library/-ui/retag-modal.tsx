@@ -1,8 +1,6 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useEffect, useMemo, useState } from 'react';
 
-import { useModalA11y } from '@/components/dialog/use-modal-a11y';
-
 import {
   fetchLibraryV2JobStatus,
   fetchLibraryV2TagPreview,
@@ -11,6 +9,7 @@ import {
   type LibraryV2TagPreviewTrack,
 } from '../-library-v2.api';
 import styles from './library-v2-page.module.css';
+import { LibraryToolDialog } from './tool-dialog';
 
 function fieldValue(v: unknown): string {
   if (v === null || v === undefined || v === '') return '—';
@@ -21,11 +20,23 @@ function fieldValue(v: unknown): string {
   return '—';
 }
 
-function diffSummary(t: LibraryV2TagPreviewTrack): string {
-  return t.diff
-    .filter((d) => !d.manual)
-    .map((d) => `${d.field}: ${fieldValue(d.file_value)} → ${fieldValue(d.db_value)}`)
-    .join('  ·  ');
+function TagChanges({ track }: { track: LibraryV2TagPreviewTrack }) {
+  return (
+    <div className={styles.tagChanges}>
+      {track.diff
+        .filter((d) => !d.manual)
+        .map((d) => (
+          <div className={styles.tagChange} key={d.field}>
+            <span className={styles.tagField}>{d.field}</span>
+            <span className={styles.tagBefore}>{fieldValue(d.file_value)}</span>
+            <span className={styles.tagArrow} aria-label="changes to">
+              →
+            </span>
+            <span className={styles.tagAfter}>{fieldValue(d.db_value)}</span>
+          </div>
+        ))}
+    </div>
+  );
 }
 
 /** One key per released field. A blanket "overwrite everything" flag would let
@@ -57,23 +68,42 @@ function ManualFieldChoice({
   const provider = fieldValue(row.provider_value);
   return (
     <div className={styles.retagManualRow}>
-      <span className={styles.retagManualField}>{row.field}</span>
-      <span className={styles.retagManualNote}>set by hand</span>
+      <span className={styles.retagManualField}>
+        {row.field}
+        <small className={styles.retagManualNote}>set by hand</small>
+      </span>
+      <span className={styles.retagManualFile}>
+        <span className={styles.retagChoiceLabel}>Current file</span>
+        <strong>{fieldValue(row.file_value)}</strong>
+      </span>
+      <span className={styles.tagArrow} aria-hidden="true">
+        →
+      </span>
       <button
         type="button"
         className={released ? styles.retagChoice : styles.retagChoiceActive}
         disabled={disabled}
+        aria-pressed={!released}
+        aria-label={`Keep mine (${fieldValue(row.db_value)})`}
         onClick={() => released && onToggle()}
       >
-        Keep mine ({fieldValue(row.db_value)})
+        <span className={styles.retagChoiceLabel}>
+          <span aria-hidden="true">{!released ? '●' : '○'}</span> Your manual edit · Keep mine
+        </span>
+        <strong>{fieldValue(row.db_value)}</strong>
       </button>
       <button
         type="button"
         className={released ? styles.retagChoiceActive : styles.retagChoice}
         disabled={disabled}
+        aria-pressed={released}
+        aria-label={`Use "${provider}" from discovery / provider`}
         onClick={() => !released && onToggle()}
       >
-        Use "{provider}"
+        <span className={styles.retagChoiceLabel}>
+          <span aria-hidden="true">{released ? '●' : '○'}</span> Discovery / provider
+        </span>
+        <strong>{provider}</strong>
       </button>
     </div>
   );
@@ -102,7 +132,6 @@ export function RetagModal({
   title: string;
   onClose: () => void;
 }) {
-  const a11yRef = useModalA11y<HTMLDivElement>(onClose);
   const queryClient = useQueryClient();
   const previewQuery = useQuery({
     queryKey: [...LIBRARY_V2_QUERY_KEY, 'tag-preview', entity, id],
@@ -116,7 +145,16 @@ export function RetagModal({
     );
   }, [previewQuery.data]);
   const changed = useMemo(() => tracks.filter((t) => t.has_changes), [tracks]);
+  const manualCount = tracks.reduce(
+    (count, track) => count + track.diff.filter((field) => field.manual && field.manual_key).length,
+    0,
+  );
 
+  const [showUnchanged, setShowUnchanged] = useState(false);
+  const visibleTracks = useMemo(
+    () => tracks.filter((t) => showUnchanged || t.has_changes || t.error),
+    [tracks, showUnchanged],
+  );
   const grouped = useMemo(() => {
     const byAlbum = new Map<
       number,
@@ -127,7 +165,7 @@ export function RetagModal({
         tracks: LibraryV2TagPreviewTrack[];
       }
     >();
-    for (const t of tracks) {
+    for (const t of visibleTracks) {
       let group = byAlbum.get(t.album_id);
       if (!group) {
         group = {
@@ -141,7 +179,7 @@ export function RetagModal({
       group.tracks.push(t);
     }
     return [...byAlbum.values()];
-  }, [tracks]);
+  }, [visibleTracks]);
 
   const [selected, setSelected] = useState<Set<number>>(new Set());
   // Hand-set fields the user handed back to the catalogue, as `trackId:key`.
@@ -214,119 +252,11 @@ export function RetagModal({
   }
 
   return (
-    <div className={styles.modalBackdrop} role="presentation" onClick={onClose}>
-      <div
-        className={`${styles.modal} ${styles.modalWide}`}
-        ref={a11yRef}
-        tabIndex={-1}
-        role="dialog"
-        aria-modal="true"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className={styles.modalHeader}>
-          <h3>Preview Retag — {title}</h3>
-          <button type="button" className={styles.iconAction} title="Close" onClick={onClose}>
-            ✕
-          </button>
-        </div>
-
-        {message ? (
-          <div
-            className={
-              phase === 'error'
-                ? styles.searchError
-                : `${styles.grabBanner} ${phase === 'done' ? styles.grab_ok : styles.grab_busy}`
-            }
-          >
-            {message}
-          </div>
-        ) : null}
-
-        <div className={styles.resultsWrap}>
-          {previewQuery.isLoading ? (
-            <div className={styles.inlineLoading}>Reading file tags…</div>
-          ) : previewQuery.isError ? (
-            <div className={styles.searchError}>
-              {previewQuery.error instanceof Error ? previewQuery.error.message : 'Preview failed'}
-            </div>
-          ) : tracks.length === 0 ? (
-            <div className={styles.inlineLoading}>No tracks with files.</div>
-          ) : (
-            <table className={styles.trackTable}>
-              <thead>
-                <tr>
-                  <th className={styles.colMonitor}></th>
-                  <th className={styles.colNum}>#</th>
-                  <th>Title</th>
-                  <th>Changes (file → library)</th>
-                </tr>
-              </thead>
-              {grouped.map((group) => {
-                const changedInGroup = group.tracks.filter((track) => track.has_changes).length;
-                return (
-                  <tbody key={group.albumId} className={styles.retagAlbumGroup}>
-                    <tr className={styles.albumGroupHeaderRow}>
-                      <td colSpan={4} className={styles.albumGroupHeader}>
-                        <span className={styles.retagAlbumHeading}>
-                          <span>{group.albumTitle}</span>
-                          <span className={styles.retagReleaseType}>
-                            {releaseTypeLabel(group.albumType)}
-                          </span>
-                          <span className={styles.retagAlbumCount}>
-                            {changedInGroup} of {group.tracks.length} changing
-                          </span>
-                        </span>
-                      </td>
-                    </tr>
-                    {group.tracks.map((t) => (
-                      <tr key={t.track_id} className={t.has_changes ? '' : styles.staticRow}>
-                        <td>
-                          {t.has_changes ? (
-                            <input
-                              type="checkbox"
-                              checked={selected.has(t.track_id)}
-                              disabled={phase === 'writing'}
-                              onChange={() => toggle(t.track_id)}
-                            />
-                          ) : null}
-                        </td>
-                        <td className={styles.colNum}>{t.track_number ?? '—'}</td>
-                        <td title={t.file_path ?? undefined}>{t.title ?? '—'}</td>
-                        <td className={styles.diffCell}>
-                          {t.error ? (
-                            <span className={styles.statusWarn}>{t.error}</span>
-                          ) : t.has_changes ? (
-                            <>
-                              {diffSummary(t)}
-                              {t.diff
-                                .filter((d) => d.manual && d.manual_key)
-                                .map((d) => (
-                                  <ManualFieldChoice
-                                    key={d.manual_key}
-                                    row={d}
-                                    released={released.has(
-                                      releaseKey(t.track_id, d.manual_key as string),
-                                    )}
-                                    onToggle={() =>
-                                      toggleRelease(t.track_id, d.manual_key as string)
-                                    }
-                                    disabled={phase === 'writing'}
-                                  />
-                                ))}
-                            </>
-                          ) : (
-                            <span className={styles.statusOk}>tags match</span>
-                          )}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                );
-              })}
-            </table>
-          )}
-        </div>
-
+    <LibraryToolDialog
+      title={`Preview Retag — ${title}`}
+      onClose={onClose}
+      description="File tags → library values. Manual edits are kept unless you explicitly choose the discovery / provider value."
+      footer={
         <div className={styles.modalActions}>
           {previewQuery.data?.truncated ? (
             <span className={styles.modalActionsText}>Showing the first 500 tracks.</span>
@@ -343,7 +273,149 @@ export function RetagModal({
             {phase === 'writing' ? 'Writing…' : `Write tags (${selected.size})`}
           </button>
         </div>
+      }
+    >
+      <div className={styles.previewToolbar}>
+        <span>
+          <strong>{changed.length}</strong> files with changes{' '}
+          <span className={styles.previewQuiet}>of {tracks.length} files</span>
+        </span>
+        <div className={styles.previewControls}>
+          {manualCount > 0 ? (
+            <button
+              type="button"
+              className={styles.btnGhost}
+              disabled={phase === 'writing' || phase === 'done'}
+              aria-pressed={released.size === 0}
+              onClick={() => setReleased(new Set())}
+            >
+              Keep mine for all ({manualCount})
+            </button>
+          ) : null}
+          <label className={styles.checkOption}>
+            <input
+              type="checkbox"
+              checked={showUnchanged}
+              onChange={(e) => setShowUnchanged(e.target.checked)}
+            />
+            Show unchanged
+          </label>
+          <button
+            className={styles.btnGhost}
+            type="button"
+            disabled={phase === 'writing' || phase === 'done' || changed.length === 0}
+            onClick={() =>
+              setSelected(
+                selected.size === changed.length
+                  ? new Set()
+                  : new Set(changed.map((t) => t.track_id)),
+              )
+            }
+          >
+            {selected.size === changed.length ? 'Deselect all' : 'Select all changes'}
+          </button>
+        </div>
       </div>
-    </div>
+      {message ? (
+        <div
+          className={
+            phase === 'error'
+              ? styles.searchError
+              : `${styles.grabBanner} ${phase === 'done' ? styles.grab_ok : styles.grab_busy}`
+          }
+        >
+          {message}
+        </div>
+      ) : null}
+
+      <div className={styles.resultsWrap}>
+        {previewQuery.isLoading ? (
+          <div className={styles.inlineLoading}>Reading file tags…</div>
+        ) : previewQuery.isError ? (
+          <div className={styles.searchError}>
+            {previewQuery.error instanceof Error ? previewQuery.error.message : 'Preview failed'}
+          </div>
+        ) : tracks.length === 0 ? (
+          <div className={styles.inlineLoading}>No tracks with files.</div>
+        ) : visibleTracks.length === 0 ? (
+          <div className={styles.inlineLoading}>
+            All file tags match your library. Enable “Show unchanged” to review them.
+          </div>
+        ) : (
+          <table className={`${styles.trackTable} ${styles.retagTable}`}>
+            <thead>
+              <tr>
+                <th className={styles.colMonitor}></th>
+                <th className={styles.colNum}>#</th>
+                <th>Title</th>
+                <th>Tag changes · current file → library value</th>
+              </tr>
+            </thead>
+            {grouped.map((group) => {
+              const changedInGroup = group.tracks.filter((track) => track.has_changes).length;
+              return (
+                <tbody key={group.albumId} className={styles.retagAlbumGroup}>
+                  <tr className={styles.albumGroupHeaderRow}>
+                    <td colSpan={4} className={styles.albumGroupHeader}>
+                      <span className={styles.retagAlbumHeading}>
+                        <span>{group.albumTitle}</span>
+                        <span className={styles.retagReleaseType}>
+                          {releaseTypeLabel(group.albumType)}
+                        </span>
+                        <span className={styles.retagAlbumCount}>
+                          {changedInGroup} of{' '}
+                          {tracks.filter((t) => t.album_id === group.albumId).length} changing
+                        </span>
+                      </span>
+                    </td>
+                  </tr>
+                  {group.tracks.map((t) => (
+                    <tr key={t.track_id} className={t.has_changes ? '' : styles.staticRow}>
+                      <td>
+                        {t.has_changes ? (
+                          <input
+                            type="checkbox"
+                            aria-label={`Retag ${t.title || `track ${t.track_id}`}`}
+                            checked={selected.has(t.track_id)}
+                            disabled={phase === 'writing' || phase === 'done'}
+                            onChange={() => toggle(t.track_id)}
+                          />
+                        ) : null}
+                      </td>
+                      <td className={styles.colNum}>{t.track_number ?? '—'}</td>
+                      <td title={t.file_path ?? undefined}>{t.title ?? '—'}</td>
+                      <td className={styles.diffCell}>
+                        {t.error ? (
+                          <span className={styles.statusWarn}>{t.error}</span>
+                        ) : t.has_changes ? (
+                          <>
+                            <TagChanges track={t} />
+                            {t.diff
+                              .filter((d) => d.manual && d.manual_key)
+                              .map((d) => (
+                                <ManualFieldChoice
+                                  key={d.manual_key}
+                                  row={d}
+                                  released={released.has(
+                                    releaseKey(t.track_id, d.manual_key as string),
+                                  )}
+                                  onToggle={() => toggleRelease(t.track_id, d.manual_key as string)}
+                                  disabled={phase === 'writing' || phase === 'done'}
+                                />
+                              ))}
+                          </>
+                        ) : (
+                          <span className={styles.statusOk}>tags match</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              );
+            })}
+          </table>
+        )}
+      </div>
+    </LibraryToolDialog>
   );
 }

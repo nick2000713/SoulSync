@@ -1,8 +1,6 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useState } from 'react';
 
-import { useModalA11y } from '@/components/dialog/use-modal-a11y';
-
 import type { LibraryV2ArtCandidate } from '../-library-v2.types';
 
 import {
@@ -15,6 +13,7 @@ import {
   releaseLibraryV2ArtistArt,
 } from '../-library-v2.api';
 import styles from './library-v2-page.module.css';
+import { LibraryToolDialog } from './tool-dialog';
 
 /** dd28-23: a timed-out apply is not a rejected apply. ky raises TimeoutError
  *  once its own budget runs out, but the request keeps running server-side and
@@ -40,7 +39,6 @@ export function AlbumArtPickerModal({
   albumTitle: string;
   onClose: () => void;
 }) {
-  const a11yRef = useModalA11y<HTMLDivElement>(onClose);
   const queryClient = useQueryClient();
   // iss27-03: a 5-minute server cache can pin a partial result from a
   // transient provider hiccup — bumping this forces `?refresh=1`, a fresh
@@ -90,59 +88,12 @@ export function AlbumArtPickerModal({
   const candidates = optionsQuery.data ?? [];
 
   return (
-    <div className={styles.modalBackdrop} role="presentation" onClick={onClose}>
-      <div
-        className={`${styles.modal} ${styles.modalWide}`}
-        ref={a11yRef}
-        tabIndex={-1}
-        role="dialog"
-        aria-modal="true"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className={styles.modalHeader}>
-          <h3>Change Cover — {albumTitle}</h3>
-          <button
-            type="button"
-            className={styles.iconAction}
-            title="Refresh — re-query every provider instead of the cached result"
-            disabled={optionsQuery.isFetching}
-            onClick={() => setRefreshNonce((n) => n + 1)}
-          >
-            ⟳
-          </button>
-          <button type="button" className={styles.iconAction} title="Close" onClick={onClose}>
-            ✕
-          </button>
-        </div>
-
-        {error ? <div className={styles.searchError}>{error}</div> : null}
-
-        <div className={styles.resultsWrap}>
-          {optionsQuery.isLoading ? (
-            <div className={styles.inlineLoading}>Fetching candidate covers…</div>
-          ) : optionsQuery.isError ? (
-            <div className={styles.searchError}>
-              {optionsQuery.error instanceof Error
-                ? optionsQuery.error.message
-                : 'Failed to load covers'}
-            </div>
-          ) : candidates.length === 0 ? (
-            <div className={styles.inlineLoading}>No alternate covers found.</div>
-          ) : (
-            <div className={styles.artPickerGrid}>
-              {candidates.map((c, i) => (
-                <ArtPickerCard
-                  key={`${c.source}:${c.url}:${i}`}
-                  candidate={c}
-                  busy={busyUrl === c.url}
-                  disabled={busyUrl !== null || releasing}
-                  onPick={() => void apply(c.url)}
-                />
-              ))}
-            </div>
-          )}
-        </div>
-
+    <LibraryToolDialog
+      title={`Change Cover — ${albumTitle}`}
+      description="Select an image to apply it. Your choice is kept on refresh."
+      onClose={onClose}
+      fitContent
+      footer={
         <div className={styles.modalActions}>
           <button
             type="button"
@@ -157,8 +108,48 @@ export function AlbumArtPickerModal({
             Cancel
           </button>
         </div>
+      }
+    >
+      <div className={styles.previewToolbar}>
+        <span className={styles.previewQuiet}>{candidates.length} image options</span>
+        <button
+          type="button"
+          className={styles.btnGhost}
+          title="Refresh — re-query every provider instead of the cached result"
+          disabled={optionsQuery.isFetching}
+          onClick={() => setRefreshNonce((n) => n + 1)}
+        >
+          {optionsQuery.isFetching ? 'Refreshing…' : 'Refresh images'}
+        </button>
       </div>
-    </div>
+      {error ? <div className={styles.searchError}>{error}</div> : null}
+
+      <div className={styles.resultsWrap}>
+        {optionsQuery.isLoading ? (
+          <div className={styles.inlineLoading}>Fetching candidate covers…</div>
+        ) : optionsQuery.isError ? (
+          <div className={styles.searchError}>
+            {optionsQuery.error instanceof Error
+              ? optionsQuery.error.message
+              : 'Failed to load covers'}
+          </div>
+        ) : candidates.length === 0 ? (
+          <div className={styles.inlineLoading}>No alternate covers found.</div>
+        ) : (
+          <div className={styles.artPickerGrid}>
+            {candidates.map((c, i) => (
+              <ArtPickerCard
+                key={`${c.source}:${c.url}:${i}`}
+                candidate={c}
+                busy={busyUrl === c.url}
+                disabled={busyUrl !== null || releasing}
+                onPick={() => void apply(c.url)}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+    </LibraryToolDialog>
   );
 }
 
@@ -174,7 +165,6 @@ export function ArtistImagePickerModal({
   artistName: string;
   onClose: () => void;
 }) {
-  const a11yRef = useModalA11y<HTMLDivElement>(onClose);
   const queryClient = useQueryClient();
   // iss27-03: see the matching comment in AlbumArtPickerModal above.
   const [refreshNonce, setRefreshNonce] = useState(0);
@@ -219,59 +209,12 @@ export function ArtistImagePickerModal({
   const candidates = optionsQuery.data ?? [];
 
   return (
-    <div className={styles.modalBackdrop} role="presentation" onClick={onClose}>
-      <div
-        className={`${styles.modal} ${styles.modalWide}`}
-        ref={a11yRef}
-        tabIndex={-1}
-        role="dialog"
-        aria-modal="true"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className={styles.modalHeader}>
-          <h3>Change Photo — {artistName}</h3>
-          <button
-            type="button"
-            className={styles.iconAction}
-            title="Refresh — re-query every provider instead of the cached result"
-            disabled={optionsQuery.isFetching}
-            onClick={() => setRefreshNonce((n) => n + 1)}
-          >
-            ⟳
-          </button>
-          <button type="button" className={styles.iconAction} title="Close" onClick={onClose}>
-            ✕
-          </button>
-        </div>
-
-        {error ? <div className={styles.searchError}>{error}</div> : null}
-
-        <div className={styles.resultsWrap}>
-          {optionsQuery.isLoading ? (
-            <div className={styles.inlineLoading}>Fetching candidate photos…</div>
-          ) : optionsQuery.isError ? (
-            <div className={styles.searchError}>
-              {optionsQuery.error instanceof Error
-                ? optionsQuery.error.message
-                : 'Failed to load photos'}
-            </div>
-          ) : candidates.length === 0 ? (
-            <div className={styles.inlineLoading}>No alternate photos found.</div>
-          ) : (
-            <div className={styles.artPickerGrid}>
-              {candidates.map((c, i) => (
-                <ArtPickerCard
-                  key={`${c.source}:${c.url}:${i}`}
-                  candidate={c}
-                  busy={busyUrl === c.url}
-                  disabled={busyUrl !== null || releasing}
-                  onPick={() => void apply(c.url)}
-                />
-              ))}
-            </div>
-          )}
-        </div>
-
+    <LibraryToolDialog
+      title={`Change Photo — ${artistName}`}
+      description="Select an image to apply it. Your choice is kept on refresh."
+      onClose={onClose}
+      fitContent
+      footer={
         <div className={styles.modalActions}>
           <button
             type="button"
@@ -286,18 +229,61 @@ export function ArtistImagePickerModal({
             Cancel
           </button>
         </div>
+      }
+    >
+      <div className={styles.previewToolbar}>
+        <span className={styles.previewQuiet}>{candidates.length} image options</span>
+        <button
+          type="button"
+          className={styles.btnGhost}
+          title="Refresh — re-query every provider instead of the cached result"
+          disabled={optionsQuery.isFetching}
+          onClick={() => setRefreshNonce((n) => n + 1)}
+        >
+          {optionsQuery.isFetching ? 'Refreshing…' : 'Refresh images'}
+        </button>
       </div>
-    </div>
+      {error ? <div className={styles.searchError}>{error}</div> : null}
+
+      <div className={styles.resultsWrap}>
+        {optionsQuery.isLoading ? (
+          <div className={styles.inlineLoading}>Fetching candidate photos…</div>
+        ) : optionsQuery.isError ? (
+          <div className={styles.searchError}>
+            {optionsQuery.error instanceof Error
+              ? optionsQuery.error.message
+              : 'Failed to load photos'}
+          </div>
+        ) : candidates.length === 0 ? (
+          <div className={styles.inlineLoading}>No alternate photos found.</div>
+        ) : (
+          <div className={styles.artPickerGrid}>
+            {candidates.map((c, i) => (
+              <ArtPickerCard
+                key={`${c.source}:${c.url}:${i}`}
+                candidate={c}
+                subject="photo"
+                busy={busyUrl === c.url}
+                disabled={busyUrl !== null || releasing}
+                onPick={() => void apply(c.url)}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+    </LibraryToolDialog>
   );
 }
 
 function ArtPickerCard({
   candidate,
+  subject = 'cover',
   busy,
   disabled,
   onPick,
 }: {
   candidate: LibraryV2ArtCandidate;
+  subject?: 'cover' | 'photo';
   busy: boolean;
   disabled: boolean;
   onPick: () => void;
@@ -307,13 +293,13 @@ function ArtPickerCard({
       type="button"
       className={styles.artPickerCard}
       disabled={disabled}
-      title={`Use this cover from ${candidate.source}`}
+      title={`Use this ${subject} from ${candidate.source}`}
       onClick={onPick}
     >
       <img
         className={styles.artPickerImg}
         src={candidate.url}
-        alt={`Cover option from ${candidate.source}`}
+        alt={`${subject === 'photo' ? 'Photo' : 'Cover'} option from ${candidate.source}`}
         loading="lazy"
       />
       <span className={styles.artPickerBadge}>{busy ? 'Applying…' : candidate.source}</span>

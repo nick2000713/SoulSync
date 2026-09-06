@@ -5,7 +5,11 @@ import { describe, expect, it, vi } from 'vitest';
 import { HttpResponse, http, server } from '@/test/msw';
 import { createTestQueryClient } from '@/test/query-client';
 
-import { AlbumReorganizeModal, ArtistReorganizeAllModal } from './reorganize-modal';
+import {
+  AlbumReorganizeModal,
+  ArtistReorganizeAllModal,
+  ArtistRenamePreviewModal,
+} from './reorganize-modal';
 
 const PREVIEW_RESPONSE = {
   success: true,
@@ -32,6 +36,28 @@ const PREVIEW_RESPONSE = {
 };
 
 describe('library v2 album reorganize queue status', () => {
+  it.each([
+    ['unchanged', { unchanged: true }],
+    ['path conflict', { collision: true }],
+    ['unresolved destination', { new_path: '', reason: 'Template could not be resolved' }],
+  ])('does not offer an apply action for %s files', async (_label, overrides) => {
+    server.use(
+      http.post('/api/library/v2/albums/42/reorganize/preview', () =>
+        HttpResponse.json({
+          ...PREVIEW_RESPONSE,
+          tracks: [{ ...PREVIEW_RESPONSE.tracks[0], ...overrides }],
+        }),
+      ),
+    );
+    render(
+      <QueryClientProvider client={createTestQueryClient()}>
+        <AlbumReorganizeModal albumId={42} albumTitle="Views" onClose={vi.fn()} />
+      </QueryClientProvider>,
+    );
+    await screen.findByText('One Dance');
+    expect(screen.getByRole('button', { name: 'Rename / Organize (0)' })).toBeDisabled();
+  });
+
   it('polls the shared queue by queue id and shows live progress through to done', async () => {
     server.use(
       http.get('/api/library/v2/albums/42/reorganize/sources', () =>
@@ -73,9 +99,9 @@ describe('library v2 album reorganize queue status', () => {
       </QueryClientProvider>,
     );
 
-    fireEvent.click(await screen.findByRole('button', { name: /Reorganize \(1\)/ }));
+    fireEvent.click(await screen.findByRole('button', { name: /Rename \/ Organize \(1\)/ }));
 
-    expect(await screen.findByText('Reorganize finished (moved).')).toBeInTheDocument();
+    expect(await screen.findByText('Rename / Organize finished (moved).')).toBeInTheDocument();
   });
 
   it('offers no mode switch, because there is only one thing it does', async () => {
@@ -99,7 +125,7 @@ describe('library v2 album reorganize queue status', () => {
         <AlbumReorganizeModal albumId={42} albumTitle="Views" onClose={vi.fn()} />
       </QueryClientProvider>,
     );
-    await screen.findByRole('button', { name: /Reorganize \(1\)/ });
+    await screen.findByRole('button', { name: /Rename \/ Organize \(1\)/ });
 
     expect(screen.queryByLabelText(/Rename only/)).toBeNull();
     expect(screen.queryByLabelText(/Metadata source/)).toBeNull();
@@ -127,7 +153,7 @@ describe('library v2 album reorganize queue status', () => {
         <AlbumReorganizeModal albumId={42} albumTitle="Views" onClose={vi.fn()} />
       </QueryClientProvider>,
     );
-    await screen.findByRole('button', { name: /Reorganize \(1\)/ });
+    await screen.findByRole('button', { name: /Rename \/ Organize \(1\)/ });
 
     expect(body.source ?? null).toBeNull();
     expect(body.mode ?? null).toBeNull();
@@ -186,7 +212,7 @@ describe('library v2 album reorganize queue status', () => {
       </QueryClientProvider>,
     );
 
-    fireEvent.click(await screen.findByRole('button', { name: /Reorganize \(1\)/ }));
+    fireEvent.click(await screen.findByRole('button', { name: /Rename \/ Organize \(1\)/ }));
 
     expect(await screen.findByText('Not queued (already queued).')).toBeInTheDocument();
   });
@@ -213,11 +239,142 @@ describe('library v2 artist reorganize-all queue progress', () => {
       </QueryClientProvider>,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: 'Reorganize All Albums' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Rename / Organize All Releases' }));
 
     expect(await screen.findByText('2 of 2 album(s) queued.')).toBeInTheDocument();
     expect(
-      await screen.findByText('All queued albums for this artist have finished.'),
+      await screen.findByText('No queued or running releases remain for this artist.'),
     ).toBeInTheDocument();
+  });
+
+  it('closes the tool from the bulk view once the releases are queued', async () => {
+    // Opened from the per-release preview, the bulk dialog's only exit went
+    // BACK to that preview -- so the button labelled "Close" could not close
+    // anything, and the tool had no exit from this view at all.
+    server.use(
+      http.post('/api/library/v2/artists/7/reorganize-all', () =>
+        HttpResponse.json({ success: true, enqueued: 1, already_queued: 0, total_albums: 1 }),
+      ),
+      http.get('/api/library/reorganize/queue', () =>
+        HttpResponse.json({ success: true, active: null, queued: [], recent: [] }),
+      ),
+    );
+    const onClose = vi.fn();
+    const onBack = vi.fn();
+
+    const queryClient = createTestQueryClient();
+    render(
+      <QueryClientProvider client={queryClient}>
+        <ArtistReorganizeAllModal
+          artistId={7}
+          artistName="Drake"
+          onBack={onBack}
+          onClose={onClose}
+        />
+      </QueryClientProvider>,
+    );
+
+    // Before queueing it is a step backwards, and says so.
+    fireEvent.click(screen.getByRole('button', { name: 'Back' }));
+    expect(onBack).toHaveBeenCalledTimes(1);
+    expect(onClose).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Rename / Organize All Releases' }));
+    expect(await screen.findByText('1 of 1 album(s) queued.')).toBeInTheDocument();
+
+    // Queued: there is nothing to go back for, so Close closes. (Two buttons
+    // carry that name -- the header's x and the footer's; the footer one is
+    // the one the finding was about.)
+    const closers = screen.getAllByRole('button', { name: 'Close' });
+    fireEvent.click(closers[closers.length - 1]);
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(onBack).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('artist rename preview scope', () => {
+  it('previews all releases together, narrows scope, and applies the complete artist scope', async () => {
+    const applyAll = vi.fn();
+    server.use(
+      http.post('/api/library/v2/artists/7/reorganize-all', () => {
+        applyAll();
+        return HttpResponse.json({
+          success: true,
+          enqueued: 2,
+          already_queued: 0,
+          total_albums: 2,
+        });
+      }),
+      http.get('/api/library/reorganize/queue', () =>
+        HttpResponse.json({ success: true, active: null, queued: [], recent: [] }),
+      ),
+      http.post('/api/library/v2/albums/:id/reorganize/preview', ({ params }) =>
+        HttpResponse.json({
+          ...PREVIEW_RESPONSE,
+          tracks: [
+            {
+              ...PREVIEW_RESPONSE.tracks[0],
+              track_id: Number(params.id),
+              title: `Track ${params.id}`,
+            },
+          ],
+        }),
+      ),
+    );
+    render(
+      <QueryClientProvider client={createTestQueryClient()}>
+        <ArtistRenamePreviewModal
+          artistId={7}
+          artistName="Drake"
+          albums={[
+            { id: 42, title: 'Album release', tracks_present: 1 },
+            { id: 43, title: 'Single release', tracks_present: 1 },
+            { id: 44, title: 'No files', tracks_present: 0 },
+          ]}
+          onClose={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+    expect(await screen.findByText('Track 42')).toBeInTheDocument();
+    expect(await screen.findByText('Track 43')).toBeInTheDocument();
+    expect(screen.getByRole('combobox', { name: 'Preview release' })).toHaveValue('all');
+    expect(screen.getByRole('button', { name: 'Rename / Organize (2)' })).toBeEnabled();
+    expect(screen.queryByText('Track 44')).not.toBeInTheDocument();
+    fireEvent.change(screen.getByRole('combobox', { name: 'Preview release' }), {
+      target: { value: '43' },
+    });
+    expect(await screen.findByText('Track 43')).toBeInTheDocument();
+    expect(screen.queryByText('Track 42')).not.toBeInTheDocument();
+    fireEvent.change(screen.getByRole('combobox', { name: 'Preview release' }), {
+      target: { value: 'all' },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: 'Rename / Organize (2)' }));
+    expect(await screen.findByText('2 releases queued.')).toBeInTheDocument();
+    expect(applyAll).toHaveBeenCalledTimes(1);
+  });
+  it('blocks applying all when one release preview fails', async () => {
+    server.use(
+      http.post('/api/library/v2/albums/42/reorganize/preview', () =>
+        HttpResponse.json(PREVIEW_RESPONSE),
+      ),
+      http.post('/api/library/v2/albums/43/reorganize/preview', () =>
+        HttpResponse.json({ success: false, error: 'Preview unavailable' }),
+      ),
+    );
+    render(
+      <QueryClientProvider client={createTestQueryClient()}>
+        <ArtistRenamePreviewModal
+          artistId={7}
+          artistName="Drake"
+          albums={[
+            { id: 42, title: 'Album release', tracks_present: 1 },
+            { id: 43, title: 'Single release', tracks_present: 1 },
+          ]}
+          onClose={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+    expect(await screen.findByText('Preview unavailable')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Rename \/ Organize \(/ })).toBeDisabled();
   });
 });

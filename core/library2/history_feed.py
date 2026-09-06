@@ -510,23 +510,27 @@ def _maintenance_events(
     clauses: List[str] = []
     params: List[Any] = []
     if artist_ids:
-        clauses.append(f"lib2_artist_id IN ({_in_clause(artist_ids)})")
+        clauses.append(f"e.lib2_artist_id IN ({_in_clause(artist_ids)})")
         params.extend(artist_ids)
     if album_ids:
-        clauses.append(f"lib2_album_id IN ({_in_clause(album_ids)})")
+        clauses.append(f"e.lib2_album_id IN ({_in_clause(album_ids)})")
         params.extend(album_ids)
     if track_ids:
-        clauses.append(f"lib2_track_id IN ({_in_clause(track_ids)})")
+        clauses.append(f"e.lib2_track_id IN ({_in_clause(track_ids)})")
         params.extend(track_ids)
     if not clauses:
         return []
     try:
         rows = _rows(
             conn,
-            """SELECT job_id, finding_type, action, changed_fields_json, occurred_at,
-                      lib2_file_id, lib2_track_id
-                 FROM lib2_maintenance_events
-                WHERE """ + " OR ".join(clauses) + " ORDER BY id DESC LIMIT ?",
+            """SELECT e.job_id, e.finding_type, e.action, e.changed_fields_json, e.occurred_at,
+                      e.lib2_file_id, e.lib2_track_id, t.title AS track_title,
+                      COALESCE(e.lib2_album_id, t.album_id) AS album_id,
+                      a.title AS album_title
+                 FROM lib2_maintenance_events e
+                 LEFT JOIN lib2_tracks t ON t.id = e.lib2_track_id
+                 LEFT JOIN lib2_albums a ON a.id = COALESCE(e.lib2_album_id, t.album_id)
+                WHERE """ + " OR ".join(clauses) + " ORDER BY e.id DESC LIMIT ?",
             (*params, limit),
         )
     except Exception:  # noqa: BLE001 — table is additive on older databases
@@ -536,6 +540,14 @@ def _maintenance_events(
         try:
             fields = json.loads(row["changed_fields_json"] or "[]")
         except (TypeError, ValueError):
+            fields = []
+        # The column is free-form JSON written by whatever repair job produced
+        # the row, but this is served as `changed_fields: string[]`. A stored
+        # object or scalar decodes to a dict/number and would reach the UI as a
+        # shape its types promise cannot occur — and `', '.join` below would
+        # silently render a dict's KEYS. Anything that is not a list is no list
+        # of changed fields.
+        if not isinstance(fields, list):
             fields = []
         detail = (
             f"{row['job_id']} · {', '.join(str(field) for field in fields)}"
@@ -557,6 +569,13 @@ def _maintenance_events(
             "detail": detail,
             "source": "maintenance",
             "status": status,
+            "status_basis": "current_file" if status else None,
+            "track_id": row["lib2_track_id"],
+            "track_title": row["track_title"],
+            "album_id": row["album_id"],
+            "album_title": row["album_title"],
+            "changed_fields": fields,
+            "job_id": row["job_id"],
         })
     return events
 

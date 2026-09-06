@@ -36,13 +36,15 @@ export function DialogHeader({
   children,
   closeLabel = 'Close dialog',
   title,
+  compact = false,
 }: {
   children?: ReactNode;
   closeLabel?: string;
   title: ReactNode;
+  compact?: boolean;
 }) {
   return (
-    <div className={styles.header}>
+    <div className={clsx(styles.header, compact && styles.headerCompact)}>
       <div className={styles.headerContent}>
         <Dialog.Title className={styles.title}>{title}</Dialog.Title>
         {children ? <div className={styles.headerMeta}>{children}</div> : null}

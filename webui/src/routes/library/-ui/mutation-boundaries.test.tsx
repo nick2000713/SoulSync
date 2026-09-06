@@ -73,11 +73,11 @@ describe('library v2 remaining mutation boundaries', () => {
     expect(screen.getByRole('button', { name: 'Album details' })).toBeEnabled();
     expect(screen.getByRole('button', { name: 'History' })).toBeEnabled();
     for (const name of [
-      'Preview retag',
+      'Preview Retag',
       'Analyze ReplayGain',
-      'Reorganize',
+      'Preview Rename / Organize',
       /Reassign to another artist/,
-      'Change cover',
+      'Change Cover',
       /Enrich/,
       'Delete',
     ]) {

@@ -797,11 +797,11 @@ export function InteractiveSearchModal({
       onOpenChange={(open) => {
         if (!open) onClose();
       }}
-      className={`${styles.modal} ${styles.modalWide}`}
+      className={`${styles.modal} ${styles.modalWide} ${styles.modalFramed}`}
     >
-      <DialogHeader title="Interactive Search" closeLabel="Close interactive search">
+      <DialogHeader title="Interactive Search" closeLabel="Close interactive search" compact>
         <span className={styles.searchHeaderMeta}>
-          Search clients run independently; results and download state update live.
+          Search sources and compare results before downloading.
         </span>
       </DialogHeader>
       <div className={styles.searchModalBody}>
@@ -924,6 +924,31 @@ export function InteractiveSearchModal({
           <span>
             {filtered.length} of {results.length} results
           </span>
+          <label className={styles.searchCompactSort}>
+            Sort
+            <select
+              className={styles.select}
+              aria-label="Sort search results"
+              value={sort.key}
+              onChange={(e) => setSort({ key: e.target.value as SortKey, dir: -1 })}
+            >
+              <option value="quality">Quality</option>
+              <option value="title">Release</option>
+              <option value="source">Source</option>
+              <option value="size">Size</option>
+              <option value="age">Age</option>
+              <option value="availability">Peers</option>
+              <option value="grabs">Grabs</option>
+            </select>
+            <button
+              type="button"
+              className={styles.toolButton}
+              aria-label="Reverse search sort"
+              onClick={() => setSort((s) => ({ ...s, dir: s.dir === 1 ? -1 : 1 }))}
+            >
+              {sort.dir === 1 ? '↑' : '↓'}
+            </button>
+          </label>
           <details className={styles.columnPicker}>
             <summary>Columns</summary>
             <div className={styles.columnMenu}>
@@ -1026,26 +1051,37 @@ export function InteractiveSearchModal({
                             </span>
                           ) : null}
                         </td>
-                        {columns.artist ? <td>{r.artist ?? '—'}</td> : null}
-                        <td className={styles.qualityText}>
+                        {columns.artist ? <td data-label="Artist">{r.artist ?? '—'}</td> : null}
+                        <td data-label="Quality" className={styles.qualityText}>
                           <span className={styles.qualityCellRow}>
                             {resultQuality(r)}
                             <ProfileBadge result={r} profile={effectiveProfile} />
                           </span>
                         </td>
                         {columns.size ? (
-                          <td className={styles.colNum}>{fmtBytes(resultSize(r))}</td>
+                          <td data-label="Size" className={styles.colNum}>
+                            {fmtBytes(resultSize(r))}
+                          </td>
                         ) : null}
                         {columns.age ? (
                           <td
+                            data-label="Age"
                             className={styles.colNum}
                             title={effMeta(r).publish_date ?? undefined}
                           >
                             {ageText(effMeta(r).publish_date)}
                           </td>
                         ) : null}
-                        {showPeers ? <td className={styles.isAvailCell}>{peerCell(r)}</td> : null}
-                        {showGrabs ? <td className={styles.isAvailCell}>{grabsCell(r)}</td> : null}
+                        {showPeers ? (
+                          <td data-label="Peers" className={styles.isAvailCell}>
+                            {peerCell(r)}
+                          </td>
+                        ) : null}
+                        {showGrabs ? (
+                          <td data-label="Grabs" className={styles.isAvailCell}>
+                            {grabsCell(r)}
+                          </td>
+                        ) : null}
                         <td>
                           <span className={styles.grabAction}>
                             <button
@@ -1086,9 +1122,7 @@ export function InteractiveSearchModal({
         </div>
 
         <div className={styles.modalFootNote}>
-          Downloads run through the normal SoulSync pipeline (staging → processing → tagging) and
-          are linked into the v2 library automatically once the file lands — no manual “Refresh
-          &amp; Scan” needed.
+          Downloads appear in your library automatically after processing.
         </div>
       </div>
     </DialogFrame>

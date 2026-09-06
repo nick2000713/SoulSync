@@ -19,10 +19,6 @@ import { getShellBridge } from '@/platform/shell/bridge';
 import { useReactPageShell } from '@/platform/shell/route-controllers';
 
 import { bitrateKbps, formatBitrate } from '../-bitrate';
-import { albumQueueRows, artistQueueRows } from '../-library-v2.play';
-import { getServiceUrl } from '../-library-v2.service-links';
-import { ArtistVideosSection } from '../../artist-detail/-ui/artist-videos-section';
-import { ConcertsSection } from '../../artist-detail/-ui/concerts-section';
 import {
   analyzeLibraryV2TrackReplayGain,
   blacklistLibraryV2Source,
@@ -111,6 +107,8 @@ import {
   type LibraryV2MatchSearchResult,
 } from '../-library-v2.api';
 import { useLibraryChanged, useMaintenanceChanged } from '../-library-v2.live';
+import { albumQueueRows, artistQueueRows } from '../-library-v2.play';
+import { getServiceUrl } from '../-library-v2.service-links';
 import {
   LIBRARY_V2_WANTED_KINDS,
   type LibraryV2AlbumDetail,
@@ -134,6 +132,8 @@ import {
   type LibraryV2WantedRow,
 } from '../-library-v2.types';
 import { computeTrackEditValues } from '../-metadata-edit';
+import { ArtistVideosSection } from '../../artist-detail/-ui/artist-videos-section';
+import { ConcertsSection } from '../../artist-detail/-ui/concerts-section';
 import { Route } from '../route';
 import { AlbumArtPickerModal, ArtistImagePickerModal } from './art-picker-modal';
 import { parseArtworkTarget, watchPendingArtwork } from './artwork-pending';
@@ -146,12 +146,15 @@ import {
 } from './discography-filters';
 import { ExportArtistsModal } from './export-modal';
 import { FilePathCellBody } from './file-path-cell';
+import { HistoryEventList } from './history-event-list';
+import { groupHistoryEvents } from './history-groups';
 import { InteractiveSearchModal } from './interactive-search';
 import styles from './library-v2-page.module.css';
-import { QualityProfileModal, QualityProfilePicker } from './quality-profile-modal';
+import { QualityProfilePicker } from './quality-profile-modal';
 import { ReassignModal } from './reassign-modal';
-import { AlbumReorganizeModal, ArtistReorganizeAllModal } from './reorganize-modal';
+import { AlbumReorganizeModal, ArtistRenamePreviewModal } from './reorganize-modal';
 import { RetagModal } from './retag-modal';
+import { LibraryToolDialog } from './tool-dialog';
 import { WatchAllModal } from './watch-all-modal';
 
 /** Row/toolbar action dispatch: the label drives the behaviour, the optional
@@ -161,6 +164,30 @@ type ActionHandler = (action: string, entity?: Lib2EntityRef) => void;
 
 function trackProgress(present: number, total: number): string {
   return `${present}/${total}`;
+}
+
+function TrackPresence({
+  present,
+  total,
+  className = '',
+}: {
+  present: number;
+  total: number;
+  className?: string;
+}) {
+  const description = `${present} of ${total} tracks in your library`;
+  return (
+    <span
+      className={`${styles.trackPresence} ${className}`}
+      data-presence={
+        total === 0 ? 'unknown' : present >= total ? 'complete' : present > 0 ? 'partial' : 'empty'
+      }
+      title={description}
+      aria-label={description}
+    >
+      {trackProgress(present, total)}
+    </span>
+  );
 }
 
 function qualityProfileSourceLabel(source?: LibraryV2QualityProfileSource): string {
@@ -680,6 +707,7 @@ export function MonitorToggle({
   trackNumber,
   discNumber,
   title,
+  prominent = false,
 }: {
   entity: 'artists' | 'albums' | 'tracks';
   id: number | null;
@@ -688,6 +716,7 @@ export function MonitorToggle({
   trackNumber?: number;
   discNumber?: number;
   title?: string;
+  prominent?: boolean;
 }) {
   const mutation = useMonitorMutation();
   const canWrite = useLibraryV2CanWrite();
@@ -696,7 +725,8 @@ export function MonitorToggle({
     <span className={styles.monitorControl} onClick={(e) => e.stopPropagation()}>
       <button
         type="button"
-        className={`${styles.monitorBtn} ${monitored ? styles.monitorOn : ''}`}
+        className={`${styles.monitorBtn} ${monitored ? styles.monitorOn : ''} ${prominent ? styles.monitorProminent : ''}`}
+        aria-pressed={monitored}
         aria-label={
           mutation.isPending
             ? 'Updating monitoring'
@@ -710,7 +740,7 @@ export function MonitorToggle({
             : entity === 'artists' && monitored
               ? 'On the Watchlist — click to remove this artist (files and explicitly monitored tracks stay untouched)'
               : entity === 'artists'
-                ? 'Not on the Watchlist — click to monitor this artist and enable Artist Settings'
+                ? 'Not on the Watchlist — click to monitor this artist'
                 : monitored
                   ? 'Monitored — click to stop'
                   : 'Not monitored — click to monitor'
@@ -895,6 +925,8 @@ export function ArtistRefreshButton({ artistId }: { artistId: number }) {
 
 function ModalShell({
   title,
+  description,
+  className,
   wide,
   detail,
   match,
@@ -903,6 +935,8 @@ function ModalShell({
   children,
 }: {
   title: string;
+  description?: ReactNode;
+  className?: string;
   wide?: boolean;
   /** Fixed width+height (tab body scrolls internally) so tabbed content
    *  (track/album detail modals) doesn't resize/jump when switching tabs. */
@@ -920,10 +954,12 @@ function ModalShell({
       onOpenChange={(open) => {
         if (!open) onClose();
       }}
-      className={`${styles.modal} ${wide ? styles.modalWide : ''} ${detail ? styles.modalDetail : ''} ${match ? styles.modalMatch : ''} ${settings ? styles.modalSettings : ''}`}
+      className={`${styles.modal} ${styles.modalFramed} ${className ?? ''} ${wide ? styles.modalWorkspace : ''} ${detail ? styles.modalDetail : ''} ${match ? styles.modalMatch : ''} ${settings ? styles.modalSettings : ''}`}
     >
-      <DialogHeader title={title} closeLabel="Close" />
-      {children}
+      <DialogHeader title={title} closeLabel="Close" compact>
+        {description ? <span className={styles.toolDescription}>{description}</span> : null}
+      </DialogHeader>
+      <div className={styles.modalContent}>{children}</div>
     </DialogFrame>
   );
 }
@@ -1119,9 +1155,7 @@ export function MatchChips({
         // it, so a matched chip gains a separate link out to the provider's
         // own page. Discogs album ids route through master/release; a service
         // with no page for this entity type simply gets no link.
-        const external = s.external_id
-          ? getServiceUrl(s.service, entityType, s.external_id)
-          : null;
+        const external = s.external_id ? getServiceUrl(s.service, entityType, s.external_id) : null;
         return (
           <span key={s.service} className={styles.matchChipGroup}>
             <button
@@ -2044,6 +2078,36 @@ export function ArtistSettingsModal({
   artist: LibraryV2ArtistDetail;
   onClose: () => void;
 }) {
+  const canWrite = useLibraryV2CanWrite();
+  if (artist.monitored) return <MonitoredArtistSettings artist={artist} onClose={onClose} />;
+  return (
+    <ModalShell title="Artist Settings" onClose={onClose}>
+      <h4>{artist.name}</h4>
+      <p>
+        Quality applies to this artist’s downloads and upgrades. Monitor the artist to also
+        configure future releases and the Watchlist.
+      </p>
+      <fieldset className={styles.settingsFieldset} disabled={!canWrite}>
+        <legend>Quality profile</legend>
+        <QualityProfilePicker
+          entity="artists"
+          id={artist.id}
+          currentProfileId={artist.quality_profile?.id ?? 1}
+          currentProfileSource={artist.quality_profile_source}
+          currentProfileExplicit={artist.quality_profile_explicit}
+        />
+      </fieldset>
+    </ModalShell>
+  );
+}
+
+function MonitoredArtistSettings({
+  artist,
+  onClose,
+}: {
+  artist: LibraryV2ArtistDetail;
+  onClose: () => void;
+}) {
   const queryClient = useQueryClient();
   const canWrite = useLibraryV2CanWrite();
   const settingsQuery = useQuery({
@@ -2118,95 +2182,101 @@ export function ArtistSettingsModal({
       ) : (
         <>
           <section className={styles.artistSettingsSection}>
-            <h4>Watchlist identity</h4>
-            <div className={styles.artistSettingsIdentity}>
-              <Artwork
-                src={
-                  artist.image_url ||
-                  settingsQuery.data?.artist_stats?.image_url ||
-                  draft.watchlist_image_url ||
-                  ''
-                }
-                alt={settingsQuery.data?.artist_stats?.name || draft.watchlist_name || artist.name}
-                className={styles.artistSettingsPhoto}
-                thumb
-              />
-              <div className={styles.artistSettingsIdentityBody}>
-                <strong className={styles.artistSettingsIdentityName}>
-                  {settingsQuery.data?.artist_stats?.name || draft.watchlist_name || artist.name}
-                </strong>
-                <span className={styles.muted}>
-                  This is the artist currently linked to the admin Watchlist.
-                </span>
-                {(settingsQuery.data?.artist_stats?.genres?.length
-                  ? settingsQuery.data.artist_stats.genres
-                  : artist.genres
-                ).length > 0 ? (
-                  <span className={styles.artistSettingsGenres}>
-                    {(settingsQuery.data?.artist_stats?.genres?.length
-                      ? settingsQuery.data.artist_stats.genres
-                      : artist.genres
-                    ).join(' · ')}
-                  </span>
-                ) : null}
-                {settingsQuery.data?.artist_stats &&
-                formatMatchStat(settingsQuery.data.artist_stats) ? (
+            <div>
+              <h4>Watchlist identity</h4>
+              <div className={styles.artistSettingsIdentity}>
+                <Artwork
+                  src={
+                    artist.image_url ||
+                    settingsQuery.data?.artist_stats?.image_url ||
+                    draft.watchlist_image_url ||
+                    ''
+                  }
+                  alt={
+                    settingsQuery.data?.artist_stats?.name || draft.watchlist_name || artist.name
+                  }
+                  className={styles.artistSettingsPhoto}
+                  thumb
+                />
+                <div className={styles.artistSettingsIdentityBody}>
+                  <strong className={styles.artistSettingsIdentityName}>
+                    {settingsQuery.data?.artist_stats?.name || draft.watchlist_name || artist.name}
+                  </strong>
                   <span className={styles.muted}>
-                    {formatMatchStat(settingsQuery.data.artist_stats)}
+                    This is the artist currently linked to the admin Watchlist.
                   </span>
-                ) : null}
-                {providerIds.length > 0 ? (
-                  <div className={styles.artistSettingsProviderIds}>
-                    {providerIds.map(([provider, id]) => {
-                      // The catalogue knows the id; until now the only thing
-                      // the page could do with it was copy it. A service with
-                      // no artist page (Amazon) keeps the copy button.
-                      const url = getServiceUrl(provider, 'artist', id);
-                      return url ? (
-                        <a
-                          key={provider}
-                          href={url}
-                          target="_blank"
-                          rel="noreferrer noopener"
-                          title={`Open on ${provider}: ${id}`}
-                        >
-                          <strong>{provider}</strong>
-                          <span>{id}</span>
-                          <small>Open</small>
-                        </a>
-                      ) : (
-                        <button
-                          type="button"
-                          key={provider}
-                          title={`Copy ${provider} ID: ${id}`}
-                          onClick={() => void navigator.clipboard?.writeText(id)}
-                        >
-                          <strong>{provider}</strong>
-                          <span>{id}</span>
-                          <small>Copy</small>
-                        </button>
-                      );
-                    })}
-                  </div>
-                ) : null}
-                <ArtistMatchChips artist={artist} watchlistRowId={draft.watchlist_row_id} />
-                {[...artist.albums, ...(artist.eps ?? []), ...artist.singles].length ? (
-                  <div className={styles.artistSettingsReleaseContext}>
-                    <span>Release context in Library v2</span>
-                    <MatchReleaseStrip
-                      albums={[...artist.albums, ...(artist.eps ?? []), ...artist.singles]
-                        .slice(0, 6)
-                        .map((album) => ({
-                          id: String(album.id),
-                          title: album.title,
-                          image: album.image_url,
-                          release_date: album.release_date,
-                          album_type: album.album_type,
-                          total_tracks: album.track_count,
-                        }))}
-                    />
-                  </div>
-                ) : null}
+                  {(settingsQuery.data?.artist_stats?.genres?.length
+                    ? settingsQuery.data.artist_stats.genres
+                    : artist.genres
+                  ).length > 0 ? (
+                    <span className={styles.artistSettingsGenres}>
+                      {(settingsQuery.data?.artist_stats?.genres?.length
+                        ? settingsQuery.data.artist_stats.genres
+                        : artist.genres
+                      ).join(' · ')}
+                    </span>
+                  ) : null}
+                  {settingsQuery.data?.artist_stats &&
+                  formatMatchStat(settingsQuery.data.artist_stats) ? (
+                    <span className={styles.muted}>
+                      {formatMatchStat(settingsQuery.data.artist_stats)}
+                    </span>
+                  ) : null}
+                  {providerIds.length > 0 ? (
+                    <div>
+                      <div className={styles.artistSettingsProviderIds}>
+                        {providerIds.map(([provider, id]) => {
+                          // The catalogue knows the id; until now the only thing
+                          // the page could do with it was copy it. A service with
+                          // no artist page (Amazon) keeps the copy button.
+                          const url = getServiceUrl(provider, 'artist', id);
+                          return url ? (
+                            <a
+                              key={provider}
+                              href={url}
+                              target="_blank"
+                              rel="noreferrer noopener"
+                              title={`Open on ${provider}: ${id}`}
+                            >
+                              <strong>{provider}</strong>
+                              <span>{id}</span>
+                              <small>Open</small>
+                            </a>
+                          ) : (
+                            <button
+                              type="button"
+                              key={provider}
+                              title={`Copy ${provider} ID: ${id}`}
+                              onClick={() => void navigator.clipboard?.writeText(id)}
+                            >
+                              <strong>{provider}</strong>
+                              <span>{id}</span>
+                              <small>Copy</small>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ) : null}
+                  <ArtistMatchChips artist={artist} watchlistRowId={draft.watchlist_row_id} />
+                  {[...artist.albums, ...(artist.eps ?? []), ...artist.singles].length ? (
+                    <div className={styles.artistSettingsReleaseContext}>
+                      <span>Release context in Library v2</span>
+                      <MatchReleaseStrip
+                        albums={[...artist.albums, ...(artist.eps ?? []), ...artist.singles]
+                          .slice(0, 6)
+                          .map((album) => ({
+                            id: String(album.id),
+                            title: album.title,
+                            image: album.image_url,
+                            release_date: album.release_date,
+                            album_type: album.album_type,
+                            total_tracks: album.track_count,
+                          }))}
+                      />
+                    </div>
+                  ) : null}
+                </div>
               </div>
             </div>
           </section>
@@ -2441,7 +2511,7 @@ const HISTORY_CATEGORY_LABELS: Record<LibraryV2HistoryCategory, string> = {
 /** Merged pipeline history for one artist or album — grabs, imports,
  *  quarantine, catalog moves and physical deletes, not just raw downloads
  *  (§A6/C3 artist scope; §52.9 album scope reuses the same resolver). */
-function HistoryModal({
+export function HistoryModal({
   scope,
   entityId,
   onClose,
@@ -2450,80 +2520,111 @@ function HistoryModal({
   entityId: number;
   onClose: () => void;
 }) {
+  const [limit, setLimit] = useState(50);
+  const maxLimit = scope === 'artist' ? 200 : 500;
   const historyQuery = useQuery({
-    queryKey: [...LIBRARY_V2_QUERY_KEY, 'history', scope, entityId],
+    queryKey: [...LIBRARY_V2_QUERY_KEY, 'history', scope, entityId, limit],
     queryFn: () =>
       scope === 'album'
-        ? fetchLibraryV2AlbumHistory(entityId)
-        : fetchLibraryV2ArtistHistory(entityId),
+        ? fetchLibraryV2AlbumHistory(entityId, limit)
+        : fetchLibraryV2ArtistHistory(entityId, limit),
+    placeholderData: (previous) => previous,
   });
   const [category, setCategory] = useState<LibraryV2HistoryCategory | 'all'>('all');
+  const [filter, setFilter] = useState('');
+  const [grouped, setGrouped] = useState(true);
   const allRows = historyQuery.data ?? [];
   const availableCategories = Array.from(new Set(allRows.map((h) => h.category)));
-  const rows = category === 'all' ? allRows : allRows.filter((h) => h.category === category);
+  const rows = allRows.filter(
+    (h) =>
+      (category === 'all' || h.category === category) &&
+      `${h.title ?? h.event_type} ${h.detail ?? ''} ${h.source ?? ''} ${h.track_title ?? ''} ${h.album_title ?? ''} ${h.status ?? ''}`
+        .toLowerCase()
+        .includes(filter.trim().toLowerCase()),
+  );
+  const groups = grouped
+    ? groupHistoryEvents(rows)
+    : rows.map((h, i) => ({ key: String(i), entries: [h] }));
   return (
-    <ModalShell title="History" wide onClose={onClose}>
-      {availableCategories.length > 1 ? (
-        <div className={styles.searchOptions}>
-          <label className={styles.checkOption}>
-            Filter:
-            <select
-              value={category}
-              onChange={(event) =>
-                setCategory(event.target.value as LibraryV2HistoryCategory | 'all')
-              }
+    <LibraryToolDialog
+      title="History"
+      onClose={onClose}
+      description="Expand an activity to see the affected tracks and the reason for each result."
+      footer={
+        <div className={styles.modalActions}>
+          <span className={styles.previewQuiet}>
+            {rows.length} of {allRows.length} loaded events · Newest first · Local time
+            {allRows.length >= maxLimit ? ` · Latest ${maxLimit} events` : ''}
+            {allRows.some((row) => row.status_basis === 'current_file') ? (
+              <span className={styles.historyFootnote}>
+                Older checks show current file status; the original verdict was not recorded.
+              </span>
+            ) : null}
+          </span>
+          {allRows.length >= limit && limit < maxLimit ? (
+            <button
+              type="button"
+              className={styles.btnGhost}
+              disabled={historyQuery.isFetching}
+              onClick={() => setLimit((current) => Math.min(maxLimit, current + 50))}
             >
-              <option value="all">All events</option>
-              {availableCategories.map((c) => (
-                <option key={c} value={c}>
-                  {HISTORY_CATEGORY_LABELS[c] ?? c}
-                </option>
-              ))}
-            </select>
-          </label>
+              {historyQuery.isFetching ? 'Loading…' : 'Load older events'}
+            </button>
+          ) : null}
         </div>
-      ) : null}
-      <div className={styles.resultsWrap}>
+      }
+    >
+      <div className={styles.previewToolbar}>
+        <input
+          className={styles.searchInput}
+          aria-label="Search history"
+          placeholder="Search track, release, event or result…"
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+        />
+        <select
+          className={styles.select}
+          aria-label="Filter history"
+          value={category}
+          onChange={(e) => setCategory(e.target.value as LibraryV2HistoryCategory | 'all')}
+        >
+          <option value="all">All events</option>
+          {availableCategories.map((c) => (
+            <option key={c} value={c}>
+              {HISTORY_CATEGORY_LABELS[c] ?? c}
+            </option>
+          ))}
+        </select>
+        <label className={styles.checkOption}>
+          <input type="checkbox" checked={grouped} onChange={(e) => setGrouped(e.target.checked)} />
+          Group similar
+        </label>
+      </div>
+      <div className={styles.historyList}>
         {historyQuery.isLoading ? (
           <div className={styles.inlineLoading}>Loading history…</div>
         ) : historyQuery.isError ? (
-          // iss29-C04: "no recorded history" is a claim about the journals.
-          // A failed fetch knows nothing about them.
-          <div className={styles.inlineLoading}>
+          <div role="alert" className={styles.searchError}>
             {mutationErrorMessage(historyQuery.error, 'History could not be loaded.')}
+            <button
+              type="button"
+              className={styles.btnGhost}
+              onClick={() => void historyQuery.refetch()}
+            >
+              Try again
+            </button>
           </div>
         ) : rows.length === 0 ? (
-          <div className={styles.inlineLoading}>No recorded history for this {scope} yet.</div>
+          <div className={styles.inlineLoading}>
+            {allRows.length
+              ? 'No events match these filters.'
+              : `No recorded history for this ${scope} yet.`}
+          </div>
         ) : (
-          <table className={styles.trackTable}>
-            <thead>
-              <tr>
-                <th>Date</th>
-                <th>Event</th>
-                <th>Detail</th>
-                <th>Source</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((h, i) => (
-                <tr key={i}>
-                  <td className={styles.muted}>
-                    {h.date ? h.date.slice(0, 16).replace('T', ' ') : '—'}
-                  </td>
-                  <td>
-                    <span className={styles.sourceBadge} data-tone={h.category}>
-                      {h.title ?? h.event_type}
-                    </span>
-                  </td>
-                  <td>{h.detail ?? '—'}</td>
-                  <td className={styles.muted}>{h.source ?? '—'}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          <HistoryEventList groups={groups} />
         )}
       </div>
-    </ModalShell>
+    </LibraryToolDialog>
   );
 }
 
@@ -2591,13 +2692,20 @@ type AlbumDetailTab = 'quality' | 'metadata';
 function AlbumDetailModal({ album, onClose }: { album: AlbumDetailTarget; onClose: () => void }) {
   const [tab, setTab] = useState<AlbumDetailTab>('quality');
   return (
-    <ModalShell title={album.title} detail onClose={onClose}>
+    <ModalShell
+      title={album.title}
+      className={`${styles.metadataEditorDialog} ${styles.albumEditorDialog}`}
+      detail
+      settings
+      onClose={onClose}
+    >
       <div className={styles.detailTabs}>
         {(['quality', 'metadata'] as const).map((t) => (
           <button
             key={t}
             type="button"
             className={`${styles.detailTab} ${tab === t ? styles.detailTabActive : ''}`}
+            aria-pressed={tab === t}
             onClick={() => setTab(t)}
           >
             {t === 'quality' ? 'Quality' : 'Metadata'}
@@ -2689,8 +2797,8 @@ function AlbumMetadataForm({
   }
 
   return (
-    <>
-      <div className={styles.editRow}>
+    <div className={styles.metadataEditGrid}>
+      <div className={`${styles.editRow} ${styles.editHalf}`}>
         <label htmlFor="lib2-album-title">Title</label>
         <input
           id="lib2-album-title"
@@ -2698,6 +2806,16 @@ function AlbumMetadataForm({
           value={title}
           disabled={busy}
           onChange={(event) => setTitle(event.target.value)}
+        />
+      </div>
+      <div className={`${styles.editRow} ${styles.editHalf}`}>
+        <label htmlFor="lib2-album-label">Label</label>
+        <input
+          id="lib2-album-label"
+          className={styles.searchInput}
+          value={label}
+          disabled={busy}
+          onChange={(event) => setLabel(event.target.value)}
         />
       </div>
       <div className={styles.editRow}>
@@ -2755,17 +2873,7 @@ function AlbumMetadataForm({
           <option value="no">Clean</option>
         </select>
       </div>
-      <div className={styles.editRow}>
-        <label htmlFor="lib2-album-label">Label</label>
-        <input
-          id="lib2-album-label"
-          className={styles.searchInput}
-          value={label}
-          disabled={busy}
-          onChange={(event) => setLabel(event.target.value)}
-        />
-      </div>
-      <div className={styles.editRow}>
+      <div className={`${styles.editRow} ${styles.editHalf}`}>
         <label htmlFor="lib2-album-style">Style</label>
         <input
           id="lib2-album-style"
@@ -2775,7 +2883,7 @@ function AlbumMetadataForm({
           onChange={(event) => setStyle(event.target.value)}
         />
       </div>
-      <div className={styles.editRow}>
+      <div className={`${styles.editRow} ${styles.editHalf}`}>
         <label htmlFor="lib2-album-mood">Mood</label>
         <input
           id="lib2-album-mood"
@@ -2816,7 +2924,7 @@ function AlbumMetadataForm({
           {busy ? 'Saving…' : 'Save'}
         </button>
       </div>
-    </>
+    </div>
   );
 }
 
@@ -2898,7 +3006,7 @@ export function AlbumOverflowMenu({
               setOpen(false);
             }}
           >
-            Preview retag
+            Preview Retag
           </button>
           <button
             type="button"
@@ -2924,7 +3032,7 @@ export function AlbumOverflowMenu({
               setOpen(false);
             }}
           >
-            Reorganize
+            Preview Rename / Organize
           </button>
           <button
             type="button"
@@ -2955,7 +3063,7 @@ export function AlbumOverflowMenu({
               setOpen(false);
             }}
           >
-            Change cover
+            Change Cover
           </button>
           <button
             type="button"
@@ -3145,7 +3253,7 @@ function EditArtistModal({
   }
 
   return (
-    <ModalShell title={`Edit — ${artist.name}`} onClose={onClose}>
+    <ModalShell title={`Edit Metadata — ${artist.name}`} settings onClose={onClose}>
       <div className={styles.editRow}>
         <label htmlFor="lib2-artist-name">Artist name</label>
         <input
@@ -3479,7 +3587,7 @@ type ManageTracksTab = 'duplicates' | 'files';
 function ManageTracksModal({ artistId, onClose }: { artistId: number; onClose: () => void }) {
   const [tab, setTab] = useState<ManageTracksTab>('files');
   return (
-    <ModalShell title="Manage Tracks" wide onClose={onClose}>
+    <LibraryToolDialog title="Manage Tracks" onClose={onClose}>
       <div className={styles.detailTabs}>
         {(['files', 'duplicates'] as const).map((t) => (
           <button
@@ -3492,11 +3600,11 @@ function ManageTracksModal({ artistId, onClose }: { artistId: number; onClose: (
           </button>
         ))}
       </div>
-      <div className={styles.tabBody}>
+      <div className={`${styles.tabBody} ${tab === 'files' ? styles.fileManagerBody : ''}`}>
         {tab === 'duplicates' ? <ManageTracksDuplicatesTab artistId={artistId} /> : null}
         {tab === 'files' ? <ArtistFilesTab artistId={artistId} /> : null}
       </div>
-    </ModalShell>
+    </LibraryToolDialog>
   );
 }
 
@@ -3548,7 +3656,7 @@ export function ManageTracksDuplicatesTab({ artistId }: { artistId: number }) {
       <p className={styles.qpSubtitle}>
         The same recording released as a single and on an album. Unmonitor the version you don't
         want kept up to date; <strong>Move file</strong> re-homes all source file links onto the
-        other version (disk untouched — run Rename/Reorganize after). Physical files you no longer
+        other version (disk untouched — run Rename / Organize after). Physical files you no longer
         need can then be removed from the <strong>Files</strong> tab.
       </p>
       {rowError ? <div className={styles.searchError}>{rowError}</div> : null}
@@ -3725,21 +3833,29 @@ export function ArtistFilesTab({ artistId }: { artistId: number }) {
 
   return (
     <>
-      <p className={styles.qpSubtitle}>
-        Physical versions are grouped by recording. <strong>Master</strong> is a retained source,
-        <strong> derivative</strong> is an intentional output such as MP3/Opus or downsampled FLAC,
-        and <strong>primary</strong> is the version used for quality and playback decisions.
-      </p>
-      <input
-        className={styles.searchInput}
-        type="text"
-        placeholder="Filter by track or album…"
-        value={search}
-        onChange={(e) => {
-          setSearch(e.target.value);
-          setPage(1);
-        }}
-      />
+      <div className={styles.fileManagerToolbar}>
+        <p className={styles.fileVersionLegend}>
+          <span>
+            <strong>Primary</strong> · playback & quality
+          </span>
+          <span>
+            <strong>Master</strong> · retained source
+          </span>
+          <span>
+            <strong>Derivative</strong> · converted copy
+          </span>
+        </p>
+        <input
+          className={styles.searchInput}
+          type="text"
+          placeholder="Filter by track or album…"
+          value={search}
+          onChange={(e) => {
+            setSearch(e.target.value);
+            setPage(1);
+          }}
+        />
+      </div>
       {rowError ? <div className={styles.searchError}>{rowError}</div> : null}
       {filesQuery.isLoading ? (
         <div className={styles.inlineLoading}>Loading files…</div>
@@ -3753,87 +3869,103 @@ export function ArtistFilesTab({ artistId }: { artistId: number }) {
         <div className={styles.inlineLoading}>No files found.</div>
       ) : (
         <>
-          <table className={styles.trackTable}>
-            <thead>
-              <tr>
-                <th>
-                  <input type="checkbox" checked={allOnPageSelected} onChange={toggleAllOnPage} />
-                </th>
-                <th>Track</th>
-                <th>Album</th>
-                <th>Version</th>
-                <th>Quality</th>
-                <th>Size</th>
-                <th>State</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              {groupedFiles.flatMap((group) =>
-                group.files.map((f, index) => (
-                  <tr
-                    key={f.file_id}
-                    className={index === 0 ? styles.fileVersionGroupStart : undefined}
-                  >
-                    <td>
-                      <input
-                        type="checkbox"
-                        checked={selected.has(f.file_id)}
-                        onChange={() => toggle(f.file_id)}
-                      />
-                    </td>
-                    {index === 0 ? (
-                      <td rowSpan={group.files.length} className={styles.fileVersionTrack}>
-                        {f.track_number != null ? `${f.track_number}. ` : ''}
-                        {f.track_title ?? '—'}
-                        <span className={styles.fileVersionCount}>
-                          {group.files.length} {group.files.length === 1 ? 'version' : 'versions'}
-                        </span>
+          <div className={styles.fileTableWrap}>
+            <table className={`${styles.trackTable} ${styles.fileManagerTable}`}>
+              <thead>
+                <tr>
+                  <th>
+                    <input
+                      type="checkbox"
+                      aria-label="Select all files on this page"
+                      checked={allOnPageSelected}
+                      onChange={toggleAllOnPage}
+                    />
+                    <span className={styles.fileTableSelectionLabel}>
+                      Select all files on this page
+                    </span>
+                  </th>
+                  <th>Track</th>
+                  <th>Album</th>
+                  <th>Version</th>
+                  <th>Quality</th>
+                  <th>Size</th>
+                  <th>State</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {groupedFiles.flatMap((group) =>
+                  group.files.map((f, index) => (
+                    <tr
+                      key={f.file_id}
+                      className={index === 0 ? styles.fileVersionGroupStart : undefined}
+                    >
+                      <td>
+                        <input
+                          type="checkbox"
+                          checked={selected.has(f.file_id)}
+                          aria-label={`Select file ${f.file_id}: ${f.track_title || 'Untitled'}`}
+                          onChange={() => toggle(f.file_id)}
+                        />
                       </td>
-                    ) : null}
-                    {index === 0 ? (
-                      <td rowSpan={group.files.length} className={styles.qualityText}>
-                        {f.album_title ?? '—'}
-                      </td>
-                    ) : null}
-                    <td>
-                      <div className={styles.fileVersionBadges}>
-                        <span className={styles.fileRoleBadge} data-role={f.file_role ?? 'master'}>
-                          {f.file_role ?? 'master'}
-                        </span>
-                        {f.is_primary ? (
-                          <span className={styles.filePrimaryBadge}>
-                            {f.primary_manual ? 'primary · manual' : 'primary'}
+                      {index === 0 ? (
+                        <td rowSpan={group.files.length} className={styles.fileVersionTrack}>
+                          {f.track_number != null ? `${f.track_number}. ` : ''}
+                          {f.track_title ?? '—'}
+                          <span className={styles.fileVersionCount}>
+                            {group.files.length} {group.files.length === 1 ? 'version' : 'versions'}
                           </span>
-                        ) : null}
-                      </div>
-                      <span className={styles.fileVersionPath} title={f.path}>
-                        {f.path}
-                      </span>
-                    </td>
-                    <td className={styles.qualityText}>{qualityText(f)}</td>
-                    <td>{formatFileSize(f.size ?? 0)}</td>
-                    <td className={styles.muted}>{f.file_state}</td>
-                    <td className={styles.trackActions}>
-                      {!f.is_primary && f.file_state === 'active' ? (
-                        <button
-                          type="button"
-                          className={styles.toolButton}
-                          data-requires-write=""
-                          disabled={!canWrite || primaryMutation.isPending}
-                          onClick={() =>
-                            primaryMutation.mutate({ trackId: f.track_id, fileId: f.file_id })
-                          }
-                        >
-                          Make primary
-                        </button>
+                        </td>
                       ) : null}
-                    </td>
-                  </tr>
-                )),
-              )}
-            </tbody>
-          </table>
+                      {index === 0 ? (
+                        <td
+                          data-label="Album"
+                          rowSpan={group.files.length}
+                          className={styles.qualityText}
+                        >
+                          {f.album_title ?? '—'}
+                        </td>
+                      ) : null}
+                      <td>
+                        <div className={styles.fileVersionBadges}>
+                          <span
+                            className={styles.fileRoleBadge}
+                            data-role={f.file_role ?? 'master'}
+                          >
+                            {f.file_role ?? 'master'}
+                          </span>
+                          {f.is_primary ? (
+                            <span className={styles.filePrimaryBadge}>
+                              {f.primary_manual ? 'primary · manual' : 'primary'}
+                            </span>
+                          ) : null}
+                        </div>
+                        <FilePathCellBody path={f.path} display={f.path.split(/[\\/]/).pop()} />
+                      </td>
+                      <td className={styles.qualityText}>{qualityText(f)}</td>
+                      <td>{formatFileSize(f.size ?? 0)}</td>
+                      <td className={styles.muted}>{f.file_state}</td>
+                      <td className={styles.trackActions}>
+                        {!f.is_primary && f.file_state === 'active' ? (
+                          <button
+                            type="button"
+                            className={styles.toolButton}
+                            data-requires-write=""
+                            disabled={!canWrite || primaryMutation.isPending}
+                            onClick={() =>
+                              primaryMutation.mutate({ trackId: f.track_id, fileId: f.file_id })
+                            }
+                          >
+                            Make primary
+                          </button>
+                        ) : null}
+                      </td>
+                    </tr>
+                  )),
+                )}
+              </tbody>
+            </table>
+          </div>
           {pagination && pagination.total_pages > 1 ? (
             <div className={styles.pagination}>
               <button
@@ -4339,8 +4471,8 @@ function UnmatchedImportsBanner() {
           {count} {count === 1 ? 'track' : 'tracks'} imported without a match
         </strong>
         <span>
-          Their tags could not be read, so they are filed under Unknown Artist instead of the
-          album they belong to. Open the artist and use Re-identify on a track to put it back.
+          Their tags could not be read, so they are filed under Unknown Artist instead of the album
+          they belong to. Open the artist and use Re-identify on a track to put it back.
         </span>
       </div>
       <button
@@ -4444,6 +4576,7 @@ function ArtistIndexView() {
       <div className={styles.toolbar}>
         <LibrarySectionTabs />
         <input
+          aria-label="Filter artists"
           id="library-search-input"
           className={styles.searchInput}
           type="text"
@@ -4452,6 +4585,7 @@ function ArtistIndexView() {
           onChange={(e) => artistFilter.onChange(e.target.value)}
         />
         <select
+          aria-label="Filter monitoring"
           id="watchlist-filter"
           className={styles.select}
           value={search.monitored}
@@ -4470,6 +4604,7 @@ function ArtistIndexView() {
           <option value="unmonitored">Unmonitored</option>
         </select>
         <select
+          aria-label="Sort artists"
           id="library-sort"
           className={styles.select}
           value={search.sort}
@@ -4741,69 +4876,71 @@ function WantedIndexView() {
           </p>
         </div>
       ) : (
-        <table className={styles.trackTable}>
-          <thead>
-            <tr>
-              <th>Artist</th>
-              <th>Album</th>
-              <th>Track</th>
-              {search.wantedKind === 'cutoff_unmet' ? <th>Quality</th> : null}
-              <th />
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((row: LibraryV2WantedRow) => (
-              <tr key={row.track_id}>
-                <td>
-                  <button
-                    type="button"
-                    className={styles.linkButton}
-                    onClick={() =>
-                      void navigate({
-                        search: (p) => ({
-                          ...p,
-                          artist: row.artist.id,
-                          album: undefined,
-                          releases: undefined,
-                        }),
-                      })
-                    }
-                  >
-                    {row.artist.name}
-                  </button>
-                </td>
-                <td>
-                  <button
-                    type="button"
-                    className={styles.linkButton}
-                    onClick={() =>
-                      void navigate({
-                        search: (p) => ({ ...p, album: row.album.id }),
-                      })
-                    }
-                  >
-                    {row.album.title}
-                  </button>
-                </td>
-                <td>{row.title}</td>
-                {search.wantedKind === 'cutoff_unmet' ? (
-                  <td>{formatWantedFileQuality(row.file) ?? '—'}</td>
-                ) : null}
-                <td className={styles.trackActions}>
-                  <IconActionButton
-                    icon="automatic"
-                    title="Search this track"
-                    requiresWrite
-                    // dd28-16: one banner is shared by every row, so a second
-                    // search must not start until the first has reported.
-                    disabled={searchBusy}
-                    onClick={() => runSearch(row.track_id)}
-                  />
-                </td>
+        <div className={styles.libraryTableResponsive} role="region" aria-label="Wanted tracks">
+          <table className={`${styles.trackTable} ${styles.wantedTable}`}>
+            <thead>
+              <tr>
+                <th>Artist</th>
+                <th>Album</th>
+                <th>Track</th>
+                {search.wantedKind === 'cutoff_unmet' ? <th>Quality</th> : null}
+                <th />
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {rows.map((row: LibraryV2WantedRow) => (
+                <tr key={row.track_id}>
+                  <td>
+                    <button
+                      type="button"
+                      className={styles.linkButton}
+                      onClick={() =>
+                        void navigate({
+                          search: (p) => ({
+                            ...p,
+                            artist: row.artist.id,
+                            album: undefined,
+                            releases: undefined,
+                          }),
+                        })
+                      }
+                    >
+                      {row.artist.name}
+                    </button>
+                  </td>
+                  <td>
+                    <button
+                      type="button"
+                      className={styles.linkButton}
+                      onClick={() =>
+                        void navigate({
+                          search: (p) => ({ ...p, album: row.album.id }),
+                        })
+                      }
+                    >
+                      {row.album.title}
+                    </button>
+                  </td>
+                  <td>{row.title}</td>
+                  {search.wantedKind === 'cutoff_unmet' ? (
+                    <td>{formatWantedFileQuality(row.file) ?? '—'}</td>
+                  ) : null}
+                  <td className={styles.trackActions}>
+                    <IconActionButton
+                      icon="automatic"
+                      title="Search this track"
+                      requiresWrite
+                      // dd28-16: one banner is shared by every row, so a second
+                      // search must not start until the first has reported.
+                      disabled={searchBusy}
+                      onClick={() => runSearch(row.track_id)}
+                    />
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
 
       {pagination && pagination.total_pages > 1 ? (
@@ -4864,10 +5001,7 @@ export function ArtistCard({
             {artist.album_count} albums · {artist.single_count} singles
           </span>
           <span className={styles.artistMeta}>
-            {trackProgress(artist.tracks_present, artist.track_count)} tracks
-            {artist.tracks_missing > 0 ? (
-              <span className={styles.missingBadge}>{artist.tracks_missing} missing</span>
-            ) : null}
+            <TrackPresence present={artist.tracks_present} total={artist.track_count} /> tracks
           </span>
         </span>
       </button>
@@ -4925,14 +5059,26 @@ function ArtistTable({
     if (!columns[key]) return null;
     switch (key) {
       case 'quality_profile':
-        return <th key="quality_profile">Quality Profile</th>;
+        return (
+          <th key="quality_profile" className={styles.artistOptionalColumn}>
+            Quality Profile
+          </th>
+        );
       case 'genres':
-        return <th key="genres">Genre</th>;
+        return (
+          <th key="genres" className={styles.artistOptionalColumn}>
+            Genre
+          </th>
+        );
       case 'added':
-        return <th key="added">Added</th>;
+        return (
+          <th key="added" className={styles.artistOptionalColumn}>
+            Added
+          </th>
+        );
       case 'size':
         return (
-          <th key="size" className={styles.colNum}>
+          <th key="size" className={`${styles.colNum} ${styles.artistOptionalColumn}`}>
             Size
           </th>
         );
@@ -4941,87 +5087,100 @@ function ArtistTable({
     }
   };
 
-  const renderBodyCell = (
-    artist: LibraryV2ArtistSummary,
-    key: keyof LibraryV2ArtistTableColumns,
-  ) => {
-    if (!columns[key]) return null;
+  const fieldLabels = {
+    quality_profile: 'Quality profile',
+    genres: 'Genre',
+    added: 'Added',
+    size: 'Size',
+  };
+  const fieldValue = (artist: LibraryV2ArtistSummary, key: keyof LibraryV2ArtistTableColumns) => {
     switch (key) {
       case 'quality_profile':
-        return (
-          <td key="quality_profile">
-            {profileNameById.has(artist.quality_profile_id)
-              ? profileLabel(
-                  profileNameById.get(artist.quality_profile_id) as string,
-                  artist.quality_profile_source,
-                )
-              : '—'}
-          </td>
-        );
+        return profileNameById.has(artist.quality_profile_id)
+          ? profileLabel(
+              profileNameById.get(artist.quality_profile_id)!,
+              artist.quality_profile_source,
+            )
+          : '—';
       case 'genres':
-        return <td key="genres">{artist.genres.join(', ') || '—'}</td>;
+        return artist.genres.join(', ') || '—';
       case 'added':
-        return <td key="added">{formatReleaseDate(artist.added_at) ?? '—'}</td>;
+        return formatReleaseDate(artist.added_at) ?? '—';
       case 'size':
-        return (
-          <td key="size" className={styles.colNum}>
-            {artist.total_size_bytes > 0 ? formatFileSize(artist.total_size_bytes) : '—'}
-          </td>
-        );
-      default:
-        return null;
+        return artist.total_size_bytes > 0 ? formatFileSize(artist.total_size_bytes) : '—';
     }
   };
+  const renderBodyCell = (artist: LibraryV2ArtistSummary, key: keyof LibraryV2ArtistTableColumns) =>
+    columns[key] ? (
+      <td
+        key={key}
+        className={`${styles.artistOptionalColumn} ${key === 'size' ? styles.colNum : ''}`}
+      >
+        {fieldValue(artist, key)}
+      </td>
+    ) : null;
 
   return (
-    <table className={styles.table} id="library-artists-grid">
-      <thead>
-        <tr>
-          <th className={styles.colMonitor}>Mon.</th>
-          <th>Artist</th>
-          <th className={styles.colNum}>Albums</th>
-          <th className={styles.colNum}>Singles</th>
-          <th className={styles.colNum}>Tracks</th>
-          <th className={styles.colNum}>Missing</th>
-          {orderedKeys.map(renderHeaderCell)}
-        </tr>
-      </thead>
-      <tbody>
-        {artists.map((artist) => (
-          <tr
-            key={artist.id}
-            className={styles.tableRow}
-            onClick={() => void navigate({ search: (p) => openArtistSearch(p, artist.id) })}
-          >
-            <td>
-              <MonitorToggle entity="artists" id={artist.id} monitored={artist.monitored} />
-            </td>
-            <td>
-              <span className={styles.cellArtist}>
-                <Artwork
-                  src={artist.image_url ?? ''}
-                  remote={artist.remote_image_url}
-                  alt={artist.name}
-                  className={styles.rowThumb}
-                  thumb
-                />
-                <span>{artist.name}</span>
-                <MediaServerRecognitionBadge sources={artist.media_server_sources} />
-              </span>
-            </td>
-            <td className={styles.colNum}>{artist.album_count}</td>
-            <td className={styles.colNum}>{artist.single_count}</td>
-            <td className={styles.colNum}>
-              {trackProgress(artist.tracks_present, artist.track_count)}
-            </td>
-            <td className={styles.colNum}>
-              {artist.tracks_missing > 0 ? artist.tracks_missing : '—'}
-            </td>
-            {orderedKeys.map((key) => renderBodyCell(artist, key))}
+    <div className={styles.libraryTableResponsive} role="region" aria-label="Artists table">
+      <table className={`${styles.table} ${styles.artistTable}`} id="library-artists-grid">
+        <thead>
+          <tr>
+            <th className={styles.colMonitor}>Mon.</th>
+            <th>Artist</th>
+            <th className={styles.colNum}>Albums</th>
+            <th className={styles.colNum}>Singles</th>
+            <th className={styles.colNum}>Tracks</th>
+            {orderedKeys.map(renderHeaderCell)}
           </tr>
-        ))}
-      </tbody>
-    </table>
+        </thead>
+        <tbody>
+          {artists.map((artist) => (
+            <tr
+              key={artist.id}
+              className={styles.tableRow}
+              onClick={() => void navigate({ search: (p) => openArtistSearch(p, artist.id) })}
+            >
+              <td>
+                <MonitorToggle entity="artists" id={artist.id} monitored={artist.monitored} />
+              </td>
+              <td>
+                <span className={styles.cellArtist}>
+                  <Artwork
+                    src={artist.image_url ?? ''}
+                    remote={artist.remote_image_url}
+                    alt={artist.name}
+                    className={styles.rowThumb}
+                    thumb
+                  />
+                  <span className={styles.artistTableIdentity}>
+                    <span>{artist.name}</span>
+                    <span className={styles.artistTableFacts}>
+                      {orderedKeys
+                        .filter((key) => columns[key])
+                        .map((key) => (
+                          <span key={key} title={fieldLabels[key]}>
+                            {fieldValue(artist, key)}
+                          </span>
+                        ))}
+                    </span>
+                    <span className={styles.artistTableReleaseCounts}>
+                      {artist.album_count} albums · {artist.single_count} singles
+                    </span>
+                  </span>
+                  <MediaServerRecognitionBadge sources={artist.media_server_sources} />
+                </span>
+              </td>
+              <td className={styles.colNum}>{artist.album_count}</td>
+              <td className={styles.colNum}>{artist.single_count}</td>
+              <td className={styles.colNum}>
+                <TrackPresence present={artist.tracks_present} total={artist.track_count} />
+              </td>
+              {orderedKeys.map((key) => renderBodyCell(artist, key))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }
 
@@ -5116,7 +5275,12 @@ function AlbumDetailView({ albumId }: { albumId: number }) {
             <Artwork src={album.image_url ?? ''} alt={album.title} className={styles.detailThumb} />
             <div className={styles.detailMeta}>
               <div className={styles.detailTitleRow}>
-                <MonitorToggle entity="albums" id={album.id} monitored={album.monitored} />
+                <MonitorToggle
+                  entity="albums"
+                  id={album.id}
+                  monitored={album.monitored}
+                  prominent
+                />
                 <h1 className={styles.title}>{album.title}</h1>
                 <AlbumOverflowMenu
                   album={{
@@ -5156,16 +5320,8 @@ function AlbumDetailView({ albumId }: { albumId: number }) {
                     ? profileLabel(album.quality_profile.name, album.quality_profile_source)
                     : 'No quality profile'}
                 </span>
-                <span className={styles.detailLabel}>
-                  <SvgIcon name="tracks" />
-                  {trackProgress(album.tracks_present, album.track_count)} tracks
-                </span>
-                <span
-                  className={`${styles.detailLabel} ${album.monitored ? styles.labelMonitored : styles.labelUnmonitored}`}
-                >
-                  <SvgIcon name={album.monitored ? 'monitor' : 'close'} />
-                  {album.monitored ? 'Monitored' : 'Unmonitored'}
-                </span>
+                <TrackPresence present={album.tracks_present} total={album.track_count} />
+
                 {album.total_size_bytes > 0 ? (
                   <span className={styles.detailLabel}>
                     <SvgIcon name="folder" />
@@ -5300,6 +5456,12 @@ function ArtistToolsMenu({
   onReorganizeAll,
   onMaintenance,
   onManualImport,
+  onEditMetadata,
+  onPhoto,
+  onManageTracks,
+  onUpdateDiscography,
+  onDelete,
+  discographyBusy,
 }: {
   artistId: number;
   artistName: string;
@@ -5307,12 +5469,18 @@ function ArtistToolsMenu({
   onReorganizeAll: () => void;
   onMaintenance: () => void;
   onManualImport: () => void;
+  onEditMetadata: () => void;
+  onPhoto: () => void;
+  onManageTracks: () => void;
+  onUpdateDiscography: () => void;
+  onDelete: () => void;
+  discographyBusy: boolean;
 }) {
+  const canWrite = useLibraryV2CanWrite();
   const [open, setOpen] = useState(false);
   const [showSubmenu, setShowSubmenu] = useState(false);
   const [showExport, setShowExport] = useState(false);
   const wrapRef = useRef<HTMLSpanElement>(null);
-
   useEffect(() => {
     if (!open) return;
     function onDocClick(e: MouseEvent) {
@@ -5324,84 +5492,82 @@ function ArtistToolsMenu({
     document.addEventListener('mousedown', onDocClick);
     return () => document.removeEventListener('mousedown', onDocClick);
   }, [open]);
-
+  const item = (
+    label: string,
+    icon: IconName,
+    action: () => void,
+    write = true,
+    danger = false,
+    busy = false,
+  ) => (
+    <button
+      type="button"
+      className={`${styles.overflowMenuItem} ${danger ? styles.overflowMenuItemDanger : ''}`}
+      disabled={(write && !canWrite) || busy}
+      onClick={() => {
+        action();
+        setOpen(false);
+        setShowSubmenu(false);
+      }}
+    >
+      <SvgIcon name={icon} />
+      {label}
+    </button>
+  );
   return (
-    <span ref={wrapRef} className={styles.overflowWrap} onClick={(e) => e.stopPropagation()}>
-      <ActionButton
-        icon="organize"
-        label="Files/Tools"
-        title="Preview Retag, Reorganize All, Library Health & Repair, Manual Import, Enrich, Export Artists"
+    <span
+      ref={wrapRef}
+      className={styles.overflowWrap}
+      onClick={(e) => e.stopPropagation()}
+      onKeyDown={(e) => {
+        if (e.key === 'Escape') {
+          setOpen(false);
+          setShowSubmenu(false);
+          wrapRef.current?.querySelector('button')?.focus();
+        }
+      }}
+    >
+      <button
+        type="button"
+        className={styles.toolButton}
+        aria-expanded={open}
+        aria-controls="artist-tools-panel"
         onClick={() => setOpen((v) => !v)}
-      />
+      >
+        <SvgIcon name="organize" />
+        <span>Tools</span>
+        <span aria-hidden="true">⌄</span>
+      </button>
       {open ? (
-        <div className={`${styles.overflowMenu} ${styles.alignLeft}`}>
-          <button
-            type="button"
-            className={styles.overflowMenuItem}
-            onClick={() => {
-              onRetag();
-              setOpen(false);
-            }}
-          >
-            Preview Retag
-          </button>
-          <button
-            type="button"
-            className={styles.overflowMenuItem}
-            onClick={() => {
-              onReorganizeAll();
-              setOpen(false);
-            }}
-          >
-            Reorganize All
-          </button>
-          <button
-            type="button"
-            className={styles.overflowMenuItem}
-            onClick={() => {
-              onMaintenance();
-              setOpen(false);
-            }}
-          >
-            Library Health & Repair
-          </button>
-          <button
-            type="button"
-            className={styles.overflowMenuItem}
-            onClick={() => {
-              onManualImport();
-              setOpen(false);
-            }}
-          >
-            Manual Import
-          </button>
-          {/* Export Artists lives in here rather than in the page header: it is
-              a whole-roster utility people reach for occasionally, not part of
-              the artist workflow, and the header is already the place for the
-              two global ACTIONS (Automatic Search, Monitor All). */}
-          <button
-            type="button"
-            className={styles.overflowMenuItem}
-            onClick={() => {
-              setShowExport(true);
-              setOpen(false);
-            }}
-          >
-            Export Artists…
-          </button>
-          <div
-            className={styles.submenuContainer}
-            onMouseEnter={() => setShowSubmenu(true)}
-            onMouseLeave={() => setShowSubmenu(false)}
-          >
+        <div
+          id="artist-tools-panel"
+          className={`${styles.overflowMenu} ${styles.artistToolsPanel} ${styles.alignRight}`}
+        >
+          <div className={styles.toolMenuHeading}>Files</div>
+          {item('Manage Tracks', 'tracks', onManageTracks, false)}
+          {item('Preview Retag', 'edit', onRetag)}
+          {item('Preview Rename / Organize', 'organize', onReorganizeAll)}
+          {item('Manual Import', 'download', onManualImport)}
+          <div className={styles.toolMenuHeading}>Metadata</div>
+          {item('Edit Metadata', 'edit', onEditMetadata)}
+          {item('Change Photo', 'cover', onPhoto)}
+          {item(
+            discographyBusy ? 'Updating Discography…' : 'Update Discography',
+            'refresh',
+            onUpdateDiscography,
+            true,
+            false,
+            discographyBusy,
+          )}
+          <div className={styles.submenuContainer}>
             <button
               type="button"
               className={styles.overflowMenuItem}
-              onClick={(e) => {
-                e.stopPropagation();
-                setShowSubmenu((v) => !v);
-              }}
+              disabled={!canWrite}
+              aria-expanded={showSubmenu}
+              onClick={() => setShowSubmenu((v) => !v)}
             >
+              <SvgIcon name="refresh" />
               Enrich… <span className={styles.submenuChevron}>›</span>
             </button>
             {showSubmenu ? (
@@ -5410,15 +5576,20 @@ function ArtistToolsMenu({
                 entityId={artistId}
                 entityName={artistName}
                 wrapperRef={wrapRef}
-                align="left"
+                align="right"
                 submenu
                 onClose={() => {
-                  setShowSubmenu(false);
                   setOpen(false);
+                  setShowSubmenu(false);
                 }}
               />
             ) : null}
           </div>
+          <div className={styles.toolMenuHeading}>Maintenance</div>
+          {item('Library Health & Repair', 'settings', onMaintenance)}
+          {item('Export Artists…', 'download', () => setShowExport(true), false)}
+          <div className={styles.toolMenuDivider} />
+          {item('Delete Artist…', 'delete', onDelete, true, true)}
         </div>
       ) : null}
       {showExport ? (
@@ -5523,12 +5694,15 @@ function completionOverlay(card: DiscographyCard): {
   label: string;
 } {
   if (card.owned === null) return { cls: 'checking', label: 'Checking…' };
-  if (!card.owned) return { cls: 'missing', label: 'Missing' };
-  const missing = Math.max(0, card.totalTracks - card.ownedTracks);
-  if (missing === 0 || card.totalTracks === 0) return { cls: 'completed', label: '✓ Owned' };
-  const pct = Math.round((card.ownedTracks / card.totalTracks) * 100);
+  if (card.totalTracks === 0)
+    return { cls: card.owned ? 'completed' : 'missing', label: card.owned ? 'Owned' : 'Missing' };
   return {
-    cls: pct >= 75 ? 'nearly_complete' : 'partial',
+    cls:
+      card.ownedTracks >= card.totalTracks
+        ? 'completed'
+        : card.ownedTracks > 0
+          ? 'partial'
+          : 'missing',
     label: `${card.ownedTracks}/${card.totalTracks}`,
   };
 }
@@ -5573,16 +5747,19 @@ function ReleaseCardGrid({
           >
             <div className="album-card-image" data-bg-src={card.imageUrl || undefined} />
             {card.albumId ? (
-              <div
-                className={styles.cardMonitor}
-                title="Bookmark this release"
-                onClick={(e) => e.stopPropagation()}
-              >
+              <div className={styles.cardMonitor} onClick={(e) => e.stopPropagation()}>
                 <MonitorToggle entity="albums" id={card.albumId} monitored={card.monitored} />
               </div>
             ) : null}
             {overlay ? (
-              <div className={`completion-overlay ${overlay.cls}`}>
+              <div
+                className={`completion-overlay ${overlay.cls} ${styles.releasePresence}`}
+                title={
+                  card.totalTracks > 0
+                    ? `${card.ownedTracks} of ${card.totalTracks} tracks in your library`
+                    : overlay.label
+                }
+              >
                 <span className="completion-status">{overlay.label}</span>
               </div>
             ) : null}
@@ -5974,6 +6151,8 @@ function LegacyArtistHero({
   badges,
   actions,
   coverage,
+  titleActions,
+  titleLeading,
   onPickImage,
 }: {
   name: string;
@@ -5994,6 +6173,8 @@ function LegacyArtistHero({
   badges?: ReactNode;
   actions?: ReactNode;
   coverage?: Record<string, number>;
+  titleActions?: ReactNode;
+  titleLeading?: ReactNode;
   onPickImage?: () => void;
 }) {
   const [expandedBio, setExpandedBio] = useState(false);
@@ -6065,7 +6246,11 @@ function LegacyArtistHero({
         </div>
         <div className="artist-info">
           <div className="artist-hero-identity">
-            <h1 className="artist-name">{name}</h1>
+            <div className={styles.detailTitleRow}>
+              {titleLeading}
+              <h1 className="artist-name">{name}</h1>
+              {titleActions}
+            </div>
             {badges ? <div className="artist-hero-badges">{badges}</div> : null}
           </div>
           {actions ? <div className="artist-hero-actions">{actions}</div> : null}
@@ -6073,17 +6258,13 @@ function LegacyArtistHero({
             <div className="artist-genres-container">{genres.join(', ')}</div>
           ) : null}
           {cleanBio ? (
-            <div
-              ref={bioRef}
-              className={`artist-hero-bio${expandedBio ? ' expanded' : ''}`}
-            >
+            <div ref={bioRef} className={`artist-hero-bio${expandedBio ? ' expanded' : ''}`}>
               <span className="bio-text">{cleanBio}</span>
               {bioFits ? null : (
                 <span
                   className="artist-hero-bio-toggle"
                   onClick={() => setExpandedBio((v) => !v)}
                   role="button"
-                  tabIndex={0}
                   onKeyDown={(e) => e.key === 'Enter' && setExpandedBio((v) => !v)}
                 >
                   {expandedBio ? 'Show less' : 'Read more'}
@@ -6410,12 +6591,10 @@ function DiscoveryArtistView({
  *  chips stay (ldp-08) instead of legacy's metadata-source panel. */
 function CatalogueArtistHero({
   artist,
-  onOpenSettings,
   onPickImage,
   headerToggle,
 }: {
   artist: LibraryV2ArtistDetail;
-  onOpenSettings: () => void;
   onPickImage: () => void;
   headerToggle: ReactNode;
 }) {
@@ -6458,25 +6637,19 @@ function CatalogueArtistHero({
       providerId={providerIds.spotify ?? providerIds.deezer ?? null}
       source={source}
       onPickImage={onPickImage}
+      titleActions={headerToggle}
+      titleLeading={
+        <MonitorToggle entity="artists" id={artist.id} monitored={artist.monitored} prominent />
+      }
       // ldp-08 stays: the V2 match chips are the metadata-source display, not
       // legacy's panel. The enrichment rings underneath are the part the user
       // asked for on top — they answer a different question (how many of this
       // artist's TRACKS a provider actually knows).
-      badges={<ArtistMatchChips artist={artist} abbreviated />}
+      badges={<ArtistMatchChips artist={artist} />}
       coverage={matchStatus.data?.enrichmentCoverage}
       actions={
         <>
           <ArtistPlayButton artistId={artist.id} artistName={artist.name} />
-          <MonitorToggle entity="artists" id={artist.id} monitored={artist.monitored} />
-          {artist.monitored ? (
-            <IconActionButton
-              icon="settings"
-              title="Artist Settings — Watchlist, future releases, quality and provider match"
-              requiresWrite
-              onClick={onOpenSettings}
-            />
-          ) : null}
-          {headerToggle}
           <ArtistAliases artistId={artist.id} artistName={artist.name} />
         </>
       }
@@ -6489,6 +6662,7 @@ function ArtistDetailView({ artistId }: { artistId: number }) {
   const canWrite = useLibraryV2CanWrite();
   const search = Route.useSearch();
   const releasesMode = search.releases;
+  const showVideos = search.artistView === 'videos';
   // ldp-03/ldp-04/ldp-05: how `All Releases` renders and how rich the header
   // is are view settings, carried in the URL next to `releases` and `view`
   // like every other Library V2 view setting.
@@ -6516,7 +6690,6 @@ function ArtistDetailView({ artistId }: { artistId: number }) {
   const [showReorganizeAll, setShowReorganizeAll] = useState(false);
   const [showEditArtist, setShowEditArtist] = useState(false);
   const [showArtPicker, setShowArtPicker] = useState(false);
-  const [showUnmonitoredProfile, setShowUnmonitoredProfile] = useState(false);
   // Album-scoped retag/delete now live inside each album's own
   // AlbumOverflowMenu (B1/B2) — this state is only for the artist-level
   // toolbar's own Preview Retag / Delete buttons.
@@ -6574,7 +6747,7 @@ function ArtistDetailView({ artistId }: { artistId: number }) {
   }
 
   function setReleasesMode(mode: 'library' | 'all') {
-    void navigate({ search: (p) => ({ ...p, releases: mode }) });
+    void navigate({ search: (p) => ({ ...p, releases: mode, artistView: 'releases' }) });
   }
 
   /** ldp-04: the filter bar governs `All Releases` in BOTH render modes, so
@@ -6691,80 +6864,37 @@ function ArtistDetailView({ artistId }: { artistId: number }) {
                 title="Manually select from search results across all configured sources"
                 onClick={() => handleAction('Interactive Search')}
               />
-              <ActionButton
-                icon="download"
-                label={discographyBusy ? 'Updating…' : 'Update Discography'}
-                title="Fetch every release this artist has published (metadata only)"
-                busy={discographyBusy}
-                onClick={() => void updateDiscography()}
-              />
             </div>
             <div className={styles.toolbarGroup}>
-              <ArtistToolsMenu
-                artistId={artistId}
-                artistName={artistName}
-                onRetag={() =>
-                  setRetagTarget({
-                    entity: 'artists',
-                    id: artistId,
-                    title: artist.name,
-                  })
-                }
-                onReorganizeAll={() => setShowReorganizeAll(true)}
-                onMaintenance={() => setShowMaintenance(true)}
-                onManualImport={() => void navigate({ to: '/import' })}
-              />
-            </div>
-            <div className={styles.toolbarGroup}>
-              <ActionButton
-                icon="tracks"
-                label="Manage Tracks"
-                title="Review single↔album duplicate recordings, files, and their monitor state"
-                requiresWrite={false}
-                onClick={() => setShowManageTracks(true)}
-              />
               <ActionButton
                 icon="history"
                 label="History"
-                title="Recent downloads recorded for this artist"
+                title="Recent activity for this artist"
                 requiresWrite={false}
                 onClick={() => setShowHistory(true)}
               />
               <ActionButton
-                icon="edit"
-                label="Edit Metadata"
-                title="Correct artist metadata without rewriting provider data"
-                onClick={() => setShowEditArtist(true)}
+                icon="settings"
+                label="Artist Settings"
+                title="Quality profile, monitoring and future releases"
+                onClick={() => setShowArtistSettings(true)}
               />
-              <ActionButton
-                icon="cover"
-                label="Change Photo"
-                title="Pick from alternate artist photos"
-                onClick={() => setShowArtPicker(true)}
-              />
-              {!artist.monitored ? (
-                <ActionButton
-                  icon="star"
-                  label={`Profile: ${
-                    artist.quality_profile
-                      ? profileLabel(artist.quality_profile.name, artist.quality_profile_source)
-                      : 'None'
-                  }`}
-                  title="Set quality independently; bookmark the artist to unlock Watchlist settings"
-                  onClick={() => setShowUnmonitoredProfile(true)}
-                />
-              ) : null}
-              <ActionButton
-                icon="delete"
-                label="Delete"
-                tone="danger"
-                title="Remove this artist and choose whether linked files stay on disk"
-                onClick={() =>
-                  setDeleteTarget({
-                    entity: 'artists',
-                    id: artistId,
-                    title: artist.name,
-                  })
+              <ArtistToolsMenu
+                artistId={artistId}
+                artistName={artistName}
+                onRetag={() =>
+                  setRetagTarget({ entity: 'artists', id: artistId, title: artist.name })
+                }
+                onReorganizeAll={() => setShowReorganizeAll(true)}
+                onMaintenance={() => setShowMaintenance(true)}
+                onManualImport={() => void navigate({ to: '/import' })}
+                onEditMetadata={() => setShowEditArtist(true)}
+                onPhoto={() => setShowArtPicker(true)}
+                onManageTracks={() => setShowManageTracks(true)}
+                onUpdateDiscography={() => void updateDiscography()}
+                discographyBusy={discographyBusy}
+                onDelete={() =>
+                  setDeleteTarget({ entity: 'artists', id: artistId, title: artist.name })
                 }
               />
             </div>
@@ -6786,7 +6916,6 @@ function ArtistDetailView({ artistId }: { artistId: number }) {
           {headerMode === 'rich' ? (
             <CatalogueArtistHero
               artist={artist}
-              onOpenSettings={() => setShowArtistSettings(true)}
               onPickImage={() => setShowArtPicker(true)}
               headerToggle={headerToggle}
             />
@@ -6800,21 +6929,17 @@ function ArtistDetailView({ artistId }: { artistId: number }) {
               />
               <div className={styles.detailMeta}>
                 <div className={styles.detailTitleRow}>
-                  <MonitorToggle entity="artists" id={artist.id} monitored={artist.monitored} />
+                  <MonitorToggle
+                    entity="artists"
+                    id={artist.id}
+                    monitored={artist.monitored}
+                    prominent
+                  />
                   <h1 className={styles.title}>{artist.name}</h1>
-                  {artist.monitored ? (
-                    <IconActionButton
-                      icon="settings"
-                      title="Artist Settings — Watchlist, future releases, quality and provider match"
-                      requiresWrite
-                      onClick={() => setShowArtistSettings(true)}
-                    />
-                  ) : null}
                   {headerToggle}
                 </div>
                 <p className={styles.subtitle}>
                   {artist.album_count} albums · {artist.single_count} singles
-                  {artist.monitored ? ' · Monitored (watchlist)' : ''}
                 </p>
                 <div className={styles.detailLabels}>
                   <span className={`${styles.detailLabel} ${styles.labelProfile}`}>
@@ -6823,12 +6948,7 @@ function ArtistDetailView({ artistId }: { artistId: number }) {
                       ? profileLabel(artist.quality_profile.name, artist.quality_profile_source)
                       : 'No quality profile'}
                   </span>
-                  <span
-                    className={`${styles.detailLabel} ${artist.monitored ? styles.labelMonitored : styles.labelUnmonitored}`}
-                  >
-                    <SvgIcon name={artist.monitored ? 'monitor' : 'close'} />
-                    {artist.monitored ? 'Monitored' : 'Unmonitored'}
-                  </span>
+
                   <span className={styles.detailLabel}>
                     <SvgIcon name="tracks" />
                     {artist.albums.length + (artist.eps?.length ?? 0) + artist.singles.length}{' '}
@@ -6845,8 +6965,10 @@ function ArtistDetailView({ artistId }: { artistId: number }) {
                 {artist.genres.length > 0 ? (
                   <p className={styles.genres}>{artist.genres.join(', ')}</p>
                 ) : null}
-                <ArtistMatchChips artist={artist} />
-                <ArtistAliases artistId={artist.id} artistName={artist.name} />
+                <div className={styles.artistLinkedMetadata}>
+                  <ArtistMatchChips artist={artist} />
+                  <ArtistAliases artistId={artist.id} artistName={artist.name} />
+                </div>
               </div>
             </header>
           )}
@@ -6855,14 +6977,16 @@ function ArtistDetailView({ artistId }: { artistId: number }) {
             <div className={styles.releasesToggle}>
               <button
                 type="button"
-                className={releasesMode === 'library' ? styles.viewActive : ''}
+                className={!showVideos && releasesMode === 'library' ? styles.viewActive : ''}
+                aria-pressed={!showVideos && releasesMode === 'library'}
                 onClick={() => setReleasesMode('library')}
               >
                 My Library
               </button>
               <button
                 type="button"
-                className={releasesMode === 'all' ? styles.viewActive : ''}
+                className={!showVideos && releasesMode === 'all' ? styles.viewActive : ''}
+                aria-pressed={!showVideos && releasesMode === 'all'}
                 onClick={() => setReleasesMode('all')}
               >
                 All Releases
@@ -6870,8 +6994,16 @@ function ArtistDetailView({ artistId }: { artistId: number }) {
                   <span className={styles.sectionCount}>{artist.discography_count}</span>
                 ) : null}
               </button>
+              <button
+                type="button"
+                className={showVideos ? styles.viewActive : ''}
+                aria-pressed={showVideos}
+                onClick={() => void navigate({ search: (p) => ({ ...p, artistView: 'videos' }) })}
+              >
+                Music Videos
+              </button>
             </div>
-            {releasesMode === 'all' ? (
+            {!showVideos && releasesMode === 'all' ? (
               <div className={styles.releasesToggle}>
                 <button
                   type="button"
@@ -6898,13 +7030,15 @@ function ArtistDetailView({ artistId }: { artistId: number }) {
               </div>
             ) : null}
             <span className={styles.releasesHint}>
-              {releasesMode === 'all'
-                ? 'Full discography from the metadata provider — monitor a release to add it to Wanted.'
-                : 'Releases in your library (plus monitored ones).'}
+              {showVideos
+                ? 'Videos from YouTube. Saved videos are managed in the Video section.'
+                : releasesMode === 'all'
+                  ? 'Full discography from the metadata provider — monitor a release to add it to Wanted.'
+                  : 'Releases in your library (plus monitored ones).'}
             </span>
           </div>
 
-          {releasesMode === 'all' ? (
+          {!showVideos && releasesMode === 'all' ? (
             <DiscographyFilterBar
               state={filters}
               onChange={setFilters}
@@ -6914,7 +7048,11 @@ function ArtistDetailView({ artistId }: { artistId: number }) {
             />
           ) : null}
 
-          {releasesMode === 'all' && releaseView === 'cards' ? (
+          {showVideos ? (
+            <div className={styles.musicVideosPanel}>
+              <ArtistVideosSection artistName={artist.name} standalone />
+            </div>
+          ) : releasesMode === 'all' && releaseView === 'cards' ? (
             <DiscographySections>
               {(
                 [
@@ -6992,16 +7130,6 @@ function ArtistDetailView({ artistId }: { artistId: number }) {
               />
             </>
           )}
-          {/* The music-video shelf came in with upstream 26698e4b2, whose only
-              mount was the legacy artist-detail page this branch deleted — it
-              shipped unreachable. It belongs under the releases, the same place
-              upstream put it. */}
-          <ArtistVideosSection artistName={artist.name} />
-          {/* Same story as the shelf above: upstream 5283de408 shipped live
-              dates and setlists whose only mount was the deleted page, so the
-              whole 1,189-line feature arrived unreachable. Setlist.fm is asked
-              by MBID; an artist without one still gets the upcoming half.
-              Renders nothing at all unless a concert provider is configured. */}
           <ConcertsSection
             artistName={artist.name}
             mbid={String(artist.provider_ids?.musicbrainz ?? '')}
@@ -7036,7 +7164,8 @@ function ArtistDetailView({ artistId }: { artistId: number }) {
             <ManageTracksModal artistId={artistId} onClose={() => setShowManageTracks(false)} />
           ) : null}
           {showReorganizeAll ? (
-            <ArtistReorganizeAllModal
+            <ArtistRenamePreviewModal
+              albums={[...artist.albums, ...(artist.eps ?? []), ...artist.singles]}
               artistId={artistId}
               artistName={artist.name}
               onClose={() => setShowReorganizeAll(false)}
@@ -7051,17 +7180,6 @@ function ArtistDetailView({ artistId }: { artistId: number }) {
               artistId={artist.id}
               artistName={artist.name}
               onClose={() => setShowArtPicker(false)}
-            />
-          ) : null}
-          {showUnmonitoredProfile ? (
-            <QualityProfileModal
-              entity="artists"
-              id={artist.id}
-              currentProfileId={artist.quality_profile?.id ?? 1}
-              currentProfileSource={artist.quality_profile_source}
-              currentProfileExplicit={artist.quality_profile_explicit}
-              title={artist.name}
-              onClose={() => setShowUnmonitoredProfile(false)}
             />
           ) : null}
           {retagTarget ? (
@@ -7372,16 +7490,6 @@ function AlbumBlock({
     (profilesQuery.data ?? []).find((p) => p.id === album.quality_profile_id)?.name ?? null;
   const releaseDate =
     formatReleaseDate(album.release_date) || (album.year ? String(album.year) : null);
-  const pct = album.track_count
-    ? clampPercent((100 * album.tracks_present) / album.track_count)
-    : 0;
-  // "Missing" only counts monitored tracks (§44/LV2-CNT-01), so a release
-  // nobody wants anything from now reads 0 missing with 0 present too — that
-  // is not completion, it is nothing having been asked for. Read it the same
-  // way a browsed-but-untouched discography release already reads.
-  const unowned =
-    album.tracks_present === 0 && (album.origin === 'discography' || album.tracks_missing === 0);
-  const complete = !unowned && album.tracks_missing === 0 && album.track_count > 0;
   const openAlbumDetail = () => {
     void navigate({
       search: (previous) => ({ ...previous, album: album.id }),
@@ -7427,50 +7535,34 @@ function AlbumBlock({
           >
             {album.title}
           </button>
-          <span className={styles.albumHeadBadges}>
-            <span className={styles.albumTypeBadge}>{album.album_type}</span>
+          {activeDownloads > 0 ? (
+            <span
+              className={styles.queueStatusPill}
+              title={`${activeDownloads} track(s) currently in the download pipeline`}
+            >
+              <SvgIcon name="download" />
+              {activeDownloads} downloading
+            </span>
+          ) : null}
+          <div className={styles.albumHeadFacts}>
             <AlbumSizeBadge bytes={album.total_size_bytes} />
-            {releaseDate ? (
-              <span className={styles.albumDateBadge} title="Release date">
-                {releaseDate}
-              </span>
-            ) : null}
-            {profileName ? (
-              <span className={styles.qualityProfileBadge} title="Quality profile">
-                <SvgIcon name="star" />
-                {profileName}
-              </span>
-            ) : null}
-          </span>
-        </div>
-        <div className={styles.albumProgress}>
-          <div className={styles.progressBar}>
-            <div
-              className={styles.progressFill}
-              data-complete={complete ? 'true' : 'false'}
-              style={{ width: `${pct}%` }}
-            />
+            <span className={styles.albumDateBadge} title="Release date">
+              {releaseDate || '—'}
+            </span>
+            <span
+              className={styles.qualityProfileBadge}
+              title={`Quality profile: ${profileName || 'Default'}`}
+            >
+              <SvgIcon name="star" />
+              {profileName || 'Default'}
+            </span>
           </div>
-          <span className={styles.progressLabel}>
-            {trackProgress(album.tracks_present, album.track_count)}
-          </span>
         </div>
-        {activeDownloads > 0 ? (
-          <span
-            className={styles.queueStatusPill}
-            title={`${activeDownloads} track(s) currently in the download pipeline`}
-          >
-            <SvgIcon name="download" />
-            {activeDownloads} downloading
-          </span>
-        ) : null}
-        {unowned ? (
-          <span className={styles.statusNotOwned}>not in library</span>
-        ) : (
-          <span className={complete ? styles.statusOk : styles.statusWarn}>
-            {complete ? 'complete' : `${album.tracks_missing} missing`}
-          </span>
-        )}
+        <TrackPresence
+          className={styles.albumTrackCount}
+          present={album.tracks_present}
+          total={album.track_count}
+        />
         <span className={styles.albumActions}>
           <AlbumPlayButton
             albumId={album.id}
@@ -8036,7 +8128,6 @@ function ResizableHeaderCell({
             event.preventDefault();
             onKeyboardResize(resizeKey, event.key === 'ArrowRight' ? 1 : -1);
           }}
-          tabIndex={0}
           title="Drag to resize adjacent columns · double-click to reset layout"
         />
       ) : null}
@@ -9042,6 +9133,9 @@ export function AlbumTrackTable({
       : UTILITY_COLUMN_WIDTH +
         Object.values(responsiveColumnWidths).reduce((sum, width) => sum + width, 0);
 
+  const stackedTable =
+    tableWidth != null && renderedTableWidth != null && renderedTableWidth > tableWidth + 1;
+
   const availableProviders = useMemo(() => {
     if (!matchQuery.data) return null;
     const set = new Set<string>();
@@ -9369,9 +9463,47 @@ export function AlbumTrackTable({
           onClear={() => setSelected(new Set())}
         />
       ) : null}
+      {stackedTable ? (
+        <div className={styles.stackedTrackControls}>
+          <label className={styles.checkOption}>
+            <input
+              type="checkbox"
+              checked={allSelected}
+              onChange={() => setSelected(allSelected ? new Set() : new Set(selectableIds))}
+            />
+            Select all tracks
+          </label>
+          <label>
+            Sort{' '}
+            <select
+              aria-label="Sort tracks"
+              className={styles.select}
+              value={sort ? `${sort.key}:${sort.dir}` : ''}
+              onChange={(e) => {
+                const [key, dir] = e.target.value.split(':');
+                setSort(key ? { key: key as TrackSortKey, dir: dir as 'asc' | 'desc' } : null);
+              }}
+            >
+              <option value="">Track order</option>
+              <option value="title:asc">Title A–Z</option>
+              <option value="title:desc">Title Z–A</option>
+              <option value="duration:asc">Shortest first</option>
+              <option value="duration:desc">Longest first</option>
+              <option value="file_size:desc">Largest files first</option>
+              <option value="file_size:asc">Smallest files first</option>
+              <option value="bpm:asc">BPM ascending</option>
+              <option value="bpm:desc">BPM descending</option>
+            </select>
+          </label>
+        </div>
+      ) : null}
       <table
-        className={styles.trackTable}
-        style={renderedTableWidth == null ? undefined : { minWidth: `${renderedTableWidth}px` }}
+        className={`${styles.trackTable} ${stackedTable ? styles.trackTableStacked : ''}`}
+        style={
+          renderedTableWidth == null || stackedTable
+            ? undefined
+            : { minWidth: `${renderedTableWidth}px` }
+        }
       >
         <colgroup>
           <col style={{ width: `${CHECKBOX_COLUMN_WIDTH}px` }} />
@@ -9679,7 +9811,12 @@ function TrackRow({
     switch (key) {
       case 'title':
         return (
-          <td key="title" style={widthStyle('title')}>
+          <td
+            data-column="title"
+            data-label={TRACK_TABLE_COLUMN_LABELS.title}
+            key="title"
+            style={widthStyle('title')}
+          >
             {/* Legacy parity: present/missing shown inline with the title. */}
             <span className={styles.trackTitleCell}>
               <span className={missing ? styles.muted : undefined}>{label}</span>
@@ -9693,31 +9830,59 @@ function TrackRow({
         );
       case 'disc':
         return (
-          <td key="disc" className={styles.colDisc} style={widthStyle('disc')}>
+          <td
+            data-column="disc"
+            data-label={TRACK_TABLE_COLUMN_LABELS.disc}
+            key="disc"
+            className={styles.colDisc}
+            style={widthStyle('disc')}
+          >
             {track.disc_number ?? '—'}
           </td>
         );
       case 'artists':
         return (
-          <td key="artists" style={widthStyle('artists')}>
+          <td
+            data-column="artists"
+            data-label={TRACK_TABLE_COLUMN_LABELS.artists}
+            key="artists"
+            style={widthStyle('artists')}
+          >
             {track.artists.map((a) => a.name).join(', ')}
           </td>
         );
       case 'duration':
         return (
-          <td key="duration" className={styles.colDuration} style={widthStyle('duration')}>
+          <td
+            data-column="duration"
+            data-label={TRACK_TABLE_COLUMN_LABELS.duration}
+            key="duration"
+            className={styles.colDuration}
+            style={widthStyle('duration')}
+          >
             {formatDuration(track.duration)}
           </td>
         );
       case 'bpm':
         return (
-          <td key="bpm" className={styles.colBpm} style={widthStyle('bpm')}>
+          <td
+            data-column="bpm"
+            data-label={TRACK_TABLE_COLUMN_LABELS.bpm}
+            key="bpm"
+            className={styles.colBpm}
+            style={widthStyle('bpm')}
+          >
             {track.bpm ?? '—'}
           </td>
         );
       case 'match':
         return (
-          <td key="match" style={widthStyle('match')}>
+          <td
+            data-column="match"
+            data-label={TRACK_TABLE_COLUMN_LABELS.match}
+            key="match"
+            style={widthStyle('match')}
+          >
             {matchServices.length > 0 ? (
               <MatchChips
                 entityType="track"
@@ -9734,6 +9899,8 @@ function TrackRow({
       case 'media_server':
         return (
           <td
+            data-column="media_server"
+            data-label={TRACK_TABLE_COLUMN_LABELS.media_server}
             key="media_server"
             className={styles.mediaServerCell}
             style={widthStyle('media_server')}
@@ -9747,7 +9914,13 @@ function TrackRow({
         );
       case 'quality': {
         return (
-          <td key="quality" className={styles.qualityText} style={widthStyle('quality')}>
+          <td
+            data-column="quality"
+            data-label={TRACK_TABLE_COLUMN_LABELS.quality}
+            key="quality"
+            className={styles.qualityText}
+            style={widthStyle('quality')}
+          >
             {/* The measured quality of a file that is not there any more is not
                 this row's quality — it is history, and the detail modal is
                 where history belongs. Leaving it in the column made a missing
@@ -9760,7 +9933,13 @@ function TrackRow({
       case 'profile': {
         const label = profileName ? profileLabel(profileName, track.quality_profile_source) : null;
         return (
-          <td key="profile" className={styles.profileCell} style={widthStyle('profile')}>
+          <td
+            data-column="profile"
+            data-label={TRACK_TABLE_COLUMN_LABELS.profile}
+            key="profile"
+            className={styles.profileCell}
+            style={widthStyle('profile')}
+          >
             {label ? (
               <span
                 className={`${styles.qualityProfileBadge} ${
@@ -9793,7 +9972,12 @@ function TrackRow({
       }
       case 'features':
         return (
-          <td key="features" style={widthStyle('features')}>
+          <td
+            data-column="features"
+            data-label={TRACK_TABLE_COLUMN_LABELS.features}
+            key="features"
+            style={widthStyle('features')}
+          >
             {!missing && track.file ? (
               <span className={styles.featuresDisplay}>
                 <TrackReplayGainBadge track={track} />
@@ -9806,7 +9990,12 @@ function TrackRow({
         );
       case 'metadata':
         return (
-          <td key="metadata" style={widthStyle('metadata')}>
+          <td
+            data-column="metadata"
+            data-label={TRACK_TABLE_COLUMN_LABELS.metadata}
+            key="metadata"
+            style={widthStyle('metadata')}
+          >
             {track.id && !missing ? (
               <TrackMetadataGapsCell track={track} onOpenTags={() => setDetailTab('tags')} />
             ) : (
@@ -9816,7 +10005,12 @@ function TrackRow({
         );
       case 'acoustid':
         return (
-          <td key="acoustid" style={widthStyle('acoustid')}>
+          <td
+            data-column="acoustid"
+            data-label={TRACK_TABLE_COLUMN_LABELS.acoustid}
+            key="acoustid"
+            style={widthStyle('acoustid')}
+          >
             {missing ? (
               <span className={styles.muted}>—</span>
             ) : (
@@ -9827,6 +10021,8 @@ function TrackRow({
       case 'file_path':
         return (
           <td
+            data-column="file_path"
+            data-label={TRACK_TABLE_COLUMN_LABELS.file_path}
             key="file_path"
             className={styles.filePathCell}
             style={widthStyle('file_path')}
@@ -9837,7 +10033,13 @@ function TrackRow({
         );
       case 'file_size':
         return (
-          <td key="file_size" className={styles.fileSizeCell} style={widthStyle('file_size')}>
+          <td
+            data-column="file_size"
+            data-label={TRACK_TABLE_COLUMN_LABELS.file_size}
+            key="file_size"
+            className={styles.fileSizeCell}
+            style={widthStyle('file_size')}
+          >
             {missing || track.file?.size == null ? (
               <span className={styles.muted}>—</span>
             ) : (
@@ -9847,7 +10049,13 @@ function TrackRow({
         );
       case 'play':
         return (
-          <td key="play" className={styles.colPlay} style={widthStyle('play')}>
+          <td
+            data-column="play"
+            data-label={TRACK_TABLE_COLUMN_LABELS.play}
+            key="play"
+            className={styles.colPlay}
+            style={widthStyle('play')}
+          >
             <TrackPlayButton
               track={track}
               albumTitle={albumTitle}
@@ -10268,7 +10476,7 @@ function TrackDetailButton({
       <IconActionButton
         icon="edit"
         title="Edit track — quality profile, metadata, tags, lyrics and pipeline info"
-        onClick={() => onOpenTab('quality')}
+        onClick={() => onOpenTab('metadata')}
       />
       {openTab ? (
         <TrackDetailModal
@@ -10297,7 +10505,7 @@ const TRACK_DETAIL_TAB_LABELS: Record<TrackDetailTab, string> = {
 function TrackDetailModal({
   track,
   albumTitle,
-  initialTab = 'quality',
+  initialTab = 'metadata',
   onClose,
 }: {
   track: LibraryV2Track;
@@ -10313,13 +10521,20 @@ function TrackDetailModal({
     libraryV2TrackFileTagsQueryOptions(trackId, tab === 'tags' || tab === 'lyrics'),
   );
   return (
-    <ModalShell title={track.title ?? albumTitle} detail onClose={onClose}>
+    <ModalShell
+      title={`Edit Track — ${track.title ?? albumTitle}`}
+      description={`${track.artists.map((artist) => artist.name).join(', ')} · ${albumTitle}`}
+      className={styles.metadataEditorDialog}
+      detail
+      onClose={onClose}
+    >
       <div className={styles.detailTabs}>
-        {(['quality', 'history', 'metadata', 'tags', 'lyrics', 'info'] as const).map((t) => (
+        {(['metadata', 'quality', 'tags', 'lyrics', 'info', 'history'] as const).map((t) => (
           <button
             key={t}
             type="button"
             className={`${styles.detailTab} ${tab === t ? styles.detailTabActive : ''}`}
+            aria-pressed={tab === t}
             onClick={() => setTab(t)}
           >
             {TRACK_DETAIL_TAB_LABELS[t]}
@@ -10410,8 +10625,8 @@ function TrackMetadataForm({ track, onSaved }: { track: LibraryV2Track; onSaved:
   }
 
   return (
-    <>
-      <div className={styles.editRow}>
+    <div className={styles.metadataEditGrid}>
+      <div className={`${styles.editRow} ${styles.editFull}`}>
         <label htmlFor="lib2-track-title">Title</label>
         <input
           id="lib2-track-title"
@@ -10472,7 +10687,7 @@ function TrackMetadataForm({ track, onSaved }: { track: LibraryV2Track; onSaved:
           <option value="no">Clean</option>
         </select>
       </div>
-      <div className={styles.editRow}>
+      <div className={`${styles.editRow} ${styles.editHalf}`}>
         <label htmlFor="lib2-track-style">Style</label>
         <input
           id="lib2-track-style"
@@ -10482,7 +10697,7 @@ function TrackMetadataForm({ track, onSaved }: { track: LibraryV2Track; onSaved:
           onChange={(event) => setStyle(event.target.value)}
         />
       </div>
-      <div className={styles.editRow}>
+      <div className={`${styles.editRow} ${styles.editHalf}`}>
         <label htmlFor="lib2-track-mood">Mood</label>
         <input
           id="lib2-track-mood"
@@ -10514,7 +10729,7 @@ function TrackMetadataForm({ track, onSaved }: { track: LibraryV2Track; onSaved:
         </button>
       </div>
       {track.id && track.file ? <TrackWriteTagsButton trackId={track.id} /> : null}
-    </>
+    </div>
   );
 }
 
@@ -11134,6 +11349,7 @@ export function TrackPipelineTimeline({ trackId }: { trackId: number }) {
                 {h.status && CHECK_STATUS_TONE[h.status] ? (
                   <span className={`${styles.verificationBadge} ${CHECK_STATUS_TONE[h.status]}`}>
                     {h.status}
+                    {h.status_basis === 'current_file' ? ' (current)' : ''}
                   </span>
                 ) : h.status ? (
                   <span className={styles.pipelineStatus} data-status={h.status}>
