@@ -519,6 +519,9 @@ function setCurrentProfile(profile) {
 const LEGACY_PROFILE_PAGE_ALIASES = {
     downloads: 'search',
     artists: 'search',
+    // Library v2 became the Library; anything still naming the old route id
+    // resolves to the same permission rather than to an unknown page.
+    'library-v2': 'library',
 };
 
 function normalizeProfilePageId(pageId) {
@@ -1428,8 +1431,7 @@ function updateProfileIndicator() {
         } else if (currentProfile.id === 1) {
             btn.style.display = ''; // Root admin sees all
         } else {
-            const ap = currentProfile.allowed_pages;
-            btn.style.display = (!ap || ap.includes(page)) ? '' : 'none';
+            btn.style.display = isPageAllowed(page) ? '' : 'none';
         }
     });
 
@@ -3017,7 +3019,12 @@ function initializeNavigation() {
 
 const _DEEPLINK_VALID_PAGES = new Set([
     'dashboard', 'sync', 'search', 'discover', 'automations',
-    'library', 'import', 'settings', 'help', 'issues', 'stats', 'watchlist',
+    // iss29-B07: '/library-v2' is a live alias that redirects to '/library'
+    // (query string preserved). It was missing here, so this fallback resolved
+    // a bookmark to it as 'dashboard'. React usually wins the race and the
+    // right page appears anyway — which is exactly what makes the gap easy to
+    // miss and unreliable to depend on.
+    'library', 'library-v2', 'import', 'settings', 'help', 'issues', 'stats', 'watchlist',
     'wishlist', 'active-downloads', 'artist-detail', 'playlist-explorer',
     'hydrabase', 'tools', 'chat'
 ]);
@@ -3034,6 +3041,9 @@ function _getPageFromPath() {
     if (!_DEEPLINK_VALID_PAGES.has(basePage)) return 'dashboard';
     // Context-dependent pages fall back to a sensible parent
     if (basePage === 'playlist-explorer') return 'library';
+    // The alias and its target are the same page as far as the shell chrome
+    // is concerned (iss29-B07).
+    if (basePage === 'library-v2') return 'library';
     return basePage;
 }
 
@@ -3122,18 +3132,31 @@ function initializeMobileNavigation() {
 
     if (!hamburgerBtn || !sidebar || !overlay) return;
 
+    // One explicit state: the drawer is open only because someone opened it at
+    // a mobile width. It is not a width, and it is not carried over from the
+    // desktop layout.
     function openMobileNav() {
         sidebar.classList.add('mobile-open');
         hamburgerBtn.classList.add('active');
+        hamburgerBtn.setAttribute('aria-expanded', 'true');
+        hamburgerBtn.setAttribute('aria-label', 'Close navigation');
         overlay.classList.add('active');
         document.body.classList.add('mobile-nav-open');
+        // Focus moves into the drawer so a keyboard isn't left behind the
+        // backdrop, and Escape below puts it back on the opener.
+        const first = sidebar.querySelector('.nav-button, a[href], button:not([disabled])');
+        if (first) first.focus();
     }
 
-    function closeMobileNav() {
+    function closeMobileNav(restoreFocus) {
+        const wasOpen = sidebar.classList.contains('mobile-open');
         sidebar.classList.remove('mobile-open');
         hamburgerBtn.classList.remove('active');
+        hamburgerBtn.setAttribute('aria-expanded', 'false');
+        hamburgerBtn.setAttribute('aria-label', 'Open navigation');
         overlay.classList.remove('active');
         document.body.classList.remove('mobile-nav-open');
+        if (wasOpen && restoreFocus === true) hamburgerBtn.focus();
     }
 
     hamburgerBtn.addEventListener('click', () => {
@@ -3144,7 +3167,33 @@ function initializeMobileNavigation() {
         }
     });
 
-    overlay.addEventListener('click', closeMobileNav);
+    overlay.addEventListener('click', () => closeMobileNav());
+
+    document.addEventListener('keydown', (event) => {
+        if (event.key !== 'Escape') return;
+        if (!sidebar.classList.contains('mobile-open')) return;
+        closeMobileNav(true);
+    });
+
+    // Crossing the breakpoint. Going desktop -> mobile the drawer defaults
+    // CLOSED: nobody asked for it, and the drawer's slide transition made the
+    // flip paint a half-open panel over the page. Going mobile -> desktop we
+    // just drop the mobile-only classes; the collapse preference lives in
+    // html[data-sidebar] and is untouched by any of this.
+    const mobileQuery = window.matchMedia ? window.matchMedia('(max-width: 768px)') : null;
+    if (mobileQuery) {
+        const onBreakpoint = () => {
+            // Kill the slide for one frame, so the layout change itself never
+            // animates across the viewport.
+            sidebar.classList.add('sidebar-no-transition');
+            closeMobileNav();
+            requestAnimationFrame(() => {
+                requestAnimationFrame(() => sidebar.classList.remove('sidebar-no-transition'));
+            });
+        };
+        if (mobileQuery.addEventListener) mobileQuery.addEventListener('change', onBreakpoint);
+        else if (mobileQuery.addListener) mobileQuery.addListener(onBreakpoint);
+    }
 
     // Backstop for the overlay click above: the overlay is one element at a
     // fixed z-index, so anything that paints over it swallows the tap and the
