@@ -243,6 +243,16 @@ def _unwrap_room_messages(messages):
             f = chat_codec.file_of(dec)
             if f:
                 m["file"] = f
+            # A shared overlay template. The definition rides its own envelope
+            # key (protocol_of would reject layers-of-objects), and the card
+            # carries the asset refs it depends on so the reader is told what
+            # will be missing BEFORE they import rather than after.
+            ov = chat_codec.overlay_of(dec)
+            if ov:
+                m["overlay"] = {"n": ov["n"],
+                                "layers": len(ov["d"].get("layers") or []),
+                                "assets": chat_codec.overlay_assets(ov["d"]),
+                                "d": ov["d"]}
             # Edit carrier: the client fold replaces the target's displayed
             # text and keeps the history; the carrier itself stays a real
             # message (Soulseek can't unsend, so hiding it would lie).
@@ -276,24 +286,38 @@ def _gif_fetch(url: str, params: dict) -> dict:
     return r.json()
 
 
+def _library_like(text) -> str:
+    """A ``LIKE ... ESCAPE '\\'`` needle for a typed search box.
+
+    Accents fold (``unidecode_lower`` on the column side), and the LIKE
+    metacharacters are escaped: in a search box ``%`` and ``_`` are letters
+    someone typed, not a request to match everything.
+    """
+    from core.text.normalize import normalize_for_comparison
+    folded = normalize_for_comparison(str(text or ''))
+    escaped = folded.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+    return f"%{escaped}%"
+
+
 def _resolve_track_path(db, track_id):
-    """A library track's on-disk path. The DB stores the path as the MEDIA
-    SERVER sees it (e.g. Plex's ``/mnt/musicBackup/...``), which the SoulSync
-    process usually can't open directly — so we hand it to the shared library
+    """A library track's on-disk path. The path lives on the track's primary
+    FILE row (ADR-03), not on the track, and it is stored as the MEDIA SERVER
+    sees it (e.g. Plex's ``/mnt/musicBackup/...``), which the SoulSync process
+    usually can't open directly — so we hand it to the shared library
     resolver, the same one the repair/import flows use. It maps the stored
     path onto SoulSync's actual mounts via ``library.music_paths`` +
     transfer/download roots (suffix-matching). None when unreachable."""
     conn = None
     try:
+        from core.library2.track_files import primary_file_row
         conn = db._get_connection()
-        row = conn.execute("SELECT file_path FROM tracks WHERE id = ?",
-                           (str(track_id),)).fetchone()
+        row = primary_file_row(conn, int(track_id))
     except Exception:
         return None
     finally:
         if conn:
             conn.close()
-    fp = row["file_path"] if row else None
+    fp = row["path"] if row else None
     if not fp:
         return None
     try:
@@ -724,22 +748,35 @@ def create_blueprint() -> Blueprint:
             return jsonify({"tracks": []})
         conn = None
         try:
+            from core.library2.track_files import primary_order
             conn = db._get_connection()
-            like = "%" + query.replace("%", "\\%") + "%"
             rows = conn.execute(
-                """SELECT t.id, t.title, t.file_path, t.file_size,
-                          COALESCE(t.track_artist, ar.name, '') AS artist,
+                f"""SELECT t.id, t.title, tf.path, tf.size,
+                          COALESCE(credited.name, album_artist.name, '') AS artist,
                           COALESCE(al.title, '') AS album
-                   FROM tracks t
-                   LEFT JOIN artists ar ON ar.id = t.artist_id
-                   LEFT JOIN albums al ON al.id = t.album_id
-                   WHERE t.file_path IS NOT NULL AND t.file_path != ''
-                     AND (t.title LIKE ? OR ar.name LIKE ? OR t.track_artist LIKE ?)
+                   FROM lib2_tracks t
+                   JOIN lib2_albums al ON al.id = t.album_id
+                   JOIN lib2_track_files tf ON tf.id = (
+                        SELECT f.id FROM lib2_track_files f
+                         WHERE f.track_id = t.id
+                           AND COALESCE(f.file_state, 'active') <> 'deleted'
+                           AND COALESCE(f.path, '') <> ''
+                         ORDER BY {primary_order('f')} LIMIT 1)
+                   LEFT JOIN lib2_artists album_artist
+                          ON album_artist.id = al.primary_artist_id
+                   LEFT JOIN lib2_artists credited ON credited.id = (
+                        SELECT ta.artist_id FROM lib2_track_artists ta
+                         WHERE ta.track_id = t.id
+                         ORDER BY CASE ta.role WHEN 'primary' THEN 0 ELSE 1 END,
+                                  ta.position, ta.artist_id LIMIT 1)
+                   WHERE unidecode_lower(t.title) LIKE :like ESCAPE '\\'
+                      OR unidecode_lower(COALESCE(credited.name, '')) LIKE :like ESCAPE '\\'
+                      OR unidecode_lower(COALESCE(album_artist.name, '')) LIKE :like ESCAPE '\\'
                    ORDER BY t.title LIMIT 20""",
-                (like, like, like)).fetchall()
+                {"like": _library_like(query)}).fetchall()
             return jsonify({"tracks": [
                 {"id": r["id"], "title": r["title"], "artist": r["artist"],
-                 "album": r["album"], "size": r["file_size"]}
+                 "album": r["album"], "size": r["size"]}
                 for r in rows]})
         except Exception as e:
             logger.debug("chat: library search failed: %s", e)
@@ -1044,6 +1081,21 @@ def create_blueprint() -> Blueprint:
                 if now - _INGEST_AT.get(room, 0) > 60:
                     _INGEST_AT[room] = now
                     db.add_chat_messages(room, live)
+                    # The WRITE is throttled with the messages; the read below
+                    # is not. Reactions are carriers, so the message archive
+                    # never held them and a reaction died with slskd's buffer.
+                    db.add_chat_reactions(room, reactions)
+                # Merged on EVERY hydrate, never on the 60s tick alone: this
+                # page polls every 4s, so folding stored reactions in only when
+                # the throttle opens would make old chips appear for one poll
+                # and vanish for the next fourteen.
+                for _k, _by in (db.get_chat_reactions(room) or {}).items():
+                    _live = reactions.setdefault(_k, {})
+                    for _e, _users in _by.items():
+                        _cur = _live.setdefault(_e, [])
+                        for _u in _users:
+                            if _u not in _cur:
+                                _cur.append(_u)
                 # Game carriers ride every hydrate rather than the 60s throttle:
                 # they are rare (usually none at all), the natural-key UNIQUE
                 # makes repeats free, and losing one loses a move.
@@ -1302,21 +1354,41 @@ def create_blueprint() -> Blueprint:
                 logger.debug("chat radio: similar-artists failed", exc_info=True)
 
         # 3) the local similar-artist graph the watchlist scan already built.
-        # It's keyed by the user's OWN artist ids, so join through artists to
-        # match on the playing artist's name (only hits when they own them).
+        # It only hits for artists the user owns, so the playing artist is
+        # looked up in the library by name — folded, because the seed is a
+        # YouTube title and its spelling is not the library's.
+        #
+        # `similar_artists.source_artist_id` is a PROVIDER id (whichever id the
+        # scan ran with — see `similar_artists_worker.pick_source_artist_id`),
+        # so the library's job here is to hand over the artist's provider ids.
+        # Spotify and MusicBrainz sit in their own columns, every other
+        # provider inside `external_ids`.
         if artist:
             conn = None
             try:
+                from core.library2.provider_ids import parse_external_ids
+                from core.text.normalize import normalize_for_comparison
                 conn = _db()._get_connection()
-                cur = conn.cursor()
-                cur.execute(
-                    "SELECT sa.similar_artist_name FROM similar_artists sa "
-                    "JOIN artists a ON a.id = sa.source_artist_id "
-                    "WHERE LOWER(a.name) = LOWER(?) "
-                    "ORDER BY sa.similarity_rank LIMIT 30",
-                    (artist,),
-                )
-                for row in cur.fetchall():
+                source_ids = []
+                for row in conn.execute(
+                    "SELECT spotify_id, musicbrainz_id, external_ids "
+                    "FROM lib2_artists WHERE unidecode_lower(name) = ?",
+                    (normalize_for_comparison(artist),),
+                ).fetchall():
+                    known = parse_external_ids(row["external_ids"])
+                    for value in (row["spotify_id"], known.get("itunes"),
+                                  known.get("deezer"), row["musicbrainz_id"]):
+                        text = str(value or "").strip()
+                        if text and text not in source_ids:
+                            source_ids.append(text)
+                marks = ",".join("?" for _ in source_ids)
+                rows = conn.execute(
+                    "SELECT similar_artist_name FROM similar_artists "
+                    f"WHERE source_artist_id IN ({marks}) "
+                    "ORDER BY similarity_rank LIMIT 30",
+                    source_ids,
+                ).fetchall() if source_ids else []
+                for row in rows:
                     ca = str(row[0] or "")
                     if _fresh(ca):
                         return jsonify({"query": ca, "why": "similar to %s" % artist})
@@ -1369,17 +1441,72 @@ def create_blueprint() -> Blueprint:
         if not _can_send():
             return jsonify({"error": "Chat sending is admin-only on this server"}), 403
         msg = _clean_message(request.get_json(silent=True))
-        if not msg:
+        # An overlay share carries no text on purpose - the CARD is the message,
+        # the way a poll or a game move is - so this guard has to know about it or
+        # the feature can never send anything. A file share slips past because its
+        # url IS the text.
+        _shared_overlay = isinstance((request.get_json(silent=True) or {}).get("overlay"), dict)
+        if not msg and not _shared_overlay:
             return jsonify({"error": "empty message"}), 400
         # Room messages ride the SoulSync envelope (rich format; other clients
         # see line noise). PMs are NEVER encoded — they must stay readable to
         # non-SoulSync users (and the ProveIt bots need literal plaintext).
         from core import chat_codec
         body = request.get_json(silent=True) or {}
+
+        # PLAIN mode. Everything in this room was enveloped unconditionally, so
+        # anyone talking to a vanilla Soulseek user was talking to themselves —
+        # the room LOOKED shared and was not. `plain` sends the raw text so
+        # every Soulseek client can read it.
+        #
+        # Nothing rich can ride along: there is no envelope to carry a reply
+        # ref, a template, a channel tag or an avatar. Those are REFUSED rather
+        # than quietly dropped — silently sending a bare sentence when someone
+        # attached a template is the same class of lie this mode exists to fix.
+        if body.get("plain") is True:
+            for field, label in (("overlay", "an overlay template"), ("file", "a file"),
+                                 ("reply", "a reply"), ("edit", "an edit")):
+                if body.get(field):
+                    return jsonify({"error": "Plain text can't carry %s — every Soulseek "
+                                             "client has to be able to read it. Switch back "
+                                             "to SoulSync format to send that." % label}), 400
+            chan = str(body.get("chan") or "").strip().lower()
+            if chan and chan != "general":
+                return jsonify({"error": "Plain text always goes to the main room — a "
+                                         "channel tag needs the SoulSync envelope."}), 400
+            if body.get("thread"):
+                return jsonify({"error": "Plain text can't go in a thread — threads need "
+                                         "the SoulSync envelope."}), 400
+            room = _resolve_room(body.get("room"))
+            if room is None:
+                return jsonify({"error": "Not in that room"}), 404
+            try:
+                if not _ensure_joined(client, room):
+                    return jsonify({"error": "Could not join room '%s'" % room}), 502
+                ok = _run_async(client.send_room_message(room, msg))
+            except Exception as e:
+                logger.exception("chat: plain room send failed")
+                return jsonify({"error": str(e)}), 502
+            if not ok:
+                return jsonify({"error": "slskd rejected the message"}), 502
+            return jsonify({"ok": True, "plain": True})
+
         extra = None
         rep = chat_codec.reply_of({"r": body.get("reply")})
         if rep:
             extra = {"r": rep}
+        # A shared overlay template. Validated by the SAME codec the receive
+        # path uses, so anything that leaves here is something a reader's card
+        # can render. Refused loudly rather than sent as a dud: a template that
+        # exceeds the wire limit would otherwise arrive truncated, which reads
+        # as a broken design rather than as a message that did not fit.
+        ovl = chat_codec.overlay_of({"o": body.get("overlay")})
+        if body.get("overlay") is not None and ovl is None:
+            return jsonify({"error": "That overlay template can't be shared "
+                                     "(it needs a name and at least one layer)."}), 400
+        if ovl:
+            extra = dict(extra or {})
+            extra["o"] = ovl
         fmeta = chat_codec.file_of({"f": body.get("file")})
         if fmeta:
             extra = dict(extra or {})
@@ -1419,6 +1546,14 @@ def create_blueprint() -> Blueprint:
             extra["ed"] = edit
         wrapped = chat_codec.encode(msg, extra)
         if wrapped is None:
+            # Name the half that did not fit. With a template attached the text
+            # is almost never the problem, and "message too long" sends someone
+            # to shorten a sentence that was already short.
+            if ovl:
+                layers = len((ovl.get("d") or {}).get("layers") or [])
+                return jsonify({"error": "That template is too big to send over chat "
+                                         "(%d layers). Export it to a file instead."
+                                         % layers}), 400
             return jsonify({"error": "message too long for Soulseek chat"}), 400
         room = _resolve_room(body.get("room"))
         if room is None:

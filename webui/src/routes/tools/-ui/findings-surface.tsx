@@ -29,6 +29,7 @@
  * duplicate), so the backend refuses an action that spans more than one type.
  */
 
+import { FindingsAlbumGrid } from './findings-album-grid';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import type { FindingGroup, FindingTypeInfo } from '../-tools.groups';
@@ -63,7 +64,7 @@ import {
   cacheHealthLabel,
   cacheHealthScore,
   findingFilePath,
-  findingFixLabel,
+  findingRowFixLabel,
   findingSeverityIcon,
   findingStatusBadge,
   findingTypeLabel,
@@ -103,6 +104,7 @@ function readStoredPageSize(): number {
 const TYPE_ORPHAN = 'orphan_file';
 const TYPE_DEAD = 'dead_file';
 const TYPE_ACOUSTID = 'acoustid_mismatch';
+const TYPE_RETAG = 'library_retag';
 const TYPE_BACKFILL = 'missing_discography_track';
 const TYPE_QUALITY = 'quality_upgrade';
 
@@ -123,6 +125,11 @@ const SORT_OPTIONS = [
   { value: 'newest', label: 'Newest first' },
   { value: 'oldest', label: 'Oldest first' },
   { value: 'severity', label: 'Severity' },
+  // Severity alone could never order an upgrade backlog - every below-profile
+  // track is 'info', so they all tied and fell back to scan order. These two
+  // sort on the audio itself.
+  { value: 'quality', label: 'Worst quality first' },
+  { value: 'quality_desc', label: 'Best quality first' },
   { value: 'path', label: 'File path' },
 ] as const;
 
@@ -167,6 +174,9 @@ export function FindingsSurface({
    *  single finding list, which is what lets every row feature survive
    *  unchanged instead of being rebuilt per group. */
   const [openType, setOpenType] = useState('');
+  // list | album | artist. Resets whenever a different type is opened, because
+  // a grouping that made sense for upgrades rarely does for the next type.
+  const [groupView, setGroupView] = useState<'list' | 'album' | 'artist'>('list');
 
   const [groups, setGroups] = useState<FindingGroup[]>([]);
   const [types, setTypes] = useState<FindingTypeInfo[]>([]);
@@ -468,6 +478,13 @@ export function FindingsSurface({
           return;
         }
       }
+      if (type === TYPE_RETAG && !finding.details?.has_manual_conflict) {
+        // Nothing to settle on this row — the plain apply is the whole action.
+      } else if (type === TYPE_RETAG) {
+        fixAction = await prompts.promptRetag(1, 1);
+        if (!fixAction) return;
+        if (fixAction === 'safe') fixAction = null;
+      }
       if (type === TYPE_BACKFILL) {
         const choice = await prompts.promptBackfill(1);
         if (!choice) return;
@@ -477,6 +494,20 @@ export function FindingsSurface({
         }
         // 'add_to_wishlist' falls through with no fix_action — the handler
         // already adds to the wishlist by default.
+      }
+
+      // A finding with no catalogue subject cannot be re-downloaded — the fix
+      // is a plain delete, and unlike every prompt above it has no dialog of
+      // its own to stop at. Confirm it here rather than let one click remove a
+      // file from disk.
+      if (findingRowFixLabel(finding) === 'Delete File') {
+        const confirmed = await window.showConfirmDialog?.({
+          title: 'Delete File',
+          message: `Permanently delete ${findingFilePath(finding) || 'this file'} from disk? It is not in your library, so nothing will be queued to replace it.`,
+          confirmText: 'Delete',
+          destructive: true,
+        });
+        if (!confirmed) return;
       }
 
       setBusyFix((current) => new Set(current).add(finding.id));
@@ -717,6 +748,15 @@ export function FindingsSurface({
           return;
         }
         // 'add_to_wishlist' falls through with no fix_action.
+      } else if (group.finding_type === TYPE_RETAG) {
+        // Two requests wear one button: write the library's values, and write
+        // them even over the fields this user edited by hand. The count comes
+        // with the group so the choice is informed rather than a coin toss.
+        fixAction = await prompts.promptRetag(count, group.manual_conflicts || 0);
+        if (!fixAction) return;
+        // 'safe' IS the default the handler takes with no action at all;
+        // sending it would only add a string nothing reads.
+        if (fixAction === 'safe') fixAction = null;
       } else if (group.finding_type === TYPE_DEAD) {
         fixAction = await prompts.promptDeadFile();
         if (!fixAction) return;
@@ -950,7 +990,57 @@ export function FindingsSurface({
     </div>
   ) : null;
 
+  /* Opening a different type drops any grouping: "by album" made sense for an
+     upgrade backlog and rarely does for the next type along. */
+  useEffect(() => {
+    setGroupView('list');
+  }, [openType]);
+
+  /* The list/album/artist switch. Only offered inside an opened type - grouping
+     across every type at once would mix "192kbps" and "missing lyrics" into one
+     album card and mean nothing. */
+  const viewSwitch = openType ? (
+    <div className="repair-view-switch" role="group" aria-label="Group findings by">
+      {([
+        ['list', 'List'],
+        ['album', 'Albums'],
+        ['artist', 'Artists'],
+      ] as const).map(([value, label]) => (
+        <button
+          type="button"
+          key={value}
+          aria-pressed={groupView === value}
+          onClick={() => setGroupView(value)}
+        >
+          {label}
+        </button>
+      ))}
+    </div>
+  ) : null;
+
+  /* Drilling into a card reuses the search box, which already matches
+     details_json - so the album name filters straight to that album's rows and
+     every existing control (select all, bulk fix, sort) keeps working on it. */
+  const groupedView =
+    openType && groupView !== 'list' ? (
+      <FindingsAlbumGrid
+        groupBy={groupView}
+        status={statusFilter}
+        findingType={openType}
+        onOpen={(group) => {
+          const needle = groupView === 'artist' ? group.artist : group.album;
+          if (needle) setQuery(needle);
+          setGroupView('list');
+          setPage(0);
+        }}
+      />
+    ) : null;
+
   const findingList = (
+    <>
+      {viewSwitch ? <div className="repair-findings-toolbar">{viewSwitch}</div> : null}
+      {groupedView}
+      {groupedView ? null : (
     <>
       {bar.showBar ? (
         <div className="repair-findings-bulk" id="repair-findings-selection">
@@ -1092,6 +1182,8 @@ export function FindingsSurface({
           </>
         ) : null}
       </div>
+    </>
+      )}
     </>
   );
 
@@ -1268,7 +1360,7 @@ function FindingCard({
 }) {
   const details = finding.details || {};
   const filePath = findingFilePath(finding);
-  const fixLabel = findingFixLabel(finding.finding_type);
+  const fixLabel = findingRowFixLabel(finding);
   const statusBadge = findingStatusBadge(finding.status, finding.user_action);
 
   return (

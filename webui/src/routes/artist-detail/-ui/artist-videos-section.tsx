@@ -221,7 +221,13 @@ function ArtistVideoRailItem({
   );
 }
 
-export function ArtistVideosSection({ artistName }: { artistName?: string | null }) {
+export function ArtistVideosSection({
+  artistName,
+  standalone = false,
+}: {
+  artistName?: string | null;
+  standalone?: boolean;
+}) {
   const [status, setStatus] = useState<Status>('idle');
   const [videos, setVideos] = useState<SearchVideo[]>([]);
   const [reloadToken, setReloadToken] = useState(0);
@@ -272,13 +278,13 @@ export function ArtistVideosSection({ artistName }: { artistName?: string | null
     window.open(url, '_blank', 'noopener,noreferrer');
   }, []);
 
-  if (status === 'idle' || status === 'empty') return null;
+  if (!standalone && (status === 'idle' || status === 'empty')) return null;
 
   return (
     <section className="artist-videos-section" id="artist-videos-section" aria-live="polite">
       <div className="artist-videos-topline">
         <div>
-          <span className="artist-videos-kicker">Video shelf</span>
+          <span className="artist-videos-kicker">{standalone ? 'YouTube' : 'Video shelf'}</span>
           <h3>Music Videos</h3>
         </div>
         <div className="artist-videos-actions">
@@ -300,7 +306,9 @@ export function ArtistVideosSection({ artistName }: { artistName?: string | null
         </div>
       </div>
 
-      {status === 'error' ? (
+      {status === 'empty' ? (
+        <div className="artist-videos-empty">No music videos found for this artist.</div>
+      ) : status === 'error' ? (
         <div className="artist-videos-empty">Music videos are unavailable right now.</div>
       ) : status === 'loading' && !featured ? (
         <div className="artist-videos-loading">
