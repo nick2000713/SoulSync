@@ -157,14 +157,37 @@ def repair_job_settings(job_id):
 
 @bp.route('/api/repair/jobs/<job_id>/run', methods=['POST'])
 def repair_job_run(job_id):
-    """Trigger immediate run of a specific job"""
+    """Trigger immediate run of a specific job.
+
+    Optional JSON body ``{"artist_id": 1, "artist_name": "..."}`` resolves a
+    Library-v2 artist to an exact file allowlist. Jobs that move/delete files
+    enforce that path scope; metadata-only jobs use the accompanying name.
+    Other jobs ignore the scope and run library-wide."""
     try:
         if _repair_worker() is None:
             return jsonify({'error': 'Repair worker not initialized'}), 400
 
-        _repair_worker().run_job_now(job_id)
-        logger.info("Repair job %s triggered manually via UI", job_id)
-        return jsonify({'success': True, 'job_id': job_id}), 200
+        body = request.get_json(silent=True) or {}
+        artist_name = str(body.get('artist_name') or '').strip()
+        artist_id = body.get('artist_id')
+        scope = None
+        if artist_id is not None:
+            from core.repair_jobs.base import build_artist_file_scope
+            scope = build_artist_file_scope(_repair_worker().db, artist_id, artist_name)
+            artist_name = scope['artist_name']
+        elif artist_name:
+            scope = {'artist_name': artist_name}
+        _repair_worker().run_job_now(job_id, scope=scope)
+        logger.info("Repair job %s triggered manually via UI%s", job_id,
+                    f" (artist scope: {artist_name})" if artist_name else "")
+        return jsonify({
+            'success': True,
+            'job_id': job_id,
+            'scoped_to': artist_name or None,
+            'scope_files': len(scope.get('file_paths', [])) if scope else None,
+        }), 200
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
     except Exception as e:
         logger.error(f"Error running repair job {job_id}: {e}")
         return jsonify({'error': str(e)}), 500
@@ -244,6 +267,40 @@ def repair_findings_groups():
         return jsonify({'groups': _repair_worker().get_finding_groups()}), 200
     except Exception as e:
         logger.error(f"Error grouping repair findings: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@bp.route('/api/repair/findings/albums', methods=['GET'])
+def repair_findings_albums():
+    """Findings folded to one row per album (or artist), worst audio first.
+
+    Nobody reviews an upgrade backlog one track at a time - the decision is
+    "re-rip this album" or "everything by them is a bad rip". This is that
+    unit, carrying the artwork already stored on the finding so the grid can
+    render without a lookup per row.
+    """
+    try:
+        if _repair_worker() is None:
+            return jsonify({'groups': []}), 200
+        group_by = request.args.get('group_by') or 'album'
+        if group_by not in ('album', 'artist'):
+            return jsonify({'error': 'group_by must be album or artist'}), 400
+        groups = _repair_worker().get_finding_albums(
+            group_by=group_by,
+            job_id=request.args.get('job_id'),
+            status=request.args.get('status') or 'pending',
+            finding_type=request.args.get('finding_type'),
+            q=request.args.get('q'),
+            limit=int(request.args.get('limit', 200)),
+        )
+        # Same relative-thumb repair the flat list does; a Plex/Jellyfin path
+        # is not loadable from the browser as stored.
+        for g in groups:
+            for key in ('album_thumb_url', 'artist_thumb_url'):
+                if g.get(key):
+                    g[key] = fix_artist_image_url(g[key])
+        return jsonify({'groups': groups}), 200
+    except Exception as e:
+        logger.error(f"Error grouping repair findings by album: {e}")
         return jsonify({'error': str(e)}), 500
 
 @bp.route('/api/repair/findings/<int:finding_id>/reopen', methods=['POST'])

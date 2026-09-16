@@ -1760,6 +1760,13 @@ async function navigateToMirroredPlaylist(playlistRef, source = 'spotify') {
     }
 }
 
+// A second Quality Profile picker for search-intent modals used to live here.
+// Upstream's quality-profiles foundation (our PR #1076) landed the acquisition
+// picker for the SAME modal footer — `downloadModalQualityProfileSelectHtml`
+// below — so the dialog showed two "Quality Profile" selects and ours silently
+// outranked the merged one in the request body. Removed in favour of the
+// upstream control, which is the one the server-side precedence documents.
+
 async function openDownloadMissingModalForArtistAlbum(virtualPlaylistId, playlistName, spotifyTracks, album, artist, showLoadingOverlayParam = true, contextType = 'artist_album') {
     if (showLoadingOverlayParam) {
         showLoadingOverlay('Loading album...');
@@ -2029,7 +2036,6 @@ function updateArtistDownloadsSection() {
     }
     downloadsUpdateTimeout = setTimeout(() => {
         showArtistDownloadsSection();
-        showLibraryDownloadsSection();
         showBeatportDownloadsSection();
         updateDashboardDownloads();
     }, 300); // 300ms debounce
@@ -3961,7 +3967,16 @@ function applyDynamicGlow(cardElement, colors) {
 function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
-    return div.innerHTML;
+    // textContent/innerHTML escapes & < > but NOT a double quote, because a
+    // text node does not need one. Almost every caller interpolates the
+    // result into a double-quoted ATTRIBUTE, where a raw quote closes the
+    // attribute early: a track called 'Crazy (12" mix)' reached MusicBrainz
+    // as 'Crazy (12' with everything after it dropped (#1230).
+    //
+    // Safe in both places: the output is always inserted via innerHTML, so
+    // &quot; renders as a plain quote in text and parses correctly in an
+    // attribute.
+    return div.innerHTML.replace(/"/g, '&quot;');
 }
 
 // --- Service Status and System Stats Functions ---

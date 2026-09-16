@@ -16,6 +16,7 @@ import {
   wishlistTracksQueryOptions,
 } from '../-wishlist.api';
 import {
+  buildArtistImageFallbackMap,
   buildArtistImageMap,
   filterWishlistGroups,
   groupWishlistArtists,
@@ -24,6 +25,7 @@ import {
 } from '../-wishlist.helpers';
 import { useLiveWishlist } from '../-wishlist.live';
 import { Route } from '../route';
+import { WishlistAudiobooks } from './wishlist-audiobooks';
 import { WishlistList } from './wishlist-list';
 import { WishlistOrb } from './wishlist-orb';
 
@@ -32,6 +34,7 @@ export function WishlistPage() {
 
   const { profileId } = useProfile();
   const search = Route.useSearch();
+  const media = search.media;
   const navigate = useNavigate({ from: Route.fullPath });
   const queryClient = useQueryClient();
 
@@ -74,6 +77,13 @@ export function WishlistPage() {
         photosQuery.data ?? [],
       ),
     [albumsQuery.data, singlesQuery.data, photosQuery.data],
+  );
+
+  // Painted only when a primary photo fails to load, which for a Library-v2
+  // artist means the local artwork build is still cold.
+  const artistImageFallbacks = useMemo(
+    () => buildArtistImageFallbackMap([albumsQuery.data ?? {}, singlesQuery.data ?? {}]),
+    [albumsQuery.data, singlesQuery.data],
   );
 
   const groups = useMemo(() => {
@@ -183,7 +193,34 @@ export function WishlistPage() {
         </button>
       </div>
 
-      {total === 0 ? (
+      {/* Media tabs. Music and audiobooks are kept as separate lists, the same
+          isolation the video side keeps between movies, shows and channels:
+          they share a page and nothing else — different database, different
+          search, different acquisition chain. */}
+      <div className="wl-media-tabs" role="tablist" aria-label="Wishlist media type">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={media === 'music'}
+          className={`wl-media-tab${media === 'music' ? ' active' : ''}`}
+          onClick={() => void navigate({ search: (prev) => ({ ...prev, media: 'music' }) })}
+        >
+          Music
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={media === 'audiobooks'}
+          className={`wl-media-tab${media === 'audiobooks' ? ' active' : ''}`}
+          onClick={() => void navigate({ search: (prev) => ({ ...prev, media: 'audiobooks' }) })}
+        >
+          Audiobooks
+        </button>
+      </div>
+
+      {media === 'audiobooks' ? (
+        <WishlistAudiobooks />
+      ) : total === 0 ? (
         <div className="wishlist-page-empty">
           <div className="wishlist-page-empty-icon">
             <svg
@@ -304,6 +341,7 @@ export function WishlistPage() {
                       group={group}
                       index={index}
                       artistImages={artistImages}
+                      artistImageFallbacks={artistImageFallbacks}
                       currentCycle={currentCycle}
                       processing={processing}
                       expanded={expandedArtist === group.name}

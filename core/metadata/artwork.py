@@ -8,7 +8,7 @@ import re
 import time
 import urllib.request
 from ipaddress import ip_address
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 from core.imports.context import get_import_context_album, get_import_context_artist
 from core.metadata.common import (
@@ -23,7 +23,10 @@ __all__ = [
     "download_cover_art",
     "is_internal_image_host",
     "is_image_proxy_url",
+    "is_placeholder_image_url",
+    "is_soulsync_image_url",
     "normalize_image_url",
+    "usable_remote_image_url",
 ]
 
 
@@ -126,14 +129,93 @@ def _redact_url_secrets(url: str | None) -> str:
     return out
 
 
+# Provider "we have no picture" images. They are real, loadable URLs, so every
+# `if url:` check passes and the UI paints a generic grey star as if it were the
+# artist's photo — worse than an empty slot, which at least falls back to the
+# app's own placeholder. Two call sites had grown their own private copy of this
+# set (`core.artists.liked_match`, `MusicDatabase._is_placeholder_image`); they
+# now share this one so a newly discovered placeholder is rejected everywhere.
+PLACEHOLDER_IMAGE_MARKERS = (
+    '2a96cbd8b46e442fc41c2b86b821562f',   # Last.fm default star
+    # deezer's "this artist has no picture": the md5 of an empty string. the url
+    # is well formed and starts with https, so every "is there an image" check
+    # that looks for http let it through, and breakbot and billie eilish sat on
+    # the watchlist with a mic icon while their library rows had good plex
+    # thumbs (upstream 62e/f86f7521a).
+    'd41d8cd98f00b204e9800998ecf8427e',
+)
+
+# deezer also answers with the hash simply MISSING from the path, which no
+# substring marker can catch.
+_DEEZER_EMPTY_PATHS = ('/images/artist//', '/images/cover//', '/images/playlist//')
+
+# SoulSync's OWN browser-facing image endpoints. These are already renderable
+# and must never be run through a media-server rebuild — `/api/library/v2/
+# artwork/...` in particular starts with `/api/`, which `normalize_image_url`
+# used to read as "old Navidrome API path" and rewrite into a Subsonic URL,
+# turning a working local artwork URL into an unreachable media-server one.
+_SOULSYNC_IMAGE_PATH_PREFIXES = ('/api/image-cache/', '/api/library/v2/artwork/')
+
+
+def is_placeholder_image_url(url: str | None) -> bool:
+    """True for a known provider placeholder ("no image available") picture.
+
+    Empty input is NOT a placeholder — it is simply missing. Callers that treat
+    both the same should test `not url or is_placeholder_image_url(url)`.
+    """
+    if not url or not isinstance(url, str):
+        return False
+    value = url.lower()
+    if any(marker in value for marker in PLACEHOLDER_IMAGE_MARKERS):
+        return True
+    if 'dzcdn.net' in value or 'deezer.com' in value:
+        return any(path in value for path in _DEEZER_EMPTY_PATHS)
+    return False
+
+
+def is_soulsync_image_url(url: str | None) -> bool:
+    """True for a URL served by SoulSync itself (proxy, cache, lib2 artwork)."""
+    if not url or not isinstance(url, str):
+        return False
+    try:
+        path = urlparse(url).path or ''
+    except Exception:
+        return False
+    return path == '/api/image-proxy' or path.startswith(_SOULSYNC_IMAGE_PATH_PREFIXES)
+
+
+def usable_remote_image_url(url: str | None) -> str | None:
+    """The URL if a browser anywhere can load it directly, else None.
+
+    "Anywhere" is the point: a media-server relative path, a Docker-internal
+    host and a provider placeholder all *look* like images but render as a
+    broken tile for the user. Callers use this to decide whether a stored
+    `image_url` can be handed to a client as-is or whether they must fall back
+    to SoulSync's own artwork endpoint.
+    """
+    if not url or not isinstance(url, str):
+        return None
+    candidate = url.strip()
+    if not candidate.startswith(('http://', 'https://')):
+        return None
+    if is_internal_image_host(candidate):
+        return None
+    if is_placeholder_image_url(candidate):
+        return None
+    return candidate
+
+
 def normalize_image_url(thumb_url: str | None) -> str | None:
     """Convert media-server image URLs into browser-safe URLs."""
     if not thumb_url:
         return None
 
     try:
-        if is_image_proxy_url(thumb_url):
-            # Already normalized for browser use; avoid wrapping it in another proxy layer.
+        if is_soulsync_image_url(thumb_url):
+            # Already normalized for browser use; avoid wrapping it in another
+            # proxy layer — and, for `/api/library/v2/artwork/...`, avoid the
+            # `/api/` rule below mistaking our own artwork endpoint for a legacy
+            # Navidrome path and rewriting it into an unreachable Subsonic URL.
             return thumb_url
 
         # Check if it's a localhost URL or relative path that needs fixing
@@ -201,6 +283,13 @@ def normalize_image_url(thumb_url: str | None) -> str | None:
                     return _browser_safe_image_url(fixed_url)
 
             elif active_server == 'navidrome':
+                parsed_cover = urlparse(thumb_url)
+                cover_id = parse_qs(parsed_cover.query).get('id', [''])[0]
+                if parsed_cover.path.rstrip('/').endswith('/getCoverArt') and cover_id:
+                    # Keep the cover identity, not a newly salted auth URL. The
+                    # existing proxy authenticates and caches when the image is
+                    # requested, outside library JSON serialization.
+                    return '/api/navidrome/cover/' + quote(cover_id, safe='')
                 navidrome_config = cfg.get_navidrome_config()
                 navidrome_base_url = navidrome_config.get('base_url', '')
                 navidrome_username = navidrome_config.get('username', '')
@@ -216,10 +305,23 @@ def normalize_image_url(thumb_url: str | None) -> str | None:
                         parsed = urlparse(thumb_url)
                         path = parsed.path
 
-                    # Generate Subsonic API authentication
+                    # Generate Subsonic API authentication.
+                    #
+                    # The salt is DERIVED, not random. A fresh `secrets.token_hex()`
+                    # per call produced a different URL every time the same cover
+                    # was normalized, and the image cache keys on the full URL
+                    # (`ImageCache.key_for_url`) — so one artist photo minted a new
+                    # cache entry on every page render. A production cache held 602
+                    # such rows, none of them ever served. Deriving the salt from
+                    # (password, path) keeps the URL stable for a given image while
+                    # still rotating whenever the password changes. It leaks
+                    # nothing: the token md5(password+salt) is already in the URL,
+                    # and the salt is a one-way digest of the password, not the
+                    # password itself.
                     import hashlib
-                    import secrets
-                    salt = secrets.token_hex(6)
+                    salt = hashlib.sha256(
+                        f"soulsync-subsonic-salt/{navidrome_password}/{path}".encode()
+                    ).hexdigest()[:12]
                     token = hashlib.md5((navidrome_password + salt).encode()).hexdigest()
 
                     # Add authentication parameters to the URL
@@ -241,14 +343,29 @@ def normalize_image_url(thumb_url: str | None) -> str | None:
         return _browser_safe_image_url(thumb_url)
 
 
+def usable_image_url(url: str | None) -> bool:
+    """a non-empty url that is not a known placeholder."""
+    if not url:
+        return False
+    value = str(url).strip()
+    return bool(value) and value.lower() != 'none' and not is_placeholder_image_url(value)
+
+
 def is_image_proxy_url(url: str) -> bool:
-    """Return True for SoulSync image proxy/cache URLs, absolute or relative."""
+    """Return True for SoulSync image proxy/cache URLs, absolute or relative.
+
+    Narrower than :func:`is_soulsync_image_url`, which also covers the
+    Library-v2 artwork endpoint. Kept as the answer to "is this URL already
+    going through the proxy/cache?" — a different question from "is this URL
+    ours and already browser-safe?".
+    """
     if not url:
         return False
 
     try:
         parsed = urlparse(url)
-        return parsed.path == '/api/image-proxy' or parsed.path.startswith('/api/image-cache/')
+        return (parsed.path == '/api/image-proxy' or parsed.path.startswith('/api/image-cache/')
+                or parsed.path.startswith('/api/navidrome/cover/'))
     except Exception:
         return False
 
@@ -282,10 +399,7 @@ def _browser_safe_image_url(url: str) -> str:
     if not url:
         return url
 
-    if is_image_proxy_url(url):
-        return url
-
-    if url.startswith('/api/image-proxy?url=') or url.startswith('/api/image-cache/'):
+    if is_soulsync_image_url(url):
         return url
 
     if url.startswith('http://') or url.startswith('https://'):
@@ -372,6 +486,12 @@ def _fetch_art_bytes(art_url: str):
     """
     global _caa_original_down_until
     if not art_url:
+        return None, None
+    # Only absolute http(s) URLs are fetchable here. A relative path (e.g. one
+    # of SoulSync's own `/api/library/v2/artwork/...` URLs, which now travel in
+    # `album.images` for Library-v2 rows that have no provider CDN cover) would
+    # otherwise reach urlopen and raise `unknown url type` on every attempt.
+    if not str(art_url).startswith(('http://', 'https://')):
         return None, None
     upgraded = _upgrade_art_url(art_url)
     is_caa_original = "coverartarchive.org" in upgraded and upgraded.endswith("/front")

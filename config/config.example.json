@@ -1,4 +1,9 @@
 {
+  "musicbrainz": {
+    "base_url": "https://musicbrainz.org/ws/2",
+    "request_interval": 1.05,
+    "embed_tags": true
+  },
   "active_media_server": "plex",
   "spotify": {
     "client_id": "",
@@ -25,6 +30,9 @@
     "username": "",
     "password": "",
     "auto_detect": true
+  },
+  "download_source": {
+    "max_mb_per_minute": 0
   },
   "soulseek": {
     "slskd_url": "http://host.docker.internal:5030",
@@ -54,8 +62,12 @@
       "album_path": "$albumartist/$albumartist - $album/$track - $title",
       "single_path": "$artist/$artist - $title/$title",
       "compilation_path": "Compilations/$album/$track - $artist - $title",
-      "playlist_path": "$playlist/$artist - $title"
+      "playlist_path": "$playlist/$artist - $title",
+      "podcast_path": "$show/Season $season/$title"
     }
+  },
+  "podcasts": {
+    "download_path": "/app/podcasts"
   },
   "import": {
     "staging_path": "./Staging",
@@ -72,6 +84,10 @@
   },
   "listenbrainz": {
     "token": ""
+  },
+  "features": {
+    "_comment": "library_v2 is retained only for config compatibility. Library V2 is now the non-disableable native catalogue and repair engine; false is ignored with a migration warning.",
+    "library_v2": true
   },
   "image_cache": {
     "enabled": true,

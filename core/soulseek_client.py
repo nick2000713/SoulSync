@@ -1,5 +1,6 @@
 import requests
 import asyncio
+import threading
 import aiohttp
 import os
 from typing import List, Optional, Dict, Any
@@ -330,6 +331,36 @@ class SoulseekClient(DownloadSourcePlugin):
                 except Exception as _e:
                     logger.debug("aiohttp direct session close: %s", _e)
 
+    def _normalize_search_responses(self, responses_data: Any) -> List[Dict[str, Any]]:
+        """Return slskd search responses from the payload shapes seen across versions."""
+        if isinstance(responses_data, list):
+            return [item for item in responses_data if isinstance(item, dict)]
+
+        if not isinstance(responses_data, dict):
+            return []
+
+        for key in ('responses', 'results', 'items', 'data'):
+            value = responses_data.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+
+        if isinstance(responses_data.get('files'), list):
+            return [responses_data]
+
+        return []
+
+    def _search_response_key(self, response_data: Dict[str, Any]) -> tuple:
+        username = response_data.get('username', '')
+        files = response_data.get('files') or response_data.get('fileList') or []
+        file_keys = []
+        for file_data in files:
+            if not isinstance(file_data, dict):
+                continue
+            filename = file_data.get('filename') or file_data.get('fileName') or file_data.get('path') or ''
+            size = file_data.get('size', 0)
+            file_keys.append((filename, size))
+        return username, tuple(file_keys)
+
     def _process_search_responses(self, responses_data: List[Dict[str, Any]]) -> tuple[List[TrackResult], List[AlbumResult]]:
         """Process search response data into TrackResult and AlbumResult objects"""
         from collections import defaultdict
@@ -345,11 +376,14 @@ class SoulseekClient(DownloadSourcePlugin):
         
         for response_data in responses_data:
             username = response_data.get('username', '')
-            files = response_data.get('files', [])
+            files = response_data.get('files') or response_data.get('fileList') or []
             
             
             for file_data in files:
-                filename = file_data.get('filename', '')
+                if not isinstance(file_data, dict):
+                    continue
+
+                filename = file_data.get('filename') or file_data.get('fileName') or file_data.get('path') or ''
                 size = file_data.get('size', 0)
                 
                 file_ext = Path(filename).suffix.lower().lstrip('.')
@@ -378,8 +412,8 @@ class SoulseekClient(DownloadSourcePlugin):
                     free_upload_slots=response_data.get('freeUploadSlots', 0),
                     upload_speed=response_data.get('uploadSpeed', 0),
                     queue_length=response_data.get('queueLength', 0),
-                    sample_rate=slskd_attrs.get(4),
-                    bit_depth=slskd_attrs.get(5),
+                    sample_rate=file_data.get('sampleRate') or slskd_attrs.get(4),
+                    bit_depth=file_data.get('bitDepth') or slskd_attrs.get(5),
                 )
 
                 all_tracks.append(track)
@@ -602,6 +636,7 @@ class SoulseekClient(DownloadSourcePlugin):
 
             # Poll for results - process and emit results immediately when found
             all_responses = []
+            seen_response_keys = set()
             all_tracks = []
             all_albums = []
             poll_interval = 1  # Check every 1 second for responsive updates
@@ -624,13 +659,19 @@ class SoulseekClient(DownloadSourcePlugin):
                 
                 # Get current search responses
                 responses_data = await self._make_request('GET', f'searches/{search_id}/responses')
-                if responses_data and isinstance(responses_data, list):
-                    # Check if we got new responses
-                    new_response_count = len(responses_data) - len(all_responses)
-                    if new_response_count > 0:
-                        # Process only the new responses
-                        new_responses = responses_data[len(all_responses):]
-                        all_responses = responses_data
+                responses = self._normalize_search_responses(responses_data)
+                if responses:
+                    new_responses = []
+                    for response_data in responses:
+                        response_key = self._search_response_key(response_data)
+                        if response_key in seen_response_keys:
+                            continue
+                        seen_response_keys.add(response_key)
+                        new_responses.append(response_data)
+
+                    if new_responses:
+                        all_responses.extend(new_responses)
+                        new_response_count = len(new_responses)
                         
                         logger.info(f"Found {new_response_count} new responses ({len(all_responses)} total) at {poll_count * poll_interval:.1f}s")
                         
@@ -662,6 +703,8 @@ class SoulseekClient(DownloadSourcePlugin):
                         logger.debug(f"No new responses, total still: {len(all_responses)}")
                     else:
                         logger.debug(f"Still waiting for responses... ({poll_count * poll_interval:.1f}s elapsed)")
+                else:
+                    logger.debug(f"Still waiting for responses... ({poll_count * poll_interval:.1f}s elapsed)")
                 
                 # Wait before next poll (unless this is the last attempt)
                 if poll_count < max_polls - 1:
@@ -803,9 +846,51 @@ class SoulseekClient(DownloadSourcePlugin):
             logger.error(f"Error starting download: {e}")
             return None
     
+    @staticmethod
+    def _looks_like_transfer_id(value: str) -> bool:
+        """Whether this is a slskd transfer UUID rather than a filename.
+
+        ``download()`` returns the FILENAME when an enqueue response carries no
+        id, which slskd 0.26 does. Putting a filename in
+        ``transfers/downloads/{id}`` makes slskd answer 400/405, the monitor
+        read that as a failure, and a perfectly good transfer was cancelled
+        seconds after starting (#1229). A filename always contains a path
+        separator or a dot; a UUID contains neither.
+        """
+        text = str(value or "").strip()
+        if not text:
+            return False
+        return not any(ch in text for ch in ("\\", "/", "."))
+
+    async def _status_from_listing(
+        self, *, transfer_id: str = "", filename: str = "", username: str = ""
+    ) -> Optional[DownloadStatus]:
+        """Find one transfer in the grouped listing.
+
+        slskd groups downloads username -> directories -> files, and every file
+        carries its real id. That listing is the only place a filename can be
+        turned back into a transfer, so it is what a filename-keyed lookup uses.
+        """
+        wanted_name = str(filename or "").replace("\\", "/").split("/")[-1].lower()
+        for status in await self.get_all_downloads():
+            if transfer_id and str(status.id) == str(transfer_id):
+                return status
+            if wanted_name:
+                if username and str(status.username) != str(username):
+                    continue
+                have = str(status.filename or "").replace("\\", "/").split("/")[-1].lower()
+                if have == wanted_name:
+                    return status
+        return None
+
     async def get_download_status(self, download_id: str) -> Optional[DownloadStatus]:
         if not self.base_url:
             return None
+
+        # A filename-keyed id can only be resolved through the listing; asking
+        # for it as a path segment is what slskd rejects.
+        if not self._looks_like_transfer_id(download_id):
+            return await self._status_from_listing(filename=download_id)
         
         try:
             response = await self._make_request('GET', f'transfers/downloads/{download_id}')
@@ -1129,8 +1214,8 @@ class SoulseekClient(DownloadSourcePlugin):
                 bitrate=file_data.get('bitRate') or slskd_attrs.get(0),
                 duration=duration_ms, quality=quality,
                 free_upload_slots=free_slots, upload_speed=upload_speed, queue_length=queue_length,
-                sample_rate=slskd_attrs.get(4),
-                bit_depth=slskd_attrs.get(5),
+                sample_rate=file_data.get('sampleRate') or slskd_attrs.get(4),
+                bit_depth=file_data.get('bitDepth') or slskd_attrs.get(5),
             ))
         return results
 
@@ -1449,6 +1534,8 @@ class SoulseekClient(DownloadSourcePlugin):
         *,
         preferred_source: Optional[Dict[str, Any]] = None,
         preferred_tracks: Optional[List[TrackResult]] = None,
+        quality_profile_id=None,
+        expected_duration_seconds=None,
     ) -> Dict[str, Any]:
         """One-shot Soulseek album download.
 
@@ -1459,6 +1546,12 @@ class SoulseekClient(DownloadSourcePlugin):
         callers may fall back to the existing per-track Soulseek flow.
         Once files are staged, the per-track staging matcher owns final
         import, same as torrent / usenet album bundles.
+                ``expected_duration_seconds`` is part of the album-bundle plugin
+        contract the master worker calls every source with. Soulseek picks a
+        folder rather than a single release, so it has nothing to compare a
+        duration against and ignores it; the parameter exists because a
+        missing one is a TypeError, and try_dispatch turns that into a failed
+        batch instead of a fallback.
         """
         result: Dict[str, Any] = {
             'success': False,
@@ -1502,7 +1595,12 @@ class SoulseekClient(DownloadSourcePlugin):
                 result['error'] = 'No complete Soulseek album folders found'
                 return result
 
-            picked = self._pick_album_bundle_folder(albums, album_name, artist_name)
+            picked = self._pick_album_bundle_folder(
+                albums,
+                album_name,
+                artist_name,
+                quality_profile_id=quality_profile_id,
+            )
             if picked is None:
                 result['error'] = 'No suitable Soulseek album folder after filtering'
                 return result
@@ -1551,7 +1649,13 @@ class SoulseekClient(DownloadSourcePlugin):
                 browse_files,
                 directory=folder_path,
             )
-        folder_tracks = self.filter_results_by_quality_preference(folder_tracks)
+        if quality_profile_id is None:
+            folder_tracks = self.filter_results_by_quality_preference(folder_tracks)
+        else:
+            folder_tracks = self.filter_results_by_quality_preference(
+                folder_tracks,
+                profile_id=quality_profile_id,
+            )
         if not folder_tracks:
             result['error'] = 'Selected Soulseek album folder contained no audio files'
             return result
@@ -1621,10 +1725,18 @@ class SoulseekClient(DownloadSourcePlugin):
         albums: List[AlbumResult],
         album_name: str,
         artist_name: str,
+        quality_profile_id=None,
     ) -> Optional[AlbumResult]:
         scored = []
         for album in albums:
-            tracks = self.filter_results_by_quality_preference(list(getattr(album, 'tracks', []) or []))
+            album_tracks = list(getattr(album, 'tracks', []) or [])
+            if quality_profile_id is None:
+                tracks = self.filter_results_by_quality_preference(album_tracks)
+            else:
+                tracks = self.filter_results_by_quality_preference(
+                    album_tracks,
+                    profile_id=quality_profile_id,
+                )
             if not tracks:
                 continue
             album_text = f"{getattr(album, 'album_title', '')} {getattr(album, 'album_path', '')}"
@@ -1923,17 +2035,18 @@ class SoulseekClient(DownloadSourcePlugin):
             return False
 
         try:
-            # Primary check: server/state tells us if slskd is connected to the Soulseek network
-            state = await self._make_request('GET', 'server/state')
-            if state is not None:
-                is_connected = state.get('isConnected') or state.get('IsConnected', False)
-                is_logged_in = state.get('isLoggedIn') or state.get('IsLoggedIn', False)
-                if not (is_connected and is_logged_in):
-                    logger.debug(f"Soulseek not fully connected: isConnected={is_connected}, isLoggedIn={is_logged_in}")
-                return is_connected and is_logged_in
+            # Primary check: server or server/state tells us if slskd is connected to the Soulseek network
+            for endpoint in ('server', 'server/state'):
+                state = await self._make_request('GET', endpoint)
+                if isinstance(state, dict) and any(k in state for k in ('isConnected', 'IsConnected', 'isLoggedIn', 'IsLoggedIn')):
+                    is_connected = state.get('isConnected') or state.get('IsConnected', False)
+                    is_logged_in = state.get('isLoggedIn') or state.get('IsLoggedIn', False)
+                    if not (is_connected and is_logged_in):
+                        logger.debug(f"Soulseek not fully connected: isConnected={is_connected}, isLoggedIn={is_logged_in}")
+                    return is_connected and is_logged_in
 
-            # Fallback: if server/state endpoint unavailable (older slskd), check API reachability
-            logger.debug("server/state endpoint unavailable, falling back to session check")
+            # Fallback: if server endpoints unavailable (older slskd), check API reachability
+            logger.debug("server endpoints unavailable, falling back to session check")
             response = await self._make_request('GET', 'session')
             return response is not None
         except Exception as e:
@@ -2033,6 +2146,8 @@ class SoulseekClient(DownloadSourcePlugin):
         # so a previously-quarantined source can't win the quality picker by
         # superior bitrate and re-trigger the same failed download in a loop.
         results = self._drop_quarantined_sources(results)
+        from core.downloads.size_limit import filter_music_candidates
+        results = filter_music_candidates(results)
         if not results:
             return []
 
@@ -2143,6 +2258,26 @@ class SoulseekClient(DownloadSourcePlugin):
     def _quote(part: str) -> str:
         from urllib.parse import quote
         return quote(str(part), safe="")
+
+    async def get_chat_connection_state(self) -> Dict[str, Any]:
+        """Chat requires a Soulseek login, not merely a reachable slskd API.
+
+        slskd exposes server state at /api/v0/server in standard releases,
+        and /api/v0/server/state in some builds. Probe both so endpoint differences
+        do not falsely lock users out of chat.
+        """
+        for endpoint in ('server', 'server/state'):
+            state = await self._make_request('GET', endpoint)
+            if isinstance(state, dict) and any(k in state for k in ('isConnected', 'IsConnected', 'isLoggedIn', 'IsLoggedIn')):
+                connected = state.get('isConnected', state.get('IsConnected', False))
+                logged_in = state.get('isLoggedIn', state.get('IsLoggedIn', False))
+                if connected is True and logged_in is True:
+                    return {"connected": True}
+                return {"connected": False, "code": "slskd_disconnected",
+                        "error": "slskd is not connected and logged in to Soulseek. Reconnect in slskd, then try again. Your message has not been sent."}
+
+        return {"connected": False, "code": "slskd_unavailable",
+                "error": "Cannot check slskd's Soulseek connection. Check that slskd is running and its API key is valid."}
 
     async def get_joined_rooms(self) -> List[str]:
         """Names of the rooms slskd is currently in ([] when none/unreachable)."""
@@ -2336,3 +2471,36 @@ class SoulseekClient(DownloadSourcePlugin):
     def __del__(self):
         # No persistent session to clean up
         pass
+_SHARED_LOCK = threading.Lock()
+_SHARED_CACHE: Dict[str, Any] = {"key": None, "client": None}
+
+
+def get_shared_soulseek_client():
+    """One client per slskd configuration, shared by every caller.
+
+    Constructing one is not free: it logs at INFO and mkdirs the download path.
+    Callers on a timer - the audiobook download monitor ticks every few seconds
+    and touches several helpers per pass - turned that into a wall of identical
+    "configured with slskd at ..." lines in app.log and a filesystem hit for
+    each one.
+
+    Keyed on the url and api key rather than cached outright, so saving new
+    slskd settings takes effect without a restart. The cache lives here rather
+    than in a caller because the cost it avoids is this module's.
+    """
+    try:
+        cfg = config_manager.get("soulseek", {}) or {}
+        key = f"{cfg.get('slskd_url', '')}::{cfg.get('api_key', '')}"
+    except Exception:                                       # noqa: BLE001
+        key = "::"
+
+    with _SHARED_LOCK:
+        cached = _SHARED_CACHE["client"]
+        if cached is not None and _SHARED_CACHE["key"] == key:
+            return cached
+        client = SoulseekClient()
+        _SHARED_CACHE["key"] = key
+        _SHARED_CACHE["client"] = client
+        return client
+
+

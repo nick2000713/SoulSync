@@ -519,6 +519,9 @@ function setCurrentProfile(profile) {
 const LEGACY_PROFILE_PAGE_ALIASES = {
     downloads: 'search',
     artists: 'search',
+    // Library v2 became the Library; anything still naming the old route id
+    // resolves to the same permission rather than to an unknown page.
+    'library-v2': 'library',
 };
 
 function normalizeProfilePageId(pageId) {
@@ -1428,8 +1431,7 @@ function updateProfileIndicator() {
         } else if (currentProfile.id === 1) {
             btn.style.display = ''; // Root admin sees all
         } else {
-            const ap = currentProfile.allowed_pages;
-            btn.style.display = (!ap || ap.includes(page)) ? '' : 'none';
+            btn.style.display = isPageAllowed(page) ? '' : 'none';
         }
     });
 
@@ -2013,6 +2015,8 @@ const PROFILE_PAGE_LABELS = {
     tools: 'Tools',
     hydrabase: 'Hydrabase',
     issues: 'Issues',
+    podcasts: 'Podcasts',
+    audiobooks: 'Audiobooks',
     help: 'Help & Docs',
     settings: 'Settings',
     'artist-detail': 'Artist Detail',
@@ -2628,7 +2632,7 @@ function showProfileEditForm(profileId, currentName, currentColor, currentAvatar
         canDlCheckbox.type = 'checkbox';
         canDlCheckbox.checked = profileSettings.can_download !== false;
         dlLabel.appendChild(canDlCheckbox);
-        dlLabel.appendChild(document.createTextNode(' Can download music'));
+        dlLabel.appendChild(document.createTextNode(' Can download (music, podcasts, audiobooks & video)'));
         form.appendChild(dlLabel);
     }
 
@@ -2716,7 +2720,7 @@ function showSelfEditForm() {
     const pageLabels = {
         dashboard: 'Dashboard', sync: 'Sync', search: 'Search', discover: 'Discover',
         automations: 'Automations', library: 'Library', stats: 'Listening Stats',
-        'playlist-explorer': 'Playlist Explorer', import: 'Import', help: 'Help & Docs'
+        'playlist-explorer': 'Playlist Explorer', import: 'Import', podcasts: 'Podcasts', help: 'Help & Docs'
     };
 
     const form = document.createElement('div');
@@ -2882,7 +2886,7 @@ async function checkAdminPinRequired() {
 // localhost).
 if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => {
-        navigator.serviceWorker.register('/sw.js', { scope: '/' })
+        navigator.serviceWorker.register(window.SoulSyncURL?.resolve('/sw.js') || '/sw.js', { scope: window.SoulSyncURL?.resolve('/') || '/' })
             .catch((err) => console.warn('[SW] registration failed:', err));
     });
 }
@@ -3017,23 +3021,31 @@ function initializeNavigation() {
 
 const _DEEPLINK_VALID_PAGES = new Set([
     'dashboard', 'sync', 'search', 'discover', 'automations',
-    'library', 'import', 'settings', 'help', 'issues', 'stats', 'watchlist',
+    // iss29-B07: '/library-v2' is a live alias that redirects to '/library'
+    // (query string preserved). It was missing here, so this fallback resolved
+    // a bookmark to it as 'dashboard'. React usually wins the race and the
+    // right page appears anyway — which is exactly what makes the gap easy to
+    // miss and unreliable to depend on.
+    'library', 'library-v2', 'import', 'settings', 'help', 'issues', 'stats', 'watchlist',
     'wishlist', 'active-downloads', 'artist-detail', 'playlist-explorer',
-    'hydrabase', 'tools', 'chat'
+    'hydrabase', 'tools', 'chat', 'podcasts', 'audiobooks'
 ]);
 
 function _getPageFromPath() {
     const router = getWebRouter();
-    const resolved = router?.resolvePageId?.(window.location.pathname);
+    const resolved = router?.resolvePageId?.((window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname));
     if (resolved) return resolved;
 
-    const path = window.location.pathname.replace(/^\/+|\/+$/g, '');
+    const path = (window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname).replace(/^\/+|\/+$/g, '');
     if (!path) return 'dashboard';
     const segs = path.split('/');
     const basePage = segs[0];
     if (!_DEEPLINK_VALID_PAGES.has(basePage)) return 'dashboard';
     // Context-dependent pages fall back to a sensible parent
     if (basePage === 'playlist-explorer') return 'library';
+    // The alias and its target are the same page as far as the shell chrome
+    // is concerned (iss29-B07).
+    if (basePage === 'library-v2') return 'library';
     return basePage;
 }
 
@@ -3057,7 +3069,7 @@ function buildArtistDetailPath(artistId, source = null, name = null) {
     return path;
 }
 
-function parseArtistDetailPath(pathname = window.location.pathname) {
+function parseArtistDetailPath(pathname = (window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname)) {
     const segs = String(pathname || '').split('/').filter(Boolean);
     if (segs[0] !== 'artist-detail' || segs.length < 3) return null;
 
@@ -3122,18 +3134,31 @@ function initializeMobileNavigation() {
 
     if (!hamburgerBtn || !sidebar || !overlay) return;
 
+    // One explicit state: the drawer is open only because someone opened it at
+    // a mobile width. It is not a width, and it is not carried over from the
+    // desktop layout.
     function openMobileNav() {
         sidebar.classList.add('mobile-open');
         hamburgerBtn.classList.add('active');
+        hamburgerBtn.setAttribute('aria-expanded', 'true');
+        hamburgerBtn.setAttribute('aria-label', 'Close navigation');
         overlay.classList.add('active');
         document.body.classList.add('mobile-nav-open');
+        // Focus moves into the drawer so a keyboard isn't left behind the
+        // backdrop, and Escape below puts it back on the opener.
+        const first = sidebar.querySelector('.nav-button, a[href], button:not([disabled])');
+        if (first) first.focus();
     }
 
-    function closeMobileNav() {
+    function closeMobileNav(restoreFocus) {
+        const wasOpen = sidebar.classList.contains('mobile-open');
         sidebar.classList.remove('mobile-open');
         hamburgerBtn.classList.remove('active');
+        hamburgerBtn.setAttribute('aria-expanded', 'false');
+        hamburgerBtn.setAttribute('aria-label', 'Open navigation');
         overlay.classList.remove('active');
         document.body.classList.remove('mobile-nav-open');
+        if (wasOpen && restoreFocus === true) hamburgerBtn.focus();
     }
 
     hamburgerBtn.addEventListener('click', () => {
@@ -3144,7 +3169,33 @@ function initializeMobileNavigation() {
         }
     });
 
-    overlay.addEventListener('click', closeMobileNav);
+    overlay.addEventListener('click', () => closeMobileNav());
+
+    document.addEventListener('keydown', (event) => {
+        if (event.key !== 'Escape') return;
+        if (!sidebar.classList.contains('mobile-open')) return;
+        closeMobileNav(true);
+    });
+
+    // Crossing the breakpoint. Going desktop -> mobile the drawer defaults
+    // CLOSED: nobody asked for it, and the drawer's slide transition made the
+    // flip paint a half-open panel over the page. Going mobile -> desktop we
+    // just drop the mobile-only classes; the collapse preference lives in
+    // html[data-sidebar] and is untouched by any of this.
+    const mobileQuery = window.matchMedia ? window.matchMedia('(max-width: 768px)') : null;
+    if (mobileQuery) {
+        const onBreakpoint = () => {
+            // Kill the slide for one frame, so the layout change itself never
+            // animates across the viewport.
+            sidebar.classList.add('sidebar-no-transition');
+            closeMobileNav();
+            requestAnimationFrame(() => {
+                requestAnimationFrame(() => sidebar.classList.remove('sidebar-no-transition'));
+            });
+        };
+        if (mobileQuery.addEventListener) mobileQuery.addEventListener('change', onBreakpoint);
+        else if (mobileQuery.addListener) mobileQuery.addListener(onBreakpoint);
+    }
 
     // Backstop for the overlay click above: the overlay is one element at a
     // fixed z-index, so anything that paints over it swallows the tap and the
@@ -3239,7 +3290,7 @@ function toggleNavSection(label) {
 function restoreNavSections() {
     let saved = {};
     try { saved = JSON.parse(localStorage.getItem('navSections') || '{}'); } catch (e) { saved = {}; }
-    const path = window.location.pathname;
+    const path = (window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname);
     document.querySelectorAll('.nav-section-label').forEach(label => {
         // Expanded by default; collapsed only when the user explicitly collapsed it.
         let collapsed = saved[label.dataset.section] === true;
@@ -3478,7 +3529,7 @@ function navigateToPage(pageId, options = {}) {
             : (pageId === 'artist-detail' && options.artistId) ? buildArtistDetailPath(options.artistId, options.artistSource, options.artistName)
             : (pageId === 'label-detail' && options.labelId) ? buildLabelDetailPath(options.labelId, options.labelName)
             : '/' + pageId;
-        if (window.location.pathname !== urlPath) {
+        if ((window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname) !== urlPath) {
             if (options.replace === true) {
                 history.replaceState({ page: pageId }, '', urlPath);
             } else {
@@ -3776,7 +3827,7 @@ async function loadPageData(pageId) {
  */
 async function loadInitialData() {
     try {
-        const initialPath = window.location.pathname;
+        const initialPath = (window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname);
         const initialNavigationEpoch = navigationEpoch;
 
         // Snapshot hydration is best-effort chrome — bubbles and the discover
@@ -3824,7 +3875,7 @@ async function loadInitialData() {
         // was blank until you navigated by hand. Desktop wins that race and
         // never sees it; a phone is slow enough to lose it. A redirect only
         // answers the question startup was already asking, so adopt it.
-        if (window.location.pathname !== initialPath) {
+        if ((window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname) !== initialPath) {
             const redirectedPage = _getPageFromPath();
             if (redirectedPage && isPageAllowed(redirectedPage)) {
                 targetPage = redirectedPage;

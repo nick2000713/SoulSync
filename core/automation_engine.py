@@ -89,6 +89,53 @@ SYSTEM_AUTOMATIONS = [
         'action_type': 'scan_watchlist',
         'initial_delay': 300,  # 5 minutes after startup
     },
+    {
+        'name': 'Auto-Scan Podcasts',
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 6, 'unit': 'hours'},
+        'action_type': 'scan_watchlist_podcasts',
+        'initial_delay': 180,  # 3 minutes after startup
+    },
+    # Audiobooks drain their wishlist through the engine like every other side.
+    # Hourly rather than the music wishlist's 30 minutes: each BOOK also carries
+    # its own multi-hour backoff, so a shorter interval would only re-walk rows
+    # that are not due yet. No owned_by — the podcast scan has none either, so
+    # audio-side automations sit on the same page as music.
+    {
+        'name': 'Auto-Process Audiobook Wishlist',
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 1, 'unit': 'hours'},
+        'action_type': 'audiobook_process_wishlist',
+        'initial_delay': 240,  # 4 minutes after startup, after the podcast scan
+    },
+    # Followed authors. Daily, because an audiobook is announced weeks ahead and
+    # published on a date — checking more often spends effort to learn nothing.
+    {
+        'name': 'Auto-Scan Audiobook Authors',
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 24, 'unit': 'hours'},
+        'action_type': 'audiobook_scan_watchlist',
+        'initial_delay': 420,  # 7 minutes after startup
+    },
+    # Empties the audiobook recycle bin. The schedule is what matters: the
+    # opportunistic pass only fires when something else is deleted, so on a
+    # library nobody prunes the bin would never expire.
+    {
+        'name': 'Empty Audiobook Recycle Bin',
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 24, 'unit': 'hours'},
+        'action_type': 'audiobook_purge_recycle',
+        'initial_delay': 780,  # 13 minutes after startup
+    },
+    # Index existing audiobook folders and loose files, including external books.
+    # Reuse this system job so existing user schedules and history are preserved.
+    {
+        'name': 'Auto-Scan Audiobook Library',
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 24, 'unit': 'hours'},
+        'action_type': 'audiobook_scan_library',
+        'initial_delay': 600,  # 10 minutes after startup, last of the audio jobs
+    },
     # Event-based system automations (no initial_delay/next_run needed)
     {
         'name': 'Auto-Scan After Downloads',
@@ -469,6 +516,11 @@ class AutomationEngine:
         self._timers = {}       # automation_id → threading.Timer
         self._lock = threading.Lock()
         self._running = False
+        # iss32-M02: set while a Library-v2 bootstrap migration holds SQLite's
+        # only writer. Scheduled slots are skipped the same way the master
+        # pause skips them — the schedule stays alive, so nothing has to be
+        # restarted and no catch-up burst follows.
+        self._migration_paused = False
 
         # Action handlers registered by web_server.py (avoids circular imports)
         # Format: {type: {'handler': fn(config)->dict, 'guard': fn()->bool or None}}
@@ -864,6 +916,22 @@ class AutomationEngine:
         self._rebuild_event_cache()
         logger.info(f"AutomationEngine started — {scheduled} scheduled, {event_count} event-based")
 
+    def pause_for_migration(self):
+        """Skip scheduled slots while a Library-v2 migration holds the writer."""
+        if not self._migration_paused:
+            self._migration_paused = True
+            logger.info("AutomationEngine paused — Library v2 migration in progress")
+
+    def resume_after_migration(self):
+        """Undo :meth:`pause_for_migration`. Idempotent."""
+        if self._migration_paused:
+            self._migration_paused = False
+            logger.info("AutomationEngine resumed — Library v2 migration finished")
+
+    @property
+    def migration_paused(self):
+        return self._migration_paused
+
     def stop(self):
         """Cancel all timers on shutdown."""
         self._running = False
@@ -1224,6 +1292,15 @@ class AutomationEngine:
                 logger.info(f"Automation '{auto.get('name')}' skipped — {side} automations are paused")
                 self._finish_run(auto, automation_id,
                                  {'status': 'skipped', 'reason': f'{side} automations are paused'},
+                                 error=None)
+                return
+            # iss32-M02: same treatment while the catalogue migration owns the
+            # writer. Running here would only produce "database is locked" and
+            # a failed run in the history.
+            if self._migration_paused:
+                logger.info(f"Automation '{auto.get('name')}' skipped — Library v2 migration in progress")
+                self._finish_run(auto, automation_id,
+                                 {'status': 'skipped', 'reason': 'Library v2 migration in progress'},
                                  error=None)
                 return
 
@@ -1599,6 +1676,10 @@ class AutomationEngine:
                     self._send_pushbullet_notification(c, variables)
                 elif t == 'telegram':
                     self._send_telegram_notification(c, variables)
+                elif t == 'ntfy':
+                    self._send_ntfy_notification(c, variables)
+                elif t == 'gotify':
+                    self._send_gotify_notification(c, variables)
                 elif t == 'webhook':
                     self._send_webhook(c, variables)
                 elif t == 'fire_signal':
@@ -1748,6 +1829,97 @@ class AutomationEngine:
         data = resp.json() if resp.status_code == 200 else {}
         if not data.get('ok'):
             raise RuntimeError(f"Telegram returned {resp.status_code}: {resp.text[:200]}")
+
+    @staticmethod
+    def _fill(text, variables):
+        """Substitute {name} tags. Shared so a new channel cannot quietly
+        invent its own slightly different templating."""
+        for key, value in variables.items():
+            text = text.replace('{' + key + '}', value)
+        return text
+
+    def _send_ntfy_notification(self, config, variables):
+        """Publish to an ntfy topic.
+
+        Self-hosted by most people who use it, so the server is configurable and
+        only DEFAULTS to ntfy.sh. Auth is optional because a private topic on
+        your own box usually has none; a token wins over user/pass when both are
+        filled in, which is the order ntfy itself resolves them.
+
+        Sent as JSON to the server root rather than as POST /<topic> with header
+        metadata: the header form has to ASCII-encode the title, so an album
+        with an accent in its name arrives mangled.
+        """
+        server = (config.get('server') or 'https://ntfy.sh').strip().rstrip('/')
+        topic = (config.get('topic') or '').strip().lstrip('/')
+        if not topic:
+            raise ValueError("An ntfy topic is required")
+        if not server.startswith(('http://', 'https://')):
+            server = 'https://' + server
+
+        payload = {
+            'topic': topic,
+            'title': self._fill(config.get('title', '{name}'), variables),
+            'message': self._fill(
+                config.get('message', 'Completed with status: {status}'), variables),
+        }
+        try:
+            priority = int(config.get('priority') or 3)
+            payload['priority'] = max(1, min(5, priority))
+        except (TypeError, ValueError):
+            pass    # ntfy's own default (3) is fine
+        tags = (config.get('tags') or '').strip()
+        if tags:
+            payload['tags'] = [t.strip() for t in tags.split(',') if t.strip()]
+        click = (config.get('click') or '').strip()
+        if click:
+            payload['click'] = self._fill(click, variables)
+
+        headers = {}
+        token = (config.get('token') or '').strip()
+        username = (config.get('username') or '').strip()
+        password = config.get('password') or ''
+        auth = None
+        if token:
+            headers['Authorization'] = f'Bearer {token}'
+        elif username:
+            auth = (username, password)
+
+        resp = requests.post(server, json=payload, headers=headers, auth=auth, timeout=10)
+        if resp.status_code >= 400:
+            raise RuntimeError(f"ntfy returned {resp.status_code}: {resp.text[:200]}")
+
+    def _send_gotify_notification(self, config, variables):
+        """Send a message to a Gotify server.
+
+        The token is an APPLICATION token, not a client one, and it goes in the
+        query string because that is the only place Gotify's /message endpoint
+        reads it. Priority is 0-10 here, not ntfy's 1-5 - the two look alike and
+        are not, so they get separate clamps rather than one shared field.
+        """
+        server = (config.get('server') or '').strip().rstrip('/')
+        token = (config.get('token') or '').strip()
+        if not server:
+            raise ValueError("A Gotify server URL is required")
+        if not token:
+            raise ValueError("A Gotify application token is required")
+        if not server.startswith(('http://', 'https://')):
+            server = 'http://' + server
+
+        payload = {
+            'title': self._fill(config.get('title', '{name}'), variables),
+            'message': self._fill(
+                config.get('message', 'Completed with status: {status}'), variables),
+        }
+        try:
+            payload['priority'] = max(0, min(10, int(config.get('priority') or 5)))
+        except (TypeError, ValueError):
+            payload['priority'] = 5
+
+        resp = requests.post(f'{server}/message', params={'token': token},
+                             json=payload, timeout=10)
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Gotify returned {resp.status_code}: {resp.text[:200]}")
 
     def _send_webhook(self, config, variables):
         """Send a POST request to a user-configured webhook URL with JSON payload."""

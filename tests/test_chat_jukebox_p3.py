@@ -100,16 +100,57 @@ def test_free_text_goes_through_search_seam(jbx_app):
     ]
     body = http.post("/api/chat/jukebox/resolve",
                      json={"q": "daft punk around the world"}).get_json()
-    assert state["search_calls"] == [("daft punk around the world", 5)]
+    # a wider ask than the five shown: search_videos drops anything under
+    # 30 s or over 15 min, and five-in meant one or two out
+    assert state["search_calls"] == [("daft punk around the world", chat_api._JUKEBOX_SEARCH_POOL)]
     assert body["results"] == [{"id": "aaaaaaaaaaa", "title": "Around the World",
                                 "channel": "Daft Punk", "duration": 429, "views": 0}]
 
 
-def test_unresolvable_video_404s(jbx_app):
+def test_a_link_still_plays_when_oembed_refuses(jbx_app):
+    # oembed answers 401 for a video whose owner disallows embedding and 404
+    # for a private one. the id plays either way: a failed lookup is "no
+    # title yet", not "no link". links used to die here.
     http, state = jbx_app
     state["oembed_fail"] = True
-    r = http.post("/api/chat/jukebox/resolve", json={"q": "dQw4w9WgXcQ"})
-    assert r.status_code == 404
+    r = http.post("/api/chat/jukebox/resolve", json={"q": "https://youtu.be/dQw4w9WgXcQ?si=abc"})
+    assert r.status_code == 200
+    assert r.get_json()["results"] == [{"id": "dQw4w9WgXcQ", "title": "dQw4w9WgXcQ", "channel": ""}]
+    assert state["search_calls"] == []
+
+
+def _v(vid, title, channel="Some Channel", views=0, duration=200):
+    return SimpleNamespace(video_id=vid, title=title, channel=channel,
+                           view_count=views, duration=duration)
+
+
+def test_search_ranks_the_song_above_the_reaction(jbx_app):
+    http, state = jbx_app
+    state["search_results"] = [
+        _v("r1111111111", "Daft Punk - Around the World REACTION!!", "ReactGuy", views=9_000_000),
+        _v("k1111111111", "Around the World (Karaoke Version)", "KaraokeCo", views=5_000_000),
+        _v("c1111111111", "around the world - daft punk (cover)", "Bedroom Covers", views=100_000),
+        _v("o1111111111", "Daft Punk - Around the World (Official Video)", "Daft Punk", views=300_000_000),
+        _v("t1111111111", "Around the World", "Daft Punk - Topic", views=20_000_000),
+        _v("l1111111111", "Around the World (Live 2007)", "fan uploads", views=2_000_000),
+        _v("x1111111111", "Around the World", "Random Reupload", views=50_000),
+    ]
+    body = http.post("/api/chat/jukebox/resolve", json={"q": "around the world"}).get_json()
+    ids = [r["id"] for r in body["results"]]
+    assert set(ids[:2]) == {"o1111111111", "t1111111111"}, "official and Topic first, either order"
+    assert len(ids) == 5
+    assert "r1111111111" not in ids and "k1111111111" not in ids, "reaction and karaoke fall off the end"
+
+
+def test_ranking_keeps_youtubes_order_on_ties():
+    found = [_v("a1111111111", "Song"), _v("b1111111111", "Song"), _v("c1111111111", "Song")]
+    assert [v.video_id for v in chat_api.rank_jukebox_results(found)] == \
+        ["a1111111111", "b1111111111", "c1111111111"]
+
+
+def test_ranking_drops_bad_ids():
+    found = [_v("not a vid!!", "x"), _v("a1111111111", "Song")]
+    assert [v.video_id for v in chat_api.rank_jukebox_results(found)] == ["a1111111111"]
 
 
 def test_resolve_respects_the_send_gate(jbx_app):
@@ -332,3 +373,106 @@ def test_jukebox_display_honesty_fallback():
     # ...and cleared on a genuine end + on tune-out
     ended = js[js.index("function _jbxOnPlayerState"):js.index("function _jbxOnPlayerState") + 400]
     assert "state.jukebox.playingNow = null" in ended
+
+
+# ── the radio's local rung: the similar-artist graph ────────────────────────
+
+@pytest.fixture()
+def radio_app(tmp_path, monkeypatch):
+    """The radio with its three remote rungs muted, so a request lands on the
+    local graph — the only rung that reads the library."""
+    from database.music_database import MusicDatabase
+    db = MusicDatabase(str(tmp_path / "radio.db"))
+
+    class _NoLastFM:
+        def __init__(self, *a, **k):
+            pass
+
+        def get_similar_tracks(self, *a, **k):
+            return []
+
+        def get_similar_artists(self, *a, **k):
+            return []
+
+        def get_tag_top_artists(self, *a, **k):
+            return []
+
+    import core.lastfm_client as lastfm_module
+    monkeypatch.setattr(lastfm_module, "LastFMClient", _NoLastFM)
+    monkeypatch.setattr(chat_api, "_db", lambda: db)
+    chat_api.configure(client_getter=lambda: None, run_async=lambda v: v,
+                       config_get=lambda k, d=None: d)
+    app = Flask(__name__)
+
+    @app.before_request
+    def _fake_profile():
+        g.is_admin = True
+
+    app.register_blueprint(chat_api.create_blueprint())
+    yield app.test_client(), db
+    chat_api.configure(client_getter=lambda: None, run_async=lambda v: v,
+                       config_get=lambda k, d=None: d)
+
+
+def _seed_graph(db, *, name, spotify_id=None, external_ids='{}', keyed_by,
+                similar='Portishead'):
+    from core.library2.importer import normalize_name
+    with db._get_connection() as conn:
+        conn.execute(
+            "INSERT INTO lib2_artists(name, name_key, spotify_id, external_ids)"
+            " VALUES(?,?,?,?)",
+            (name, normalize_name(name), spotify_id, external_ids))
+        conn.execute(
+            "INSERT INTO similar_artists(source_artist_id, similar_artist_name,"
+            "                            similarity_rank) VALUES(?,?,1)",
+            (keyed_by, similar))
+        conn.commit()
+
+
+def test_radio_reaches_the_local_graph_through_a_provider_id(radio_app):
+    """The graph is keyed by the artist's PROVIDER id (the scan stores whichever
+    id it scanned with), never by a catalogue row id — so the library lookup has
+    to hand over the artist's provider ids, not its own primary key."""
+    http, db = radio_app
+    _seed_graph(db, name='Bjork', spotify_id='SP-BJORK', keyed_by='SP-BJORK')
+
+    body = http.post("/api/chat/jukebox/radio",
+                     json={"title": "Bjork - Hyperballad"}).get_json()
+
+    assert body == {"query": "Portishead", "why": "similar to Bjork"}
+
+
+def test_radio_local_graph_reads_a_long_tail_provider_id(radio_app):
+    """Only Spotify and MusicBrainz have promoted columns in v2; every other
+    provider lives in ``external_ids``, and the scan may well have keyed the
+    graph by one of those."""
+    http, db = radio_app
+    _seed_graph(db, name='Bjork', external_ids='{"deezer": "DZ-77"}',
+                keyed_by='DZ-77')
+
+    body = http.post("/api/chat/jukebox/radio",
+                     json={"title": "Bjork - Hyperballad"}).get_json()
+
+    assert body["query"] == "Portishead"
+
+
+def test_radio_local_graph_matches_the_artist_across_accents(radio_app):
+    """The seed is a YouTube title, so its spelling is not the library's:
+    'Bjork - Hyperballad' must still find the stored 'Björk'."""
+    http, db = radio_app
+    _seed_graph(db, name='Björk', spotify_id='SP-BJORK', keyed_by='SP-BJORK')
+
+    body = http.post("/api/chat/jukebox/radio",
+                     json={"title": "BJORK - Hyperballad"}).get_json()
+
+    assert body["query"] == "Portishead"
+
+
+def test_radio_says_so_when_the_library_does_not_know_the_artist(radio_app):
+    http, db = radio_app
+    _seed_graph(db, name='Bjork', spotify_id='SP-BJORK', keyed_by='SP-BJORK')
+
+    body = http.post("/api/chat/jukebox/radio",
+                     json={"title": "Someone Else - A Song"}).get_json()
+
+    assert body == {"query": None, "why": "no similar data"}

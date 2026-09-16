@@ -66,6 +66,11 @@ def _discover_shelf_cache(key_extra=None):
             out = fn(*args, **kwargs)
             resp = make_response(out)
             if resp.status_code == 200:
+                # keys now carry a generation/source id, so old ones become
+                # unreachable rather than overwritten. drop the expired ones
+                # instead of letting them accumulate for the process's life.
+                for stale in [k for k, v in _DISCOVER_SHELF_CACHE.items() if v[0] <= now]:
+                    _DISCOVER_SHELF_CACHE.pop(stale, None)
                 _DISCOVER_SHELF_CACHE[key] = (
                     now + _DISCOVER_SHELF_TTL_S,
                     (resp.get_data(), resp.status_code, resp.content_type),
@@ -73,6 +78,38 @@ def _discover_shelf_cache(key_extra=None):
             return resp
         return wrapper
     return deco
+
+
+def invalidate_discover_shelf_cache(prefix=None):
+    """Drop cached shelf responses. Called after curation stores new content.
+
+    the cache is keyed by (handler, query, profile, extra); a prefix drops one
+    handler's entries and no prefix drops everything. without this a freshly
+    curated generation sat behind a 30-minute-old response, which looked
+    exactly like curation having done nothing.
+    """
+    if prefix is None:
+        _DISCOVER_SHELF_CACHE.clear()
+        return
+    for key in [k for k in _DISCOVER_SHELF_CACHE if k[0] == prefix]:
+        _DISCOVER_SHELF_CACHE.pop(key, None)
+
+
+def _discover_bylt_key():
+    """The BYLT cache key's extra: active source + stored generation id.
+
+    the key used to carry neither, so a source switch or a fresh generation
+    kept serving the previous answer for up to half an hour. reading the
+    generation id here is one indexed row and it makes the cache follow the
+    content instead of the clock.
+    """
+    try:
+        from core.discovery.bylt_store import read_generation
+        source = _get_active_discovery_source()
+        gen = read_generation(get_database(), get_current_profile_id()) or {}
+        return f"{source}:{gen.get('generation_id') or 'none'}"
+    except Exception:
+        return 'unknown'
 
 
 def _discover_dial_key():
@@ -89,6 +126,15 @@ get_database = None
 config_manager = None
 download_orchestrator = None
 _get_active_discovery_source = None
+
+
+def _catalogue_name_key(name):
+    """The catalogue's folded artist key. SQLite's LOWER() is ASCII-only, so a
+    stored "Björk" never answered a searched "björk" (iss29-D13)."""
+    from core.library2.importer import normalize_name
+
+    return normalize_name(str(name or ""))
+
 _spotify_client = None
 _tidal_client = None
 _hydrabase_client = None
@@ -122,6 +168,30 @@ def get_recommended_stations():
         return jsonify({"success": True, "stations": stations})
     except Exception as e:
         logger.error(f"[Discover] stations failed: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@bp.route('/api/discover/stations/<artist_id>/snapshot', methods=['POST'])
+def get_station_snapshot(artist_id):
+    """A finite, inspectable preview of one station.
+
+    the card only ever offered endless radio, so there was nothing to select,
+    download or sync - the queue lived in the player and kept refilling. this
+    returns a bounded list of library tracks for the seed and stores it, so a
+    selection cannot move under an open dialog.
+
+    it is side-effect free with respect to playback: nothing here starts audio,
+    pauses audio or touches the current queue. pass refresh=1 to cut a new
+    revision on purpose.
+    """
+    try:
+        from core.discovery.stations import build_station_snapshot
+        refresh = str(request.args.get('refresh', '')).lower() in ('1', 'true', 'yes')
+        snapshot = build_station_snapshot(
+            get_database(), artist_id, get_current_profile_id(), refresh=refresh)
+        return jsonify({"success": True, "snapshot": snapshot})
+    except Exception as e:
+        logger.error(f"[Discover] station snapshot failed: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 
@@ -554,6 +624,10 @@ def _autostart_popularity_backfill():
             from core.discovery import popularity_backfill as pb
             if not pb.is_running():
                 database = get_database()
+                from core.library2.migration_gate import migration_required
+                if migration_required(database):
+                    _t.sleep(30)
+                    continue
                 missing = database.count_similar_artists_missing_popularity(1)
                 if missing > 0:
                     spotify_free, lastfm, deezer = _resolve_popularity_sources()
@@ -1073,72 +1147,123 @@ def get_discover_release_radar():
         return jsonify({"success": False, "error": str(e)}), 500
 
 @bp.route('/api/discover/because-you-listen-to', methods=['GET'])
-@_discover_shelf_cache()
+@_discover_shelf_cache(key_extra=_discover_bylt_key)
 def get_discover_because_you_listen_to():
-    """Get 'Because You Listen To' sections — personalized by top played artists."""
+    """'Because You Listen To' - one stored generation, served whole.
+
+    the shelves come from a single versioned record written by the scanner
+    (core/discovery/bylt_store.py), so headings and tracks arrive together and
+    an old shelf can never stand beside a new one. a profile that has not been
+    curated since this shipped still gets its legacy ordinal rows, hydrated by
+    exact id rather than against a recency window, and labelled as legacy.
+
+    failures are failures: the old handler answered 200 with an empty section
+    list when it threw, which cached a lie for half an hour.
+    """
     try:
+        from core.discovery import bylt_store, bylt_view
+
         database = get_database()
         active_source = _get_active_discovery_source()
         pid = get_current_profile_id()
 
-        # Fetch pool tracks once for all sections
-        pool_tracks = database.get_discovery_pool_tracks(limit=5000, new_releases_only=False, source=active_source, profile_id=pid)
-        tracks_by_id = {}
-        for t in pool_tracks:
-            if active_source == 'spotify' and t.spotify_track_id:
-                tracks_by_id[t.spotify_track_id] = t
-            elif active_source == 'itunes' and t.itunes_track_id:
-                tracks_by_id[t.itunes_track_id] = t
-            elif active_source == 'deezer' and getattr(t, 'deezer_track_id', None):
-                tracks_by_id[t.deezer_track_id] = t
+        history_scope = 'shared'
+        history_note = None
+        try:
+            history_scope = database.listening_history_scope()
+            if history_scope == 'shared' and _profile_count(database) > 1:
+                history_note = ('Listening history is shared across profiles on '
+                                'this install.')
+        except Exception as e:  # noqa: BLE001 - the note is not the feature
+            logger.debug("listening scope probe failed: %s", e)
 
-        sections = []
-        for i in range(3):
-            artist_name = database.get_metadata(f'bylt_artist_{i}')
-            if not artist_name:
-                continue
-            track_ids = database.get_curated_playlist(f'because_you_listen_to_{i}', profile_id=pid)
-            if not track_ids:
-                continue
+        failure = bylt_store.read_failure(database, profile_id=pid)
+        generation = bylt_store.read_generation(database, profile_id=pid)
 
-            tracks = []
-            for tid in track_ids:
-                t = tracks_by_id.get(tid)
-                if t:
-                    tracks.append({
-                        'id': tid,
-                        'name': t.track_name,
-                        'artist': t.artist_name,
-                        'album': t.album_name,
-                        'image_url': t.album_cover_url,
-                        'duration_ms': t.duration_ms,
-                        'popularity': t.popularity,
-                    })
+        if generation:
+            payload = bylt_view.payload_from_generation(
+                generation, failure=failure, history_scope=history_scope,
+                history_note=history_note,
+                owned_lookup=_bylt_owned_lookup(database, generation.get('sections')),
+                image_fix=fix_artist_image_url)
+            return jsonify(payload)
 
-            if tracks:
-                # Get artist image
-                artist_image = None
-                try:
-                    conn = database._get_connection()
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT thumb_url FROM artists WHERE LOWER(name) = LOWER(?) LIMIT 1", (artist_name,))
-                    row = cursor.fetchone()
-                    if row and row[0]:
-                        artist_image = fix_artist_image_url(row[0])
-                    conn.close()
-                except Exception as e:
-                    logger.debug("artist image lookup failed: %s", e)
+        slots = bylt_store.read_legacy_slots(database, profile_id=pid)
+        if not slots:
+            return jsonify(bylt_view.empty_payload(
+                source=active_source, history_scope=history_scope,
+                history_note=history_note, failure=failure))
 
-                sections.append({
-                    'artist_name': artist_name,
-                    'artist_image': artist_image,
-                    'tracks': tracks,
-                })
+        wanted = [tid for slot in slots for tid in slot['track_ids']]
+        hydrated = {
+            tid: bylt_view.pool_row_to_dict(track)
+            for tid, track in database.get_discovery_pool_tracks_by_ids(
+                wanted, active_source, profile_id=pid).items()
+        }
+        legacy_sections = [{'tracks': list(hydrated.values())}]
+        payload = bylt_view.payload_from_legacy(
+            slots, hydrated, active_source,
+            history_scope=history_scope, history_note=history_note,
+            owned_lookup=_bylt_owned_lookup(database, legacy_sections),
+            image_fix=fix_artist_image_url,
+            seed_image_lookup=lambda name: _artist_thumb(database, name))
+        return jsonify(payload)
 
-        return jsonify({'success': True, 'sections': sections})
     except Exception as e:
         logger.error(f"Error getting BYLT: {e}")
-        return jsonify({'success': True, 'sections': []})
+        return jsonify({'success': False, 'error': str(e), 'sections': []}), 500
+
+
+def _profile_count(database) -> int:
+    try:
+        with database._get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM profiles")
+            return int(cur.fetchone()[0] or 0)
+    except Exception:
+        return 1
+
+
+def _artist_thumb(database, name):
+    """Seed image for a legacy BYLT slot, read from the v2 catalogue.
+
+    Upstream reads `artists.thumb_url` here; that table is gone. The key is
+    the folded name rather than LOWER(name) for the reason _catalogue_name_key
+    documents - SQLite's LOWER() is ASCII-only, so a stored "Bjork" spelled
+    with the diacritic never answered its own lookup (iss29-D13).
+    """
+    if not name:
+        return None
+    try:
+        with database._get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT image_url FROM lib2_artists WHERE name_key = ? LIMIT 1",
+                        (_catalogue_name_key(name),))
+            row = cur.fetchone()
+            return row[0] if row and row[0] else None
+    except Exception as e:
+        logger.debug("artist image lookup failed: %s", e)
+        return None
+
+
+def _bylt_owned_lookup(database, sections):
+    """One batched library read for every recording the shelves show.
+
+    owned tracks are labelled, not hidden: a shelf may legitimately contain
+    something you already have, but calling it new to the library would be a
+    lie and the download action would have nothing to do.
+    """
+    from core.discovery import bylt_view
+    try:
+        pairs = bylt_view.library_pairs(sections or [])
+        if not pairs:
+            return None
+        return bylt_view.owned_lookup_from_library(
+            database.resolve_library_tracks(pairs))
+    except Exception as e:  # noqa: BLE001 - ownership is a label, not the shelf
+        logger.debug("library ownership lookup failed: %s", e)
+        return None
+
 
 @bp.route('/api/discover/undiscovered-albums', methods=['GET'])
 @_discover_shelf_cache()
@@ -1160,7 +1285,11 @@ def get_discover_undiscovered_albums():
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT LOWER(al.title), LOWER(ar.name)
-                FROM albums al JOIN artists ar ON ar.id = al.artist_id
+                FROM lib2_albums al
+                JOIN lib2_artists ar ON ar.id = al.primary_artist_id
+                WHERE EXISTS (SELECT 1 FROM lib2_tracks t JOIN lib2_track_files f
+                              ON f.track_id=t.id WHERE t.album_id=al.id
+                              AND f.file_state='active' AND TRIM(f.path)<>'')
             """)
             library_keys = {(r[0].strip(), r[1].strip()) for r in cursor.fetchall()}
 
@@ -1198,8 +1327,11 @@ def get_discover_label_explorer():
         with database._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT DISTINCT label FROM albums
-                WHERE label IS NOT NULL AND label != ''
+                SELECT DISTINCT al.label FROM lib2_albums al
+                WHERE al.label IS NOT NULL AND al.label != ''
+                  AND EXISTS (SELECT 1 FROM lib2_tracks t JOIN lib2_track_files f
+                              ON f.track_id=t.id WHERE t.album_id=al.id
+                              AND f.file_state='active' AND TRIM(f.path)<>'')
                 LIMIT 30
             """)
             labels = {r[0] for r in cursor.fetchall()}
@@ -1215,7 +1347,7 @@ def get_discover_label_explorer():
 @bp.route('/api/discover/deep-cuts', methods=['GET'])
 @_discover_shelf_cache()
 def get_discover_deep_cuts():
-    """Low-popularity tracks from artists you listen to — from cache."""
+    """Low-popularity tracks by the artists you listen to — from cache."""
     try:
         database = get_database()
         cache = get_metadata_cache()
@@ -2589,26 +2721,34 @@ def get_your_artist_info(artist_id):
             cursor = conn.cursor()
             # Check by various ID columns
             cursor.execute("""
-                SELECT * FROM artists WHERE id = ? OR spotify_artist_id = ? OR itunes_artist_id = ?
-                OR deezer_id = ? OR discogs_id = ? LIMIT 1
+                SELECT * FROM lib2_artists WHERE id = ? OR spotify_id = ?
+                   OR json_extract(external_ids, '$.itunes') = ?
+                   OR json_extract(external_ids, '$.deezer') = ?
+                   OR json_extract(external_ids, '$.discogs') = ? LIMIT 1
             """, (artist_id, artist_id, artist_id, artist_id, artist_id))
             row = cursor.fetchone()
             if row:
                 r = dict(row)
+                from core.library2.provider_ids import parse_external_ids
+                ids = parse_external_ids(r.get('external_ids'))
+                try:
+                    lastfm = (json.loads(r.get('enrichment') or '{}').get('lastfm') or {})
+                except (TypeError, ValueError):
+                    lastfm = {}
                 result.update({
                     'name': r.get('name', artist_name),
                     'genres': json.loads(r['genres']) if r.get('genres') else [],
                     'summary': r.get('summary', ''),
-                    'image_url': r.get('thumb_url', ''),
-                    'spotify_artist_id': r.get('spotify_artist_id'),
+                    'image_url': r.get('image_url', ''),
+                    'spotify_artist_id': r.get('spotify_id'),
                     'musicbrainz_id': r.get('musicbrainz_id'),
-                    'deezer_id': r.get('deezer_id'),
-                    'itunes_artist_id': r.get('itunes_artist_id'),
-                    'discogs_id': r.get('discogs_id'),
-                    'lastfm_url': r.get('lastfm_url'),
-                    'tidal_id': r.get('tidal_id'),
-                    'lastfm_listeners': r.get('lastfm_listeners', 0),
-                    'lastfm_playcount': r.get('lastfm_playcount', 0),
+                    'deezer_id': ids.get('deezer'),
+                    'itunes_artist_id': ids.get('itunes'),
+                    'discogs_id': ids.get('discogs'),
+                    'lastfm_url': ids.get('lastfm') or lastfm.get('url'),
+                    'tidal_id': ids.get('tidal'),
+                    'lastfm_listeners': lastfm.get('listeners', 0),
+                    'lastfm_playcount': lastfm.get('playcount', 0),
                 })
                 return jsonify(result)
         except Exception as e:
@@ -2702,7 +2842,10 @@ def image_proxy():
     try:
         from core.image_cache import get_image_cache
 
-        cached = get_image_cache().get_url(url)
+        cache = get_image_cache()
+        cached = cache.get_url(url)
+        if request.args.get('v') == 'rail':
+            cached = cache.get_variant_of(cached.key, 'rail')
         response = send_file(cached.path, mimetype=cached.mime_type, conditional=True)
         max_age = int(config_manager.get("image_cache.ttl_seconds", 2592000))
         response.headers['Cache-Control'] = f'private, max-age={max_age}'
@@ -2769,7 +2912,9 @@ def serve_cached_image(cache_key):
         # nothing keeps getting the original.
         variant = (request.args.get('v') or '').strip()
         cache = get_image_cache()
-        if variant and thumbnails_enabled():
+        # Compact dashboard artwork is always bounded; other variants retain
+        # the existing opt-in setting for library/detail pages.
+        if variant == 'rail' or (variant and thumbnails_enabled()):
             cached = cache.get_variant_of(cache_key, variant)
         else:
             cached = cache.get(cache_key)
@@ -2780,8 +2925,20 @@ def serve_cached_image(cache_key):
         response.headers['X-SoulSync-Image-Cache'] = cached.status
         return response
     except Exception as exc:
-        logger.debug("cached image serve failed for %s: %s", cache_key, exc)
-        return '', 404
+        # An empty 404 made every distinct failure look identical from the
+        # browser — "key not found", "upstream refused", "host unreachable" and
+        # "not an image" were indistinguishable, so a production report could
+        # only say "218 images 404" without saying why. The reason travels in a
+        # header (secrets redacted) rather than a body so nothing about the
+        # response contract changes for the <img> that requested it.
+        from core.metadata.artwork import _redact_url_secrets
+        reason = ' '.join(_redact_url_secrets(str(exc)).split())[:200] \
+            or exc.__class__.__name__
+        logger.debug("cached image serve failed for %s: %s", cache_key, reason)
+        response = Response('', status=404)
+        response.headers['X-SoulSync-Image-Error'] = reason
+        response.headers['Cache-Control'] = 'no-store'
+        return response
 
 
 from core.artists.map import (

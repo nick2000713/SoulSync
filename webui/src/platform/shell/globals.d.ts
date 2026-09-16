@@ -120,14 +120,30 @@ declare global {
      *  Must be given the id explicitly once React owns the page. */
     playArtistRadio?: (artistId?: string | number, artistName?: string) => void;
     /** stats-automations.js — the parameterized radio core the Artist Web's
-     *  "Play radio" hands off to (survives the discover.js deletion). */
-    startArtistRadioById?: (artistId: string | number, artistName: string) => void | Promise<void>;
+     *  "Play radio" and the discover Stations row hand off to (survives the
+     *  discover.js deletion).
+     *
+     *  RESOLVES false when nothing could be played. It used to resolve
+     *  undefined either way, so a caller reported success for a station that
+     *  never started. */
+    startArtistRadioById?: (
+      artistId: string | number,
+      artistName: string,
+    ) => Promise<boolean | void> | boolean | void;
     /** media-player.js — seedless Library Radio: queues a ranked-random batch
      *  from the whole library and arms radio mode for refills. */
     startLibraryRadio?: () => void | Promise<void>;
     /** media-player.js — play a resolved library track list (radio-row shape)
      *  as the queue, labeled with a "Playing from" context. */
-    playTrackList?: (tracks: unknown[], contextName?: string) => void | Promise<void>;
+    cancelPendingPlayback?: () => void;
+    playTrackList?: (
+      tracks: unknown[],
+      contextName?: string,
+      options?: { isCurrent: () => boolean },
+    ) =>
+      | void
+      | { status: string; error?: string }
+      | Promise<void | { status: string; error?: string }>;
     /** sync-services.js — the WHOLE ListenBrainz playlist sync: fetch, virtual
      *  playlist, status polling into the discover-lb-playlist-<id>-sync-*
      *  spans. Shared (survives discover.js's deletion), so the React page
@@ -146,7 +162,6 @@ declare global {
     showLoadingOverlay?: (message?: string) => void;
     hideLoadingOverlay?: () => void;
     /** library.js — quality-enhance eligibility probe (library artists only). */
-    checkArtistEnhanceEligibility?: (artistId: unknown) => void;
     /** stats-automations.js — the Enhance Quality modal, opened from the hero. */
     openEnhanceQualityModal?: () => void;
     /**
@@ -292,6 +307,9 @@ declare global {
       spotifyTracks: unknown[],
       artist?: unknown,
       album?: unknown,
+      /** Explicit "who made this playlist". Without it the modal sniffs the id
+       *  prefix and DEFAULTS to YouTube, which mislabels a SoulSync station. */
+      sourceLabel?: string | null,
     ) => void | Promise<void>;
     /** init.js:1465 — the My Accounts / personal settings modal. */
     openPersonalSettings?: () => void | Promise<void>;
@@ -453,6 +471,14 @@ declare global {
     startAudioPlayback?: () => void | Promise<void>;
     /** media-player.js — starts streaming a search result in the player. */
     startStream?: (searchResult: unknown) => void | Promise<void>;
+    /** media-player.js — plays a track directly from a search/preview context. */
+    playTrackDirectly?: (info: {
+      name: string;
+      artist: string;
+      album?: string;
+      image_url?: string;
+      source?: string;
+    }) => void;
     /** Repaints the search download bubbles from the vanilla bubble store into
      *  #enhanced-main-results-area (shared-helpers.js). The React search page
      *  calls it on mount because it recreates that container each visit. */
@@ -668,6 +694,15 @@ declare global {
           labelName?: string;
         },
       ) => Promise<boolean>;
+      /**
+       * Navigate to a full in-app href, query string included.
+       *
+       * `navigateToPage` addresses a page by id and cannot carry search params,
+       * so a plain `<a href="/library?artist=7">` — which is what a search
+       * result card is — had no way in and fell through to the browser as a
+       * full document load (iss29-B03).
+       */
+      navigateToHref: (href: string, options?: { replace?: boolean }) => Promise<boolean>;
     };
     SoulSyncWebShellBridge?: {
       getCurrentProfileContext: () => ShellProfileContext | null;
@@ -695,11 +730,22 @@ declare global {
       showReactHost: (pageId: ShellPageId) => void;
       playLibraryTrack: (
         track: {
-          id: string | number;
+          id?: string | number | null;
+          lib2_track_id?: string | number | null;
+          legacy_track_id?: string | number | null;
+          server_track_id?: string | number | null;
           title: string;
           file_path: string;
           bitrate?: string | number | null;
           artist_id?: string | number | null;
+          /**
+           * iss29-B08: the LIB2 artist id, when the track came from Library V2.
+           * `artist_id` above is a legacy id and is correctly null for a
+           * V2-native track — which left the player's "Go to artist" button
+           * permanently disabled during V2 playback, because nothing routed to
+           * `/library?artist=`.
+           */
+          lib2_artist_id?: string | number | null;
           album_id?: string | number | null;
           _stats_image?: string | null;
           /** Play this exact file: skip the title+artist re-resolve. */
@@ -831,6 +877,9 @@ declare global {
     disablePlaylistSelection?: (disabled: boolean) => void;
     updateRefreshButtonState?: () => void;
     getSyncAccountPlaylists?: () => { id: string | number; name?: string }[];
+    /** Ask the tools page to show whichever tab holds `selector`. True when it
+     *  had to switch, so the caller knows to wait a frame before measuring. */
+    revealToolsTabFor?: (selector: string) => boolean;
   }
 }
 

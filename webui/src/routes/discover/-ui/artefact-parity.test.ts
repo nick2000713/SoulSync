@@ -29,14 +29,13 @@ import { describe, expect, it } from 'vitest';
 const UI = resolve(process.cwd(), 'src/routes/discover/-ui');
 
 const HTML = readFileSync(resolve(process.cwd(), 'index.html'), 'utf8');
-const JS =
-  readFileSync(
-    resolve(process.cwd(), 'src/routes/discover/__fixtures__/-vanilla-discover.js'),
-    'utf8',
-  );
-  // discover-section-controller.js was deleted outright in the aug 26 TS
-  // migration (dead code: its consumer, the vanilla discover page, is long
-  // gone) - the fixture below already carries the vanilla class vocabulary.
+const JS = readFileSync(
+  resolve(process.cwd(), 'src/routes/discover/__fixtures__/-vanilla-discover.js'),
+  'utf8',
+);
+// discover-section-controller.js was deleted outright in the aug 26 TS
+// migration (dead code: its consumer, the vanilla discover page, is long
+// gone) - the fixture below already carries the vanilla class vocabulary.
 const CSS = readdirSync(resolve(process.cwd(), 'static'))
   .filter((f) => f.endsWith('.css'))
   .map((f) => readFileSync(resolve(process.cwd(), 'static', f), 'utf8'))
@@ -69,11 +68,16 @@ const KNOWN_IDS = new Set<string>([
  * component SOURCE and cannot tell a prop from an attribute.
  */
 const NEW_IDS = [
+  // Deezer's editors publish curated playlists and the public api serves them
+  // with no key. A shelf the vanilla never had, so its section anchor is new.
+  'deezer-editorial',
   'build-a-playlist',
   'lastfm-radio',
   'listenbrainz',
   'recent-releases',
-  // the 3.3.0 zone regroup: anchors for the four recommendation zones
+  // The four zone anchors upstream's Discover redesign added (3.2.5, regrouped
+  // in 3.3.0). They are scroll targets the page's own zone map jumps to, not
+  // vanilla artefacts — the vanilla had no zones at all.
   'discover-zone-for-you',
   'discover-zone-library',
   'discover-zone-new-missing',
@@ -82,6 +86,22 @@ const NEW_IDS = [
   'library-radio-section',
   // recommended stations row (aug 25)
   'recommended-stations-section',
+  // M05: the dial is a native range input now, and aria-labelledby /
+  // aria-describedby need ids to point at. Styled by class, so they never
+  // appear in the stylesheet.
+  'adv-wave-label',
+  'adv-wave-help',
+  // the station preview dialog (sep 5). the vanilla had no such surface at
+  // all - a station was one click that started endless radio - so every id
+  // here is new by construction. they mirror the mix modal's, which is
+  // deliberate: the poller and the selection bar read by id.
+  'station-modal-overlay',
+  'station-modal-selbar',
+  'station-modal-tracks',
+  'station-select-all',
+  'station-sel-count',
+  'station-dl-selected',
+  'station-sync-selected',
 ];
 
 /**
@@ -119,8 +139,14 @@ const DELETED_MARKUP_CLASSES = ['artweb-size-btn', 'watch-all-text'];
  * only pass through here on its way to a stylesheet.
  */
 const NEW_CLASSES: string[] = [
-  // 3.3.0 zone regroup: the tools zone's grid modifier, styled in style.css
+  // 3.3.0 zone regroup: the tools zone's grid modifier, styled in style.css.
+  // It arrived in 3.2.5 as a modifier on the styled `.discovery-zone-section`
+  // base with no rule of its own; it leaves this list the moment the scan can
+  // see the rule that now exists.
   'discovery-zone-section--map-tools',
+  // NOTE: the Deezer editorial shelf adds no entry here on purpose. Its chips
+  // and its progress bar are styled in style.css, which makes them KNOWN
+  // rather than new, and the shelf reuses the page's own card classes.
 ];
 
 function componentFiles(): string[] {

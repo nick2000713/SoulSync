@@ -78,15 +78,17 @@ spotify_client = _SpotifyClientProxy()
 _resolve_library_file_path = None
 _attempt_download_with_candidates = None
 missing_download_executor = None
+download_monitor = None
 
 
-def init(resolve_library_file_path_fn, attempt_download_with_candidates_fn, executor):
+def init(resolve_library_file_path_fn, attempt_download_with_candidates_fn, executor, monitor):
     """Bind shared helpers from web_server."""
     global _resolve_library_file_path, _attempt_download_with_candidates
-    global missing_download_executor
+    global missing_download_executor, download_monitor
     _resolve_library_file_path = resolve_library_file_path_fn
     _attempt_download_with_candidates = attempt_download_with_candidates_fn
     missing_download_executor = executor
+    download_monitor = monitor
 
 
 def redownload_start(track_id):
@@ -104,7 +106,10 @@ def redownload_start(track_id):
         database = get_database()
         conn = database._get_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT file_path FROM tracks WHERE id = ?", (track_id,))
+        cursor.execute(
+            "SELECT path AS file_path FROM lib2_track_files WHERE track_id=? "
+            "AND COALESCE(file_state,'active')='active' "
+            "ORDER BY is_primary DESC, id LIMIT 1", (track_id,))
         row = cursor.fetchone()
         conn.close()
 
@@ -233,6 +238,7 @@ def redownload_start(track_id):
                 'used_sources': set(),
                 'status_change_time': time.time(),
                 'metadata_enhanced': False,
+                '_user_manual_pick': True,
                 'error_message': None,
                 '_redownload_context': {
                     'library_track_id': track_id,
@@ -282,6 +288,9 @@ def redownload_start(track_id):
                         download_tasks[task_id]['status'] = 'failed'
                         download_tasks[task_id]['error_message'] = str(e)
 
+        # Register before dispatch: fast streaming downloads can finish immediately.
+        # The monitor owns completion/import and failure cleanup for this batch.
+        download_monitor.start_monitoring(batch_id)
         missing_download_executor.submit(_run_redownload)
 
         return jsonify({

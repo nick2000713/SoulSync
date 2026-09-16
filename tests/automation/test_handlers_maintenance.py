@@ -159,12 +159,78 @@ class TestDatabaseUpdate:
         assert result['status'] == 'completed'
 
 
+    def test_auto_start_database_update_resets_last_progress_at_heartbeat(self):
+        # A stale last_progress_at from the prior hour must be updated
+        # to now upon launch so the watchdog does not falsely declare
+        # a stall at second 0 (#859).
+        import time
+        from core.database_update_health import is_db_update_stalled
+
+        old_epoch = time.time() - 3600
+        state = {'status': 'idle', 'last_progress_at': old_epoch}
+        executor = _StubExecutor()
+
+        def fake_task(*_a, **_k):
+            # Check state while the task is supposedly running
+            assert state['status'] == 'running'
+            assert state['last_progress_at'] > old_epoch
+            assert abs(state['last_progress_at'] - time.time()) < 5.0
+            assert is_db_update_stalled(state, time.time()) is False
+            state['status'] = 'finished'
+
+        executor.submit = lambda fn, *a, **k: fake_task()
+        deps = _build_deps(
+            get_db_update_state=lambda: state,
+            db_update_executor=executor,
+            run_db_update_task=fake_task,
+        )
+        import core.automation.handlers.database_update as module
+        original = module.time.sleep
+        module.time.sleep = lambda _: None
+        try:
+            result = auto_start_database_update({'_automation_id': 'auto-hb'}, deps)
+        finally:
+            module.time.sleep = original
+        assert result['status'] == 'completed'
+        assert state['last_progress_at'] > old_epoch
+
+
 class TestDeepScan:
     def test_already_running_returns_skipped(self):
         state = {'status': 'running'}
         deps = _build_deps(get_db_update_state=lambda: state)
         result = auto_deep_scan_library({}, deps)
         assert result == {'status': 'skipped', 'reason': 'Database update already running'}
+
+    def test_auto_deep_scan_resets_last_progress_at_heartbeat(self):
+        import time
+        from core.database_update_health import is_db_update_stalled
+
+        old_epoch = time.time() - 3600
+        state = {'status': 'idle', 'last_progress_at': old_epoch}
+        executor = _StubExecutor()
+
+        def fake_task(*_a, **_k):
+            assert state['status'] == 'running'
+            assert state['last_progress_at'] > old_epoch
+            assert is_db_update_stalled(state, time.time()) is False
+            state['status'] = 'finished'
+
+        executor.submit = lambda fn, *a, **k: fake_task()
+        deps = _build_deps(
+            get_db_update_state=lambda: state,
+            db_update_executor=executor,
+            run_deep_scan_task=fake_task,
+        )
+        import core.automation.handlers.database_update as module
+        original = module.time.sleep
+        module.time.sleep = lambda _: None
+        try:
+            result = auto_deep_scan_library({'_automation_id': 'auto-deep-hb'}, deps)
+        finally:
+            module.time.sleep = original
+        assert result['status'] == 'completed'
+        assert state['last_progress_at'] > old_epoch
 
 
 # ─── duplicate_cleaner ────────────────────────────────────────────────
@@ -182,16 +248,31 @@ class TestDuplicateCleaner:
 
 
 class TestQualityScanner:
-    def test_triggers_quality_upgrade_repair_job(self):
+    def test_triggers_the_job_that_now_owns_the_outcome(self):
+        """There is no quality-scan job left to trigger.
+
+        Queueing an upgrade candidate is what the wanted projection does
+        continuously; `monitoring_list_reconcile` mirrors the result. A saved
+        automation keeps its action name and now runs the job that actually
+        produces the outcome it was written for, instead of erroring on a job
+        that no longer exists.
+        """
         triggered = []
-        deps = _build_deps(run_repair_job_now=lambda job_id, **kw: triggered.append(job_id) or True)
+        deps = _build_deps(
+            run_repair_job_now=lambda job_id, **kwargs: triggered.append(
+                (job_id, kwargs.get('scope'))
+            ) or True
+        )
         result = auto_start_quality_scan({}, deps)
-        assert triggered == ['quality_upgrade']
+        assert triggered == [(
+            'monitoring_list_reconcile',
+            {'compatibility_source': 'start_quality_scan'},
+        )]
         assert result['status'] == 'completed'
         assert result['triggered'] is True
 
     def test_error_when_worker_unavailable(self):
-        deps = _build_deps(run_repair_job_now=lambda job_id, **kw: None)
+        deps = _build_deps(run_repair_job_now=lambda job_id, **kwargs: None)
         result = auto_start_quality_scan({}, deps)
         assert result['status'] == 'skipped'
 
@@ -205,7 +286,11 @@ class TestQualityScanner:
             return True
 
         auto_start_quality_scan({}, _build_deps(run_repair_job_now=_run))
-        assert seen == {'job': 'quality_upgrade', 'respect_enabled': True}
+        assert seen == {
+            'job': 'monitoring_list_reconcile',
+            'scope': {'compatibility_source': 'start_quality_scan'},
+            'respect_enabled': True,
+        }
 
     def test_a_disabled_job_reads_as_skipped_not_failed(self):
         """Turning a job off is a choice, not a fault. #1192 already taught us

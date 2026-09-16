@@ -148,9 +148,26 @@ export function canSelectSource(source: string, enabledExperimental: ReadonlySet
   return !EXPERIMENTAL_SOURCES.has(source) || enabledExperimental.has(source);
 }
 
-/** Empty slice — every consumer reads five arrays, so none of them may be absent. */
+/** Empty slice — every consumer reads six arrays, so none of them may be absent. */
 export function emptySourceResults(): SourceResults {
-  return { db_artists: [], artists: [], albums: [], tracks: [], videos: [] };
+  return { db_artists: [], artists: [], albums: [], tracks: [], playlists: [], videos: [] };
+}
+
+/**
+ * The library artists any source of this query already resolved (iss29-B04a).
+ *
+ * "In Your Library" is a local catalogue result: it does not depend on which
+ * provider tab is active, so a source that cannot produce it (the video
+ * search) should show what a sibling already found rather than an empty
+ * section.
+ */
+export function knownDbArtists(
+  sources: Partial<Record<string, SourceResults>>,
+): SourceResults['db_artists'] {
+  for (const results of Object.values(sources)) {
+    if (results?.db_artists?.length) return results.db_artists;
+  }
+  return [];
 }
 
 /** Unpack /api/enhanced-search into the per-source cache shape. */
@@ -160,6 +177,7 @@ export function sourceResultsFromResponse(data: EnhancedSearchResponse): SourceR
     artists: data.spotify_artists ?? [],
     albums: data.spotify_albums ?? [],
     tracks: data.spotify_tracks ?? [],
+    playlists: data.spotify_playlists ?? [],
     videos: [],
   };
 }
@@ -330,6 +348,52 @@ export function artistDetailPath(
   return name ? `${path}?name=${encodeURIComponent(name)}` : path;
 }
 
+/**
+ * Open a provider artist directly in Library V2's discovery view.
+ *
+ * Search used to point at `/artist-detail/<source>/<id>` and relied on that
+ * legacy-compatible route to redirect a second time. Keeping the redirect is
+ * useful for old bookmarks and non-React callers, but search already has every
+ * value Library V2 needs and should link to its actual destination.
+ */
+export function libraryV2DiscoveryArtistPath(
+  artistId: string | number,
+  source: string,
+  name?: string | null,
+): string {
+  const normalized = source.trim().toLowerCase();
+  const discoveryId = `${normalized}:${String(artistId)}`;
+  return (
+    `/library?discover=${encodeURIComponent(discoveryId)}` +
+    (name ? `&discoverName=${encodeURIComponent(name)}` : '') +
+    '&releases=all&releaseView=cards&header=rich'
+  );
+}
+
+/**
+ * Where an "In Your Library" artist card points.
+ *
+ * The library is Library v2 now, and so is the bucket: `_build_db_artists`
+ * reads the v2 catalogue, so every card here has a v2 id and opens the page
+ * that can actually manage the artist (monitoring, wanted, quality profile).
+ * The artist-detail fallback stays for callers that pass an artist from
+ * somewhere else — inventing a v2 id for one would 404 the page.
+ */
+export function inLibraryArtistPath(artist: {
+  id?: string | number;
+  library_v2_id?: number | null;
+}): string {
+  return artist.library_v2_id
+    ? // ldp-05 (iss29-B05): arriving from a search result means landing on what
+      // the legacy artist page showed — full discography, cards, rich header.
+      // Without these the direct deep link fell back to the in-library defaults
+      // (My Library / table / compact), so the same artist looked different
+      // depending on whether v2 had mapped it yet.
+      `/library?artist=${encodeURIComponent(String(artist.library_v2_id))}` +
+        `&releases=all&releaseView=cards&header=rich`
+    : artistDetailPath(artist.id ?? '');
+}
+
 /** Where a label card points — buildLabelDetailPath (init.js:3003). */
 export function labelDetailPath(labelId: string | number, name?: string | null): string {
   const path = `/label-detail/${encodeURIComponent(String(labelId))}`;
@@ -354,6 +418,7 @@ export function hasAnyResults(results: SourceResults): boolean {
     results.artists.length > 0 ||
     results.albums.length > 0 ||
     results.tracks.length > 0 ||
+    results.playlists.length > 0 ||
     results.videos.length > 0
   );
 }
