@@ -78,8 +78,12 @@ export const SEARCH_DEBOUNCE_MS = 600;
  */
 export const MBID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/** a pasted link, one token, no spaces. the lookup endpoint says if it knows the site */
+export const LINK_RE = /^https?:\/\/\S+$/i;
+
 export function isIdLookupQuery(query: string): boolean {
-  return MBID_RE.test(query.trim());
+  const trimmed = query.trim();
+  return MBID_RE.test(trimmed) || LINK_RE.test(trimmed);
 }
 
 export function shouldSearch(query: string): boolean {
@@ -148,9 +152,26 @@ export function canSelectSource(source: string, enabledExperimental: ReadonlySet
   return !EXPERIMENTAL_SOURCES.has(source) || enabledExperimental.has(source);
 }
 
-/** Empty slice — every consumer reads five arrays, so none of them may be absent. */
+/** Empty slice — every consumer reads six arrays, so none of them may be absent. */
 export function emptySourceResults(): SourceResults {
-  return { db_artists: [], artists: [], albums: [], tracks: [], videos: [] };
+  return { db_artists: [], artists: [], albums: [], tracks: [], playlists: [], videos: [] };
+}
+
+/**
+ * The library artists any source of this query already resolved (iss29-B04a).
+ *
+ * "In Your Library" is a local catalogue result: it does not depend on which
+ * provider tab is active, so a source that cannot produce it (the video
+ * search) should show what a sibling already found rather than an empty
+ * section.
+ */
+export function knownDbArtists(
+  sources: Partial<Record<string, SourceResults>>,
+): SourceResults['db_artists'] {
+  for (const results of Object.values(sources)) {
+    if (results?.db_artists?.length) return results.db_artists;
+  }
+  return [];
 }
 
 /** Unpack /api/enhanced-search into the per-source cache shape. */
@@ -160,6 +181,7 @@ export function sourceResultsFromResponse(data: EnhancedSearchResponse): SourceR
     artists: data.spotify_artists ?? [],
     albums: data.spotify_albums ?? [],
     tracks: data.spotify_tracks ?? [],
+    playlists: data.spotify_playlists ?? [],
     videos: [],
   };
 }
@@ -299,10 +321,144 @@ export function trackMetaLine(track: SearchTrack): string {
   return [track.artist, track.album].filter(Boolean).join(' • ');
 }
 
-/** An album's display line — `artist • year`, with the vanilla's N/A year. */
-export function albumMetaLine(album: SearchAlbum): string {
-  const year = album.release_date ? album.release_date.slice(0, 4) : 'N/A';
-  return `${album.artist ?? ''} • ${year}`;
+/**
+ * An album's display line: artist, then the year.
+ *
+ * deezer's album search carries no date, so the vanilla printed "N/A" on every
+ * card. no year falls back to the track count, and nothing falls back to
+ * nothing. `withKind` names a single or EP folded in with the albums.
+ */
+export function albumMetaLine(album: SearchAlbum, { withKind = false } = {}): string {
+  const year = album.release_date ? album.release_date.slice(0, 4) : '';
+  const tracks = album.total_tracks ? `${album.total_tracks} tracks` : '';
+  const kind = withKind ? singleKind(album) : '';
+  return [album.artist, kind || year || tracks, kind ? year : ''].filter(Boolean).join(' • ');
+}
+
+function singleKind(album: SearchAlbum): string {
+  if (album.album_type === 'single') return 'Single';
+  if (album.album_type === 'ep') return 'EP';
+  return '';
+}
+
+/** below this many, singles and EPs ride at the end of the albums row */
+export const SINGLES_SHELF_MIN = 3;
+
+/**
+ * The albums and singles as the page lays them out.
+ *
+ * one or two singles made a whole shelf for a card or two. they fold into the
+ * albums row instead, marked with their kind. counts and render both read this
+ * so a pill never counts something the page does not show under it.
+ */
+export function shelfAlbums(all: SearchAlbum[]): {
+  albums: SearchAlbum[];
+  singlesAndEps: SearchAlbum[];
+} {
+  const { albums, singlesAndEps } = splitAlbums(all);
+  if (albums.length > 0 && singlesAndEps.length > 0 && singlesAndEps.length < SINGLES_SHELF_MIN) {
+    return { albums: [...albums, ...singlesAndEps], singlesAndEps: [] };
+  }
+  return { albums, singlesAndEps };
+}
+
+function nameKey(name: string | undefined): string {
+  return (name ?? '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+}
+
+export interface ArtistFaceEntry {
+  artist: SearchArtist;
+  inLibrary: boolean;
+}
+
+/**
+ * Library artists first, then the found ones, without the twin.
+ *
+ * the source's best match for a library artist is the same artist, so showing
+ * both put two identical U2 faces side by side. the first found artist sharing
+ * a library artist's name is dropped; the library one wins because it links to
+ * what you own. later same-named artists are real strangers and stay.
+ */
+export function mergeArtistFaces(
+  dbArtists: SearchArtist[],
+  artists: SearchArtist[],
+): ArtistFaceEntry[] {
+  const unmatched = new Set(dbArtists.map((artist) => nameKey(artist.name)));
+  const found = artists.filter((artist) => {
+    const key = nameKey(artist.name);
+    if (!key || !unmatched.has(key)) return true;
+    unmatched.delete(key);
+    return false;
+  });
+  return [
+    ...dbArtists.map((artist) => ({ artist, inLibrary: true })),
+    ...found.map((artist) => ({ artist, inLibrary: false })),
+  ];
+}
+
+/** 9800000 → "9.8M", 12400 → "12K" */
+export function compactCount(value: number): string {
+  if (value >= 1_000_000) return `${trimZero(value / 1_000_000)}M`;
+  if (value >= 1_000) return `${trimZero(value / 1_000)}K`;
+  return String(value);
+}
+
+function trimZero(value: number): string {
+  return (value >= 100 ? Math.round(value) : Math.round(value * 10) / 10).toString();
+}
+
+/** the quiet line under a found artist. deezer calls them fans */
+export function foundArtistLine(artist: SearchArtist): string {
+  if (!artist.followers) return 'Artist';
+  const noun = artist.source === 'deezer' ? 'fans' : 'followers';
+  return `${compactCount(artist.followers)} ${noun}`;
+}
+
+const EDITORIAL_RE = /\b(deezer|spotify|tidal|apple music|qobuz)\b/i;
+
+/**
+ * Playlists with the likely click first.
+ *
+ * the source ranks by its own idea of popular, which put a stranger's
+ * 2171-track "Joe Joe Vault II" beside "100% U2". editorial playlists that name
+ * the query lead, then any that name it, then editorial, then the rest, each
+ * group in the source's order.
+ */
+export function rankPlaylists<T extends { name?: string; creator?: string }>(
+  playlists: T[],
+  query: string,
+): T[] {
+  const needle = nameKey(query);
+  const score = (playlist: T) => {
+    const named = needle ? nameKey(playlist.name).includes(needle) : false;
+    const editorial = EDITORIAL_RE.test(playlist.creator ?? '');
+    return (named ? 0 : 2) + (editorial ? 0 : 1);
+  };
+  return playlists
+    .map((playlist, index) => ({ playlist, index, rank: score(playlist) }))
+    .sort((a, b) => a.rank - b.rank || a.index - b.index)
+    .map((entry) => entry.playlist);
+}
+
+const QUALIFIER_RE =
+  /remaster|live|version|edit\b|mix\b|mono|stereo|deluxe|edition|bonus|acoustic|demo|instrumental|anniversary/i;
+const TRAILING_GROUP_RE = /\s*([([][^()[\]]*[)\]])\s*$/;
+const TRAILING_DASH_RE = /\s+-\s+([^-]+)$/;
+
+/**
+ * "Pride (In The Name Of Love) (Remastered 2009)" → the title, and the
+ * trailing qualifier to set in a quieter tone. only a last group or dash tail
+ * that reads like a release note dims; "(In The Name Of Love)" is the name.
+ */
+export function splitTitleExtra(title: string): { main: string; extra: string } {
+  const trimmed = title.trim();
+  for (const re of [TRAILING_GROUP_RE, TRAILING_DASH_RE]) {
+    const match = re.exec(trimmed);
+    if (!match || !QUALIFIER_RE.test(match[1])) continue;
+    const main = trimmed.slice(0, match.index).trim();
+    if (main) return { main, extra: match[1].trim() };
+  }
+  return { main: title, extra: '' };
 }
 
 /**
@@ -330,6 +486,52 @@ export function artistDetailPath(
   return name ? `${path}?name=${encodeURIComponent(name)}` : path;
 }
 
+/**
+ * Open a provider artist directly in Library V2's discovery view.
+ *
+ * Search used to point at `/artist-detail/<source>/<id>` and relied on that
+ * legacy-compatible route to redirect a second time. Keeping the redirect is
+ * useful for old bookmarks and non-React callers, but search already has every
+ * value Library V2 needs and should link to its actual destination.
+ */
+export function libraryV2DiscoveryArtistPath(
+  artistId: string | number,
+  source: string,
+  name?: string | null,
+): string {
+  const normalized = source.trim().toLowerCase();
+  const discoveryId = `${normalized}:${String(artistId)}`;
+  return (
+    `/library?discover=${encodeURIComponent(discoveryId)}` +
+    (name ? `&discoverName=${encodeURIComponent(name)}` : '') +
+    '&releases=all&releaseView=cards&header=rich'
+  );
+}
+
+/**
+ * Where an "In Your Library" artist card points.
+ *
+ * The library is Library v2 now, and so is the bucket: `_build_db_artists`
+ * reads the v2 catalogue, so every card here has a v2 id and opens the page
+ * that can actually manage the artist (monitoring, wanted, quality profile).
+ * The artist-detail fallback stays for callers that pass an artist from
+ * somewhere else — inventing a v2 id for one would 404 the page.
+ */
+export function inLibraryArtistPath(artist: {
+  id?: string | number;
+  library_v2_id?: number | null;
+}): string {
+  return artist.library_v2_id
+    ? // ldp-05 (iss29-B05): arriving from a search result means landing on what
+      // the legacy artist page showed — full discography, cards, rich header.
+      // Without these the direct deep link fell back to the in-library defaults
+      // (My Library / table / compact), so the same artist looked different
+      // depending on whether v2 had mapped it yet.
+      `/library?artist=${encodeURIComponent(String(artist.library_v2_id))}` +
+        `&releases=all&releaseView=cards&header=rich`
+    : artistDetailPath(artist.id ?? '');
+}
+
 /** Where a label card points — buildLabelDetailPath (init.js:3003). */
 export function labelDetailPath(labelId: string | number, name?: string | null): string {
   const path = `/label-detail/${encodeURIComponent(String(labelId))}`;
@@ -354,6 +556,7 @@ export function hasAnyResults(results: SourceResults): boolean {
     results.artists.length > 0 ||
     results.albums.length > 0 ||
     results.tracks.length > 0 ||
+    results.playlists.length > 0 ||
     results.videos.length > 0
   );
 }

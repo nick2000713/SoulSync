@@ -35,6 +35,21 @@ from utils.logging_config import get_logger
 logger = get_logger("downloads.task_worker")
 
 
+def _notify_acquisition_retry_exhausted(track_info: Any, error: str) -> bool:
+    """Notify persistent Acquisition state; ordinary tasks are a no-op."""
+    if not isinstance(track_info, dict):
+        return False
+    try:
+        from core.acquisition.pipeline_callback import (
+            notify_pipeline_retry_exhausted,
+        )
+        return notify_pipeline_retry_exhausted(track_info, error=error)
+    except Exception:
+        logger.exception(
+            "[Modal Worker] Could not persist Acquisition retry exhaustion")
+        return False
+
+
 def _resolve_worker_source(username):
     """Logical source bucket for a candidate's username (Soulseek peers all
     collapse to 'soulseek'; streaming sources keep their name). Mirrors the
@@ -130,15 +145,12 @@ def _candidate_ordering(track_info: Optional[dict] = None):
 
 
 def _try_cached_candidates(task_id, batch_id, track, deps):
-    """Quarantine-retry fast path: attempt the already-found candidates before
-    re-searching anything.
+    """Retry fast path: attempt the already-found candidates before searching.
 
-    When a verified-bad file is re-queued, the connection was fine (the file
-    downloaded, it was just the wrong/broken content) — so the next-best pick is
-    almost always already sitting in ``cached_candidates``. Walk those (skipping
-    sources already tried or budget-exhausted) and hand them to the normal
-    download path. Returns True if a download was started; False to fall through
-    to a fresh search (which only happens for a not-yet-searched source).
+    Quarantine retries reuse candidates because the connection worked and only
+    the content was bad. Slow-transfer retries do the same, but retain the best
+    crawling source at the end as a last resort. Returns True if a download was
+    started; False to fall through to a fresh search.
     """
     with tasks_lock:
         task = download_tasks.get(task_id)
@@ -147,24 +159,35 @@ def _try_cached_candidates(task_id, batch_id, track, deps):
         cached = list(task.get('cached_candidates') or [])
         used = set(task.get('used_sources') or ())
         exhausted = {str(s).lower() for s in (task.get('exhausted_download_sources') or ())}
+        slow_fallback_key = task.get('_slow_fallback_source_key')
         task_track_info = task.get('track_info')
 
     remaining = []
+    slow_fallback = None
     for c in cached:
         uname, fname = _cand_user_file(c)
         if not uname or not fname:
             continue
-        if f"{uname}_{fname}" in used:
+        source_key = f"{uname}_{fname}"
+        if source_key in used:
+            if source_key == slow_fallback_key:
+                slow_fallback = c
             continue
         if _resolve_worker_source(uname).lower() in exhausted:
             continue
         remaining.append(c)
 
+    # The hybrid chain may have moved on from Soulseek altogether since the
+    # slow source was retained; an exhausted source is not a last resort.
+    if slow_fallback is not None and _resolve_worker_source(
+            _cand_user_file(slow_fallback)[0]).lower() not in exhausted:
+        remaining.append(slow_fallback)
+
     if not remaining:
         return False
 
     logger.info(
-        f"[Modal Worker] Quarantine retry: trying {len(remaining)} cached "
+        f"[Modal Worker] Retry: trying {len(remaining)} cached "
         f"candidate(s) before re-searching (task {task_id})"
     )
     _qf, _qt = _candidate_ordering(task_track_info)
@@ -237,7 +260,187 @@ class TaskWorkerDeps:
     try_version_mismatch_fallback: Optional[Callable] = None  # (title, artist, task_id, batch_id) -> bool
 
 
+# A sibling may only be skipped against once it has actually OBTAINED the file
+# AND finished with it. 'searching'/'downloading' is a promise, not a file, and
+# 'post_processing' is only a file on disk — the integrity, quality and AcoustID
+# gates that run after it can still quarantine, requeue or fail that owner. A
+# task that stood down against either is stranded with nothing and no retry
+# (L2-003), so only genuinely terminal, successful owners count.
+_SIBLING_OWNED_STATUSES = frozenset({'completed', 'already_owned'})
+
+# Two runs of the same song rarely differ by more than tagging jitter; a gap
+# this large means the sibling is a different recording (radio edit, live
+# version, extended mix) and must not be deduped away.
+_DEDUP_DURATION_TOLERANCE_MS = 5000
+
+
+def _dedup_provider_identity(track_info: Any) -> Optional[tuple]:
+    """``(namespace, id)`` naming the exact recording, or ``None``.
+
+    Metadata alone cannot tell a remaster from its original — same title, same
+    artist, same album title, different recording. When both sides carry an id
+    in the SAME namespace it is authoritative in both directions: equal ids are
+    the same recording, different ids are not.
+    """
+    from core.downloads.origin import _parse_source_info
+
+    if not isinstance(track_info, dict):
+        return None
+    source_info = _parse_source_info(track_info.get('source_info'))
+    lib2_id = source_info.get('lib2_track_id') or track_info.get('lib2_track_id')
+    if lib2_id not in (None, ''):
+        return ('lib2', str(lib2_id))
+    source = str(source_info.get('source') or track_info.get('source') or '').strip().lower()
+    provider_id = (track_info.get('provider_track_id')
+                   or source_info.get('track_id')
+                   or track_info.get('id'))
+    if source and provider_id not in (None, ''):
+        return (source, str(provider_id))
+    return None
+
+
+def _dedup_profile_id(track_info: Any) -> Optional[int]:
+    """The quality profile this request was made under, if it declared one."""
+    from core.downloads.origin import _parse_source_info
+
+    if not isinstance(track_info, dict):
+        return None
+    raw = track_info.get('quality_profile_id')
+    if raw in (None, ''):
+        raw = _parse_source_info(track_info.get('source_info')).get('quality_profile_id')
+    if raw in (None, ''):
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _dedup_int(track_info: Any, key: str) -> Optional[int]:
+    if not isinstance(track_info, dict):
+        return None
+    raw = track_info.get(key)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _same_recording(mine: Any, theirs: Any) -> bool:
+    """Do these two ``track_info`` payloads name the same recording?
+
+    Provider identity decides when both sides speak the same namespace. Only
+    when they don't do we fall back to metadata, and then the title/artist/album
+    triple has to be backed by duration and disc/track agreement — the triple on
+    its own conflates every alternate take of a song.
+    """
+    from core.downloads.status import track_info_identity
+
+    mine_id = _dedup_provider_identity(mine)
+    theirs_id = _dedup_provider_identity(theirs)
+    if mine_id and theirs_id and mine_id[0] == theirs_id[0]:
+        return mine_id[1] == theirs_id[1]
+
+    # Both sides go through track_info_identity, so the artist normalisation is
+    # identical. Building one side out of the SpotifyTrack's first artist only
+    # (as this used to) made every collaboration credit a false negative.
+    if track_info_identity(mine) != track_info_identity(theirs):
+        return False
+
+    mine_ms = _dedup_int(mine, 'duration_ms')
+    theirs_ms = _dedup_int(theirs, 'duration_ms')
+    if mine_ms and theirs_ms and abs(mine_ms - theirs_ms) > _DEDUP_DURATION_TOLERANCE_MS:
+        return False
+
+    for key in ('disc_number', 'track_number'):
+        a, b = _dedup_int(mine, key), _dedup_int(theirs, key)
+        if a and b and a != b:
+            return False
+    return True
+
+
+def _find_owning_sibling(task_id: str, track: SpotifyTrack):
+    """The task in ANOTHER batch that already owns this exact recording.
+
+    Returns ``(other_task_id, other_task)``, or ``(None, None)``.
+
+    Two concurrently-running batches routinely contain the same song (a
+    playlist and the artist's album, two playlists sharing a hit). Both used to
+    download and import it; the second import lands as "already owned" and
+    leaves a second Completed row with no AcoustID badge, which reads as a
+    failure.
+
+    CROSS-batch only, deliberately. A task with no batch is a one-off the user
+    asked for by hand — a re-download to get a better rip, say — and silently
+    turning that into "you already have it" would take away an action they
+    explicitly took. Within one batch the queue is the caller's own list, so a
+    repeat there is also their choice.
+
+    Three things must hold before we stand a task down (L2-003): the sibling has
+    to name the SAME recording (``_same_recording``), it has to have finished
+    successfully with a file to show for it, and it has to have been fetched
+    under the same quality profile — otherwise a deliberate upgrade request
+    silently inherits the low-quality copy it was meant to replace.
+    """
+    with tasks_lock:
+        own = download_tasks.get(task_id) or {}
+        own_batch = own.get('batch_id')
+        if not own_batch:
+            return None, None
+        mine = own.get('track_info')
+        if not isinstance(mine, dict):
+            mine = {
+                'name': getattr(track, 'name', ''),
+                'artists': list(getattr(track, 'artists', None) or []),
+                'album': getattr(track, 'album', ''),
+                'duration_ms': getattr(track, 'duration_ms', 0),
+            }
+        from core.downloads.status import track_info_identity
+        if not track_info_identity(mine)[0] and not _dedup_provider_identity(mine):
+            # No title and no id is not an identity — it would match every other
+            # untitled row.
+            return None, None
+        my_profile = _dedup_profile_id(mine)
+        # A copy in someone else's library is not this library's copy (E-06):
+        # the sibling has to be filling the same one.
+        from core.library_scope import batch_library_owner
+        my_library = batch_library_owner(download_batches.get(own_batch) or {})
+        for other_id, other in download_tasks.items():
+            if other_id == task_id or other.get('batch_id') == own_batch:
+                continue
+            if batch_library_owner(download_batches.get(other.get('batch_id')) or {}) != my_library:
+                continue
+            if other.get('status') not in _SIBLING_OWNED_STATUSES:
+                continue
+            if not (other.get('file_path') or other.get('filename')):
+                # Terminal but with nothing on disk to point at — treating that
+                # as ownership hands this task a success it has no file for.
+                continue
+            if _dedup_profile_id(other.get('track_info')) != my_profile:
+                continue
+            if _same_recording(mine, other.get('track_info')):
+                return other_id, other
+    return None, None
+
+
 def download_track_worker(task_id: str, batch_id: Optional[str], deps: TaskWorkerDeps) -> None:
+    """Run one task under the library its batch fills (#1199).
+
+    Everything below asks the catalogue -- the cross-batch dedup, source reuse,
+    the staging match -- and all of it has to answer for the library this file
+    is going into, not for whoever happens to own the pool thread.
+    """
+    if not batch_id:
+        return _download_track_worker(task_id, batch_id, deps)
+    from core.library_scope import batch_scope, library_scope
+    with tasks_lock:
+        batch = dict(download_batches.get(batch_id) or {})
+    with library_scope(batch_scope(batch)):
+        return _download_track_worker(task_id, batch_id, deps)
+
+
+def _download_track_worker(task_id: str, batch_id: Optional[str], deps: TaskWorkerDeps) -> None:
     """Enhanced download worker that matches the GUI's exact retry logic.
 
     Implements sequential query retry, fallback candidates, and download
@@ -331,7 +534,65 @@ def download_track_worker(task_id: str, batch_id: Optional[str], deps: TaskWorke
         )
         logger.info(f"[Modal Worker] Starting download task for: {track.name} by {track.artists[0] if track.artists else 'Unknown'}")
 
+        # === CROSS-BATCH DEDUP: has a sibling batch already obtained this file? ===
+        _owner_id, _owner = _find_owning_sibling(task_id, track)
+        if _owner_id:
+            logger.info(
+                "[Modal Worker] Task %s: '%s' is already owned by task %s — "
+                "skipping the download instead of importing a second copy",
+                task_id, track.name, _owner_id)
+            with tasks_lock:
+                if task_id in download_tasks:
+                    _row = download_tasks[task_id]
+                    _row['status'] = 'already_owned'
+                    _row['_dedup_owned_by'] = _owner_id
+                    # Inherit the owner's outcome. Without this the row shows a
+                    # blank quality and an empty verification badge, which reads
+                    # as "this one failed" for a track that is present and fine.
+                    for _field in ('verification_status', 'quality', 'file_path',
+                                   'download_source'):
+                        if _owner.get(_field) is not None:
+                            _row[_field] = _owner[_field]
+            if batch_id:
+                deps.on_download_completed(batch_id, task_id, True)
+            return
+
+        # Initialize task state tracking (like GUI's parallel_search_tracking)
+        with tasks_lock:
+            if task_id in download_tasks:
+                download_tasks[task_id]['status'] = 'searching'  # Now actively being processed
+                download_tasks[task_id]['current_query_index'] = 0
+                download_tasks[task_id]['current_candidate_index'] = 0
+                download_tasks[task_id]['retry_count'] = 0
+                download_tasks[task_id]['candidates'] = []
+                # CRITICAL: Preserve used_sources from previous retry attempts (don't reset to empty set)
+                # If this is a retry, the monitor will have already marked failed sources
+                if 'used_sources' not in download_tasks[task_id]:
+                    download_tasks[task_id]['used_sources'] = set()
+                # Else: keep existing used_sources to avoid retrying same failed hosts
+
+        # Cached-first retry. Verified-bad and observably slow downloads both
+        # already have useful candidates to walk before issuing another search,
+        # and the queries that produced them need not run again. Other retry
+        # paths start a new search generation.
+        with tasks_lock:
+            _t = download_tasks.get(task_id, {})
+            is_quarantine_retry = bool(_t.pop('_quarantine_retry', False))
+            cached_first = is_quarantine_retry or bool(_t.get('_slow_fallback_source_key'))
+            if not cached_first:
+                _t.pop('searched_queries', None)
+        if cached_first and _try_cached_candidates(task_id, batch_id, track, deps):
+            with tasks_lock:
+                used_filename = download_tasks.get(task_id, {}).get('filename')
+                used_username = download_tasks.get(task_id, {}).get('username')
+            if used_filename and used_username:
+                deps.store_batch_source(batch_id, used_username, used_filename)
+            return
+
         # === SOURCE REUSE: Check batch's last good source before searching ===
+        # Retry candidates were already validated for this exact track. Walk
+        # them first so a slow retry cannot be intercepted by the batch folder's
+        # broader source-reuse matching.
         if deps.try_source_reuse(task_id, batch_id, track):
             # Store source for next worker (cascading reuse)
             with tasks_lock:
@@ -358,40 +619,6 @@ def download_track_worker(task_id: str, batch_id: Optional[str], deps: TaskWorke
                     download_tasks[task_id]['error_message'] = staging_miss_reason
             if batch_id:
                 deps.on_download_completed(batch_id, task_id, False)
-            return
-
-        # Initialize task state tracking (like GUI's parallel_search_tracking)
-        with tasks_lock:
-            if task_id in download_tasks:
-                download_tasks[task_id]['status'] = 'searching'  # Now actively being processed
-                download_tasks[task_id]['current_query_index'] = 0
-                download_tasks[task_id]['current_candidate_index'] = 0
-                download_tasks[task_id]['retry_count'] = 0
-                download_tasks[task_id]['candidates'] = []
-                # CRITICAL: Preserve used_sources from previous retry attempts (don't reset to empty set)
-                # If this is a retry, the monitor will have already marked failed sources
-                if 'used_sources' not in download_tasks[task_id]:
-                    download_tasks[task_id]['used_sources'] = set()
-                # Else: keep existing used_sources to avoid retrying same failed hosts
-
-        # Cached-first quarantine retry. The monitor sets ``_quarantine_retry``
-        # when a verified-bad file is re-queued; in that case we walk the
-        # already-found candidates before re-searching (the connection was fine,
-        # just the content was wrong). A NON-quarantine entry (fresh download, or
-        # the monitor's dead-connection/stuck retry) instead starts a new search
-        # generation: clear the searched-source memory so each source can be
-        # searched fresh again.
-        with tasks_lock:
-            _t = download_tasks.get(task_id, {})
-            is_quarantine_retry = bool(_t.pop('_quarantine_retry', False))
-            if not is_quarantine_retry:
-                _t.pop('searched_queries', None)
-        if is_quarantine_retry and _try_cached_candidates(task_id, batch_id, track, deps):
-            with tasks_lock:
-                used_filename = download_tasks.get(task_id, {}).get('filename')
-                used_username = download_tasks.get(task_id, {}).get('username')
-            if used_filename and used_username:
-                deps.store_batch_source(batch_id, used_username, used_filename)
             return
 
         # 1. Generate multiple search queries (like GUI's generate_smart_search_queries)
@@ -436,15 +663,25 @@ def download_track_worker(task_id: str, batch_id: Optional[str], deps: TaskWorke
                 if len(first_word) > 1:
                     legacy_queries.append(f"{track_name} {first_word}".strip())
 
-        # Add track-only query
-        if track_name.strip():
+        # Add track-only query only when it is distinctive enough to broadcast.
+        # generate_download_queries() already enforces this guard; the legacy
+        # fallback must honor the same contract or short wishlist titles like
+        # "Vortex" still fan out to hundreds of noisy Soulseek responses.
+        if (
+            track_name.strip()
+            and deps.matching_engine._title_is_distinctive_enough_to_broadcast(track_name.strip())
+        ):
             legacy_queries.append(track_name.strip())
 
         # Add traditional cleaned queries
         cleaned_name = re.sub(r'\s*\([^)]*\)', '', track_name).strip()
         cleaned_name = re.sub(r'\s*\[[^\]]*\]', '', cleaned_name).strip()
 
-        if cleaned_name and cleaned_name.lower() != track_name.lower():
+        if (
+            cleaned_name
+            and cleaned_name.lower() != track_name.lower()
+            and deps.matching_engine._title_is_distinctive_enough_to_broadcast(cleaned_name)
+        ):
             legacy_queries.append(cleaned_name.strip())
 
         # Combine enhanced queries with legacy fallbacks.
@@ -494,6 +731,8 @@ def download_track_worker(task_id: str, batch_id: Optional[str], deps: TaskWorke
         # so per-item profiles changed what survived import but not what was
         # considered in the first place (#1150). None = app-wide default.
         _profile_id = track_data.get('quality_profile_id') if isinstance(track_data, dict) else None
+        from core.quality.selection import load_search_mode
+        _search_mode = load_search_mode(_profile_id)
 
         # 2. Sequential Query Search (matches GUI's start_search_worker_parallel logic)
         search_diagnostics = []  # Track what happened per query for detailed error messages
@@ -505,7 +744,7 @@ def download_track_worker(task_id: str, batch_id: Optional[str], deps: TaskWorke
         # keeps returning fresh wrong peers — once its budget is gone, switch to
         # HiFi/Tidal/…). See monitor.requeue_quarantined_task_for_retry.
         #
-        # On a quarantine retry we do NOT exclude a source just because it was
+        # On a cached-first retry we do NOT exclude a source just because it was
         # searched once: the first run only ran ONE query before starting a
         # download, so the later queries (e.g. "artist + album") have never hit
         # that source yet and may surface the correct upload. Instead we remember
@@ -519,7 +758,7 @@ def download_track_worker(task_id: str, batch_id: Optional[str], deps: TaskWorke
             _t = download_tasks.get(task_id, {})
             _exhausted_sources = [str(s) for s in (_t.get('exhausted_download_sources') or ())]
             _searched_queries = (
-                set(_t.get('searched_queries') or ()) if is_quarantine_retry else set()
+                set(_t.get('searched_queries') or ()) if cached_first else set()
             )
         for query_index, query in enumerate(search_queries):
             # Cancellation check before each query
@@ -540,7 +779,7 @@ def download_track_worker(task_id: str, batch_id: Optional[str], deps: TaskWorke
             # sitting in cache (walked above) — re-searching it is the wasteful
             # repeat the cached-first design removes. Skip it; the not-yet-run
             # queries below still search this source.
-            if is_quarantine_retry and query in _searched_queries:
+            if cached_first and query in _searched_queries:
                 logger.debug(
                     f"[Modal Worker] Skipping already-searched query '{query}' "
                     f"(candidates served from cache) for task {task_id}"
@@ -601,10 +840,22 @@ def download_track_worker(task_id: str, batch_id: Optional[str], deps: TaskWorke
                         logger.debug("[Modal Worker] search ticker failed: %s", _tick_exc)
 
                 # Perform search with timeout
-                tracks_result, _ = deps.run_async(deps.download_orchestrator.search(
-                    query, timeout=30, exclude_sources=_exclude_sources or None,
-                    progress_callback=_search_progress,
-                ))
+                _search_kwargs = {
+                    'timeout': 30,
+                    'exclude_sources': _exclude_sources or None,
+                    'progress_callback': _search_progress,
+                    'search_mode': _search_mode,
+                }
+                # Upstream's delta: an assigned item profile decides whether
+                # hybrid search stops at the first source or pools every source
+                # for best-quality selection. Passed conditionally so the old
+                # call shape (and light-weight test doubles) still work for a
+                # default-profile task.
+                if _profile_id is not None:
+                    _search_kwargs['quality_profile_id'] = _profile_id
+                tracks_result, _ = deps.run_async(
+                    deps.download_orchestrator.search(query, **_search_kwargs)
+                )
                 logger.debug(f"Search completed for task {task_id}, got {len(tracks_result) if tracks_result else 0} results")
 
                 # CRITICAL: Check cancellation immediately after search returns
@@ -810,6 +1061,11 @@ def download_track_worker(task_id: str, batch_id: Optional[str], deps: TaskWorke
                 if all_raw_results and not download_tasks[task_id].get('cached_candidates'):
                     download_tasks[task_id]['cached_candidates'] = all_raw_results
 
+        _notify_acquisition_retry_exhausted(
+            track_data,
+            f'No match found after {len(search_queries)} shared-pipeline queries',
+        )
+
         # Notify batch manager that this task completed (failed) - THREAD SAFE
         if batch_id:
             try:
@@ -837,6 +1093,12 @@ def download_track_worker(task_id: str, batch_id: Optional[str], deps: TaskWorke
                 logger.error(f"[Exception Recovery] Could not acquire lock to update task {task_id} status")
         except Exception as status_error:
             logger.error(f"Error updating task status in exception handler: {status_error}")
+
+        task_info = locals().get('track_data')
+        _notify_acquisition_retry_exhausted(
+            task_info,
+            f'Unexpected shared-pipeline retry error: {type(e).__name__}',
+        )
 
         # Notify batch manager that this task completed (failed) - THREAD SAFE with RECOVERY
         if batch_id:

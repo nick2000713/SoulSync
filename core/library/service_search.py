@@ -66,6 +66,84 @@ def _detect_provider(items, client):
     return 'spotify'
 
 
+def _release_value(value, *names, default=None):
+    for name in names:
+        if isinstance(value, dict):
+            candidate = value.get(name)
+        else:
+            candidate = getattr(value, name, None)
+        if candidate not in (None, ''):
+            return candidate
+    return default
+
+
+def _release_image(value):
+    direct = _release_value(value, 'image_url', 'cover_url', 'album_cover_url')
+    if direct:
+        return str(direct)
+    images = _release_value(value, 'images', default=[]) or []
+    if images:
+        first = images[0]
+        if isinstance(first, dict):
+            return first.get('url') or first.get('#text') or None
+        return str(first)
+    return None
+
+
+def artist_release_preview(service, artist_id, artist_name='', limit=6):
+    """Small, provider-exact release context for an artist match candidate.
+
+    This deliberately uses the same metadata registry/artist-album helper as
+    Library/Watchlist discography. It never falls across providers: the albums
+    shown under a Spotify candidate are Spotify's albums for that exact id.
+    Unsupported/rate-limited providers return ``supported=False`` or an empty
+    list without turning a successful artist search into an error.
+    """
+    service = str(service or '').strip().lower()
+    try:
+        limit = max(1, min(int(limit), 8))
+    except (TypeError, ValueError):
+        limit = 6
+    if service not in {
+        'spotify', 'itunes', 'deezer', 'discogs', 'amazon',
+        'musicbrainz', 'jiosaavn',
+    }:
+        return {'supported': False, 'albums': []}
+
+    from core.metadata.album_tracks import get_artist_albums_for_source
+    albums = get_artist_albums_for_source(
+        service,
+        str(artist_id or '').strip(),
+        artist_name=str(artist_name or '').strip(),
+        limit=limit,
+        max_pages=1,
+    )
+    if albums is None:
+        return {'supported': False, 'albums': []}
+
+    normalized = []
+    seen = set()
+    for album in albums:
+        album_id = str(_release_value(album, 'id', 'album_id', default='') or '')
+        title = str(_release_value(album, 'name', 'title', 'album_name', default='') or '').strip()
+        release_date = str(_release_value(album, 'release_date', 'date', default='') or '')
+        dedupe_key = album_id or f"{title.casefold()}::{release_date[:4]}"
+        if not title or dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        normalized.append({
+            'id': album_id,
+            'title': title,
+            'image': _release_image(album),
+            'release_date': release_date or None,
+            'album_type': str(_release_value(album, 'album_type', 'type', default='') or '') or None,
+            'total_tracks': _release_value(album, 'total_tracks', 'track_count'),
+        })
+        if len(normalized) >= limit:
+            break
+    return {'supported': True, 'albums': normalized}
+
+
 def _mb_direct_lookup(entity_type, mbid):
     """Confirm a pasted MusicBrainz MBID by fetching that exact entity.
     Returns a one-item result list (same shape as the search path) so the
@@ -104,6 +182,112 @@ def _mb_direct_lookup(entity_type, mbid):
     return []
 
 
+def _deezer_get(kind, entity_id):
+    """Public-API GET ``/{album|track|artist}/{id}``. None on any failure."""
+    import requests as req_lib
+    try:
+        from core.deezer_throttle import wait_for_slot
+        wait_for_slot()
+        resp = req_lib.get(
+            f'https://api.deezer.com/{kind}/{entity_id}', timeout=10,
+        )
+        data = resp.json()
+    except Exception as e:
+        logger.debug("Deezer direct %s %s failed: %s", kind, entity_id, e)
+        return None
+    if not isinstance(data, dict) or data.get('error') or not data.get('id'):
+        return None
+    return data
+
+
+def _deezer_shape_artist(a):
+    return {
+        'id': str(a.get('id', '')),
+        'name': a.get('name', ''),
+        'image': a.get('picture_medium'),
+        'extra': f"Direct ID match · {a.get('nb_fan', 0)} fans",
+    }
+
+
+def _deezer_shape_album(a):
+    artist = a.get('artist', {}) if isinstance(a.get('artist'), dict) else {}
+    artist_name = artist.get('name', '')
+    return {
+        'id': str(a.get('id', '')),
+        'name': a.get('title', ''),
+        'image': a.get('cover_medium'),
+        'extra': f"Direct ID match{' · ' + artist_name if artist_name else ''}",
+    }
+
+
+def _deezer_shape_track(t):
+    artist = t.get('artist', {}) if isinstance(t.get('artist'), dict) else {}
+    album = t.get('album', {}) if isinstance(t.get('album'), dict) else {}
+    artist_name = artist.get('name', '')
+    album_name = album.get('title', '')
+    bits = ' · '.join(b for b in (artist_name, album_name) if b)
+    return {
+        'id': str(t.get('id', '')),
+        'name': t.get('title', ''),
+        'image': album.get('cover_medium'),
+        'extra': f"Direct ID match{' · ' + bits if bits else ''}",
+    }
+
+
+def _deezer_direct_lookup(entity_type, deezer_id, query=''):
+    """Confirm a pasted Deezer URL/id and return a one-item result list.
+
+    Album/track URLs can resolve across kinds: a track URL while matching an
+    album returns the parent album (remix singles live on album pages); an
+    album URL while matching a track returns the first track. Failed lookups
+    return [] so the caller can fall through to fuzzy search.
+    """
+    from core.library.direct_id import extract_deezer_link
+    link = extract_deezer_link(query)
+    url_kind = link[0] if link else entity_type
+
+    if url_kind == 'album':
+        album = _deezer_get('album', deezer_id)
+        if not album:
+            return []
+        if entity_type == 'album':
+            return [_deezer_shape_album(album)]
+        if entity_type == 'track':
+            tracks = (album.get('tracks') or {}).get('data') or []
+            first = tracks[0] if tracks else None
+            tid = first.get('id') if isinstance(first, dict) else None
+            if not tid:
+                return []
+            track = _deezer_get('track', tid) or first
+            return [_deezer_shape_track(track)]
+        return []
+
+    if url_kind == 'track':
+        track = _deezer_get('track', deezer_id)
+        if not track:
+            return []
+        if entity_type == 'track':
+            return [_deezer_shape_track(track)]
+        if entity_type == 'album':
+            album_obj = track.get('album') if isinstance(track.get('album'), dict) else {}
+            album_id = album_obj.get('id')
+            if not album_id:
+                return []
+            album = _deezer_get('album', album_id)
+            if not album:
+                album = album_obj
+            return [_deezer_shape_album(album)] if album.get('id') else []
+        return []
+
+    if url_kind == 'artist' or entity_type == 'artist':
+        if entity_type != 'artist':
+            return []
+        artist = _deezer_get('artist', deezer_id)
+        return [_deezer_shape_artist(artist)] if artist else []
+
+    return []
+
+
 def _search_service(service, entity_type, query):
     """Search a service and return normalized results."""
     import requests as req_lib
@@ -121,6 +305,10 @@ def _search_service(service, entity_type, query):
                 hit = _mb_direct_lookup(entity_type, direct_id)
                 if hit:
                     return hit
+            elif service == 'deezer':
+                hit = _deezer_direct_lookup(entity_type, direct_id, query)
+                if hit:
+                    return hit
         except Exception as e:
             logger.debug("Direct-ID lookup failed for %s %s: %s", service, direct_id, e)
         # fall through to fuzzy search
@@ -134,7 +322,14 @@ def _search_service(service, entity_type, query):
             # Detect actual provider from result IDs — Spotify IDs are alphanumeric,
             # iTunes/Deezer IDs are purely numeric. Prevents storing wrong IDs.
             provider = _detect_provider(items, client)
-            return [{'id': a.id, 'name': a.name, 'image': a.image_url, 'extra': ', '.join(a.genres[:3]) if a.genres else '', 'provider': provider} for a in items]
+            # §52.5: every Artist dataclass (Spotify, SpotipyFree, and the
+            # iTunes/Deezer fallback this branch can silently resolve to)
+            # already carries followers/popularity — 0 where a provider
+            # doesn't supply it (see core/metadata's "Spotify-only; 0
+            # elsewhere" convention) — so surfacing them is free, no extra
+            # API call regardless of which source actually served this hit.
+            return [{'id': a.id, 'name': a.name, 'image': a.image_url, 'extra': ', '.join(a.genres[:3]) if a.genres else '', 'provider': provider,
+                     'followers': a.followers, 'popularity': a.popularity} for a in items]
         elif entity_type == 'album':
             items = client.search_albums(query, limit=8)
             provider = _detect_provider(items, client)
@@ -162,9 +357,9 @@ def _search_service(service, entity_type, query):
         # MusicBrainz needs no credentials and no worker — only a client. When
         # the worker is there, use its service so both share one rate limiter;
         # otherwise fall back to the process-wide shared instance. Requiring
-        # the worker meant a failed worker init took manual MusicBrainz search
-        # and enrichment down with it, reported as "worker not initialized" to
-        # a user who never asked for a worker.
+        # the worker meant a MusicBrainz enrich raised, and the callers that
+        # swallow a per-provider failure turned that into "Enrich all" quietly
+        # leaving the chip pending.
         mb_client = None
         if mb_worker is not None and getattr(mb_worker, 'mb_service', None):
             mb_client = mb_worker.mb_service.mb_client
@@ -218,7 +413,8 @@ def _search_service(service, entity_type, query):
         for item in data:
             if entity_type == 'artist':
                 results.append({'id': str(item.get('id', '')), 'name': item.get('name', ''),
-                                'image': item.get('picture_medium'), 'extra': f"{item.get('nb_fan', 0)} fans"})
+                                'image': item.get('picture_medium'), 'extra': f"{item.get('nb_fan', 0)} fans",
+                                'followers': item.get('nb_fan', 0)})
             elif entity_type == 'album':
                 artist_name = item.get('artist', {}).get('name', '') if isinstance(item.get('artist'), dict) else ''
                 results.append({'id': str(item.get('id', '')), 'name': item.get('title', ''),

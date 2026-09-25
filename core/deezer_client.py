@@ -4,9 +4,13 @@ import time
 from typing import Dict, List, Optional, Any
 from functools import wraps
 from dataclasses import dataclass
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 from utils.logging_config import get_logger
 from core.metadata.artist_album_cache import get_cached_artist_album_items, store_artist_album_items
 from core.metadata.cache import get_metadata_cache
+from core.matching.artist_aliases import split_artist_credit
+from core.worker_utils import artist_name_matches
 
 logger = get_logger("deezer_client")
 
@@ -362,6 +366,21 @@ class DeezerClient:
 
     def __init__(self):
         self.session = requests.Session()
+        retry_strategy = Retry(
+            total=3,
+            connect=3,
+            read=2,
+            backoff_factor=0.3,
+            status_forcelist=[500, 502, 503, 504],
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(
+            max_retries=retry_strategy,
+            pool_connections=20,
+            pool_maxsize=20,
+        )
+        self.session.mount('https://', adapter)
+        self.session.mount('http://', adapter)
         self.session.headers.update({
             'User-Agent': 'SoulSync/1.0',
             'Accept': 'application/json',
@@ -403,39 +422,60 @@ class DeezerClient:
         """Reload configuration — refresh OAuth token from config."""
         self._load_token()
 
-    def _api_get(self, endpoint: str, params: dict = None, timeout: int = 15) -> Optional[Dict[str, Any]]:
-        """Generic GET request to Deezer API with error handling.
-        Includes OAuth access_token when available for user-level endpoints."""
-        try:
-            url = f"{self.BASE_URL}/{endpoint.lstrip('/')}"
-            if params is None:
-                params = {}
-            # Include access token for authenticated requests
-            if self._access_token and 'access_token' not in params:
-                params['access_token'] = self._access_token
-            response = self.session.get(url, params=params, timeout=timeout)
+    def _api_get(self, endpoint: str, params: dict = None, timeout: int = 15,
+                 use_token: bool = True, max_retries: int = 2) -> Optional[Dict[str, Any]]:
+        """Generic GET request to Deezer API with error handling and retry.
+        Includes OAuth access_token when available for user-level endpoints.
 
-            if response.status_code != 200:
-                logger.error(f"Deezer API returned status {response.status_code} for {endpoint}")
+        use_token=False for the PUBLIC endpoints - charts, editorial, search.
+        They need no auth, and sending a stale token does not get ignored: the
+        api answers `{"error": {"type": "OAuthException"}}` and the call fails
+        outright. So a user with an expired Deezer link lost the browse rows
+        that never needed their account in the first place.
+        """
+        url = f"{self.BASE_URL}/{endpoint.lstrip('/')}"
+        if params is None:
+            params = {}
+        # Include access token for authenticated requests
+        if use_token and self._access_token and 'access_token' not in params:
+            params['access_token'] = self._access_token
+
+        for attempt in range(max_retries + 1):
+            try:
+                response = self.session.get(url, params=params, timeout=timeout)
+
+                if response.status_code != 200:
+                    logger.error(f"Deezer API returned status {response.status_code} for {endpoint}")
+                    return None
+
+                data = response.json()
+
+                if 'error' in data:
+                    error = data['error']
+                    error_type = error.get('type', 'Unknown')
+                    error_msg = error.get('message', 'Unknown error')
+                    if error_type == 'DataException':
+                        logger.debug(f"Deezer data not found: {endpoint}")
+                    else:
+                        logger.error(f"Deezer API error ({error_type}): {error_msg}")
+                    return None
+
+                return data
+
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                if attempt < max_retries:
+                    logger.warning(
+                        f"Deezer connection error on {endpoint} (attempt {attempt + 1}/{max_retries + 1}): {e}. Retrying with fresh connection..."
+                    )
+                    time.sleep(0.25 * (attempt + 1))
+                    continue
+                logger.error(f"Error in Deezer API request ({endpoint}): {e}")
+                return None
+            except Exception as e:
+                logger.error(f"Error in Deezer API request ({endpoint}): {e}")
                 return None
 
-            data = response.json()
-
-            if 'error' in data:
-                error = data['error']
-                error_type = error.get('type', 'Unknown')
-                error_msg = error.get('message', 'Unknown error')
-                if error_type == 'DataException':
-                    logger.debug(f"Deezer data not found: {endpoint}")
-                else:
-                    logger.error(f"Deezer API error ({error_type}): {error_msg}")
-                return None
-
-            return data
-
-        except Exception as e:
-            logger.error(f"Error in Deezer API request ({endpoint}): {e}")
-            return None
+        return None
 
     # ==================== Metadata Source Methods (iTunesClient parity) ====================
     # These methods follow the same interface as iTunesClient so DeezerClient
@@ -557,6 +597,12 @@ class DeezerClient:
 
             q=track:"X" artist:"Y" album:"Z"
 
+        but the artist:"Y" filter is broken on deezer's side (#1295): with
+        it in, even their own docs example comes back empty. track: and
+        album: still work, so the artist goes in as plain words, which
+        still ranks the right artist up. callers check the artist on the
+        way out.
+
         Quotes around each value preserve multi-word phrases. Empty
         fields are skipped. Embedded double-quotes get stripped (no
         escape mechanism in Deezer's syntax) — rare in practice, but
@@ -564,10 +610,10 @@ class DeezerClient:
         query.
         """
         parts = []
+        if artist:
+            parts.append(artist.replace(chr(34), ""))
         if track:
             parts.append(f'track:"{track.replace(chr(34), "")}"')
-        if artist:
-            parts.append(f'artist:"{artist.replace(chr(34), "")}"')
         if album:
             parts.append(f'album:"{album.replace(chr(34), "")}"')
         return ' '.join(parts)
@@ -639,6 +685,145 @@ class DeezerClient:
                                        [str(ad.get('id', '')) for ad in raw_items if ad.get('id')])
 
         return albums[:limit]
+
+    # ── Editorial playlists ──────────────────────────────────────
+    #
+    # Deezer's own editors publish playlists per genre, and the public API
+    # serves them with no key and no auth. These are the "top stuff" rows: the
+    # same thing the Deezer app opens on.
+    #
+    # `chart/{genre}/playlists` is the curated selection. Genre 0 is the
+    # everything chart and is deliberately tiny (four entries), so a browse that
+    # only asked for 0 would look broken; the per-genre charts are where the
+    # content is (Rock 50, Dance 40, Rap 35 when this was written).
+    #
+    # Nothing here needs a token, so it works for every user whether or not they
+    # have linked a Deezer account.
+
+    # The fallback genre set, used only when `GET /genre` cannot be reached.
+    # The live list is asked for instead (see get_editorial_genres): this used
+    # to BE the list, and shipping twelve of Deezer's twenty-eight quietly hid
+    # Metal, Country, Blues, Folk, Soul & Funk and every regional category.
+    EDITORIAL_GENRES = (
+        (0, 'Top'),
+        (132, 'Pop'),
+        (116, 'Rap / Hip Hop'),
+        (152, 'Rock'),
+        (113, 'Dance'),
+        (106, 'Electro'),
+        (165, 'R&B'),
+        (85, 'Alternative'),
+        (144, 'Reggae'),
+        (129, 'Jazz'),
+        (98, 'Classical'),
+        (173, 'Films / Games'),
+    )
+
+    def get_editorial_genres(self) -> List[Dict[str, Any]]:
+        """The genres a browse can ask for, as [{id, name}].
+
+        Asked for rather than hardcoded. The first version shipped twelve names
+        as a constant to save a request, which cost sixteen genres - Metal,
+        Country, Blues, Soul & Funk, Folk and every regional category among
+        them. One cached call is worth more than that.
+
+        EDITORIAL_GENRES stays as the fallback, so the chips still appear when
+        Deezer is unreachable, and 'All' is kept at the front because it is the
+        row the shelf opens on.
+        """
+        data = self._api_get('genre', use_token=False)
+        rows = (data or {}).get('data') or []
+        out = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            gid = row.get('id')
+            name = str(row.get('name') or '').strip()
+            if gid is None or not name:
+                continue
+            out.append({'id': int(gid), 'name': name})
+        if not out:
+            logger.debug("Deezer genre list unavailable; using the built-in set")
+            return [{'id': gid, 'name': name} for gid, name in self.EDITORIAL_GENRES]
+        out.sort(key=lambda g: (g['id'] != 0, g['name'].lower()))
+        return out
+
+    @rate_limited
+    def get_editorial_playlists(self, genre_id: int = 0, limit: int = 25) -> List[Dict[str, Any]]:
+        """Deezer's curated playlists for one genre.
+
+        Returns the normalised shape the discover shelf reads, or [] on any
+        failure - a browse row that cannot load is an empty row, never an error
+        the page has to handle.
+        """
+        try:
+            genre_id = int(genre_id)
+        except (TypeError, ValueError):
+            genre_id = 0
+        limit = max(1, min(int(limit or 25), 100))
+
+        data = self._api_get(f'chart/{genre_id}/playlists', {'limit': limit}, use_token=False)
+        items = (data or {}).get('data') or []
+        if not items:
+            logger.debug("No Deezer editorial playlists for genre %s", genre_id)
+            return []
+
+        out = []
+        for item in items:
+            playlist = self._editorial_playlist_to_dict(item)
+            if playlist:
+                out.append(playlist)
+        logger.info("Deezer editorial: %s playlists for genre %s", len(out), genre_id)
+        return out
+
+    @rate_limited
+    def search_playlists(self, query: str, limit: int = 25) -> List[Dict[str, Any]]:
+        """Search Deezer playlists by name. Editorial and user playlists mixed.
+
+        Same normalised shape as get_editorial_playlists, so a shelf can render
+        either without caring which it asked for.
+        """
+        query = (query or '').strip()
+        if not query:
+            return []
+        limit = max(1, min(int(limit or 25), 100))
+        data = self._api_get('search/playlist', {'q': query, 'limit': limit}, use_token=False)
+        items = (data or {}).get('data') or []
+        out = []
+        for item in items:
+            playlist = self._editorial_playlist_to_dict(item)
+            if playlist:
+                out.append(playlist)
+        return out
+
+    @staticmethod
+    def _editorial_playlist_to_dict(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """One api playlist row -> the shape the shelf and the loader share.
+
+        `id` is what matters: it is the same id /api/deezer/playlist/<id> already
+        takes, so a card picked here goes through the pipeline that already
+        exists rather than a second one built for browsing.
+        """
+        if not isinstance(item, dict):
+            return None
+        playlist_id = str(item.get('id') or '').strip()
+        title = str(item.get('title') or '').strip()
+        if not playlist_id or not title:
+            return None
+        user = item.get('user') if isinstance(item.get('user'), dict) else {}
+        # picture_xl is 1000x1000; the shelf wants art that survives a retina
+        # tile, and the smaller keys are the same image scaled down
+        image = (item.get('picture_xl') or item.get('picture_big')
+                 or item.get('picture_medium') or item.get('picture') or '')
+        return {
+            'id': playlist_id,
+            'title': title,
+            'creator': str(user.get('name') or 'Deezer').strip() or 'Deezer',
+            'track_count': int(item.get('nb_tracks') or 0),
+            'image_url': image,
+            'link': str(item.get('link') or ''),
+            'source': 'deezer',
+        }
 
     def get_track_details(self, track_id: str) -> Optional[Dict[str, Any]]:
         """Get detailed track info — returns Spotify-compatible dict (metadata source interface)"""
@@ -1231,10 +1416,15 @@ class DeezerClient:
             logger.error(f"Error searching for album '{artist_name} - {album_title}': {e}")
             return None
 
-    @rate_limited
     def search_track(self, artist_name: str, track_title: str) -> Optional[Dict[str, Any]]:
         """
         Search for a track by artist name and track title (enrichment interface).
+
+        deezer's artist:"X" filter came back empty for every query (#1295), so
+        the artist rides as plain words next to track:"Y" and we check the
+        artist ourselves. a plain artist term only ranks, it doesn't filter, and
+        karaoke / piano covers rank above the real song, so results[0] isn't
+        safe. we take the first result by the artist we asked for, or nothing.
 
         Args:
             artist_name: Name of the artist
@@ -1244,22 +1434,17 @@ class DeezerClient:
             Track dict from Deezer or None if not found
         """
         try:
-            query = f'artist:"{artist_name}" track:"{track_title}"'
-            response = self.session.get(
-                f"{self.BASE_URL}/search",
-                params={'q': query},
-                timeout=10
-            )
-            response.raise_for_status()
+            query = self._build_advanced_query(track=track_title, artist=artist_name)
+            result = self._pick_track_by_artist(self._search_track_raw(query), artist_name)
 
-            data = response.json()
-            if 'error' in data:
-                logger.error(f"Deezer API error searching track '{query}': {data['error']}")
-                return None
+            # the exact-title phrase can miss a title deezer spells a bit
+            # differently, so one plain search before calling it not found
+            if result is None:
+                fallback = ' '.join(p for p in (artist_name, track_title) if p)
+                if fallback and fallback != query:
+                    result = self._pick_track_by_artist(self._search_track_raw(fallback), artist_name)
 
-            results = data.get('data', [])
-            if results and len(results) > 0:
-                result = results[0]
+            if result is not None:
                 # Cache the track entity
                 try:
                     cache = get_metadata_cache()
@@ -1275,6 +1460,41 @@ class DeezerClient:
         except Exception as e:
             logger.error(f"Error searching for track '{artist_name} - {track_title}': {e}")
             return None
+
+    @rate_limited
+    def _search_track_raw(self, query: str) -> List[Dict[str, Any]]:
+        """one /search call, raw result dicts. its own rate slot so the
+        fallback in search_track pays for its request too"""
+        if not query:
+            return []
+        response = self.session.get(
+            f"{self.BASE_URL}/search",
+            params={'q': query},
+            timeout=10
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        if 'error' in data:
+            logger.error(f"Deezer API error searching track '{query}': {data['error']}")
+            return []
+        return data.get('data') or []
+
+    @staticmethod
+    def _pick_track_by_artist(results: List[Dict[str, Any]], artist_name: str) -> Optional[Dict[str, Any]]:
+        """first result by the artist we asked for. deezer only gives the
+        primary artist, so a collab credit ("daft punk & pharrell") matches on
+        any of its names. no artist asked for means the top result, like before"""
+        if not results:
+            return None
+        if not artist_name:
+            return results[0]
+        wanted = [artist_name] + split_artist_credit(artist_name)
+        for result in results:
+            got = (result.get('artist') or {}).get('name') or ''
+            if any(artist_name_matches(name, got) for name in wanted):
+                return result
+        return None
 
     @rate_limited
     def get_album_raw(self, album_id: int) -> Optional[Dict[str, Any]]:
@@ -1462,6 +1682,13 @@ class DeezerClient:
                     'name': t.get('title', ''),
                     'artists': [artist_name],
                     'album': t.get('album', {}).get('title', ''),
+                    'album_cover_url': (
+                        t.get('album', {}).get('cover_xl')
+                        or t.get('album', {}).get('cover_big')
+                        or t.get('album', {}).get('cover_medium')
+                        or t.get('album', {}).get('cover_small')
+                        or ''
+                    ),
                     'duration_ms': t.get('duration', 0) * 1000,
                     # REAL album position; the playlist index is a last resort only.
                     'track_number': track_positions.get(str(t.get('id'))) or i,

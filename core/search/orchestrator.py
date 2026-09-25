@@ -119,29 +119,99 @@ def resolve_client(source_name: str, deps: SearchDeps) -> tuple[Any, bool]:
 
 
 def _build_db_artists(query: str, deps: SearchDeps) -> list[dict]:
-    active_server = deps.config_manager.get_active_media_server()
-    artist_objs = deps.database.search_artists(query, limit=5, server_source=active_server)
+    """The "In Your Library" bucket — Library v2's catalogue, and nothing else.
+
+    Every entry is a lib2 artist, so ``id`` and ``library_v2_id`` are the same
+    lib2 id and every card routes to the v2 artist page — the page that can
+    actually manage the artist (monitoring, wanted, quality profile). Before
+    this the bucket was a merge: legacy ``artists`` searched first, lib2 rows
+    folded in by back-reference, provider id or unambiguous name, with an
+    off-thread repair that wrote the name-resolved link back. One catalogue
+    needs none of it.
+
+    Two details survive from the two halves it replaces:
+
+    - **Accents fold.** Legacy searched ``unidecode_lower(name)``; the lib2
+      half searched ``LOWER(name)``, which SQLite applies to ASCII only
+      (iss29-D13), so it never answered a 'Tiesto' typed without the
+      diaeresis. The function is registered on every ``MusicDatabase``
+      connection (``database/music_database.py``), which is the connection
+      this reads from.
+    - **An alias is not an entry.** §40 alias members fold into their
+      canonical artist, spelled as ``library2.queries.list_artists`` spells it
+      (iss29-D04) so the membership test stays index-servable.
+    """
+    from core.library2.sql_util import scope_visibility_sql
+    from core.text.normalize import normalize_for_comparison
+
+    # "Your" library is the one you are looking at (#1199): an artist that only
+    # another library holds is not in yours. Absent when nothing separates
+    # libraries; judged across the alias group, like the library's own list.
+    visible = scope_visibility_sql("artist", "va")
+    in_scope = (
+        "AND EXISTS (SELECT 1 FROM lib2_artists va"
+        "  WHERE COALESCE(va.canonical_artist_id, va.id) = a.id"
+        f"   AND {visible})" if visible else "")
     out: list[dict] = []
-    for artist in artist_objs:
-        image_url = None
-        if hasattr(artist, 'thumb_url') and artist.thumb_url:
-            image_url = deps.fix_artist_image_url(artist.thumb_url)
-        out.append({
-            'id': artist.id,
-            'name': artist.name,
-            'image_url': image_url,
-        })
+    conn = None
+    try:
+        conn = deps.database._get_connection()
+        rows = conn.execute(
+            f"""SELECT a.id, a.name, a.image_url
+                 FROM lib2_artists a
+                WHERE a.canonical_artist_id IS NULL
+                  AND EXISTS (
+                      SELECT 1 FROM lib2_artists member
+                       WHERE (member.canonical_artist_id = a.id
+                              OR (member.canonical_artist_id IS NULL
+                                  AND member.id = a.id))
+                         AND unidecode_lower(member.name) LIKE :needle)
+                  {in_scope}
+                ORDER BY a.name COLLATE NOCASE, a.id
+                LIMIT 10""",
+            {"needle": f"%{normalize_for_comparison(query)}%"},
+        ).fetchall()
+        for row in rows:
+            artist_id = int(row['id'])
+            out.append({
+                'id': artist_id,
+                'library_v2_id': artist_id,
+                'name': row['name'],
+                # iss29-B04c: `id` is a lib2 id, and the generic
+                # `/api/artist/<id>/image` resolver forwards whatever id it is
+                # given to the providers — which means a lib2 id resolved to
+                # whichever Deezer/iTunes artist happens to own that number, a
+                # confidently wrong face on the card. Library V2 serves this
+                # artist's own artwork, so point at that.
+                'image_url': (
+                    deps.fix_artist_image_url(row['image_url'])
+                    if row['image_url']
+                    else f"/api/library/v2/artwork/artist/{artist_id}"
+                ),
+                'image_is_native': True,
+            })
+    except Exception as exc:  # a database without the v2 tables yet
+        logger.debug("Library-v2 artist search unavailable: %s", exc)
+    finally:
+        if conn is not None:
+            conn.close()
     return out
 
 
+# 2, not 3: U2, A1, M83's cousins. a 3 floor quietly made them unsearchable
+# (#1291). matches MIN_QUERY_LENGTH on the search page.
+MIN_REMOTE_QUERY_LENGTH = 2
+
+
 def _short_query_response(db_artists: list[dict], requested_source: str, deps: SearchDeps) -> dict:
-    """Skip the remote search for queries shorter than 3 chars."""
+    """Skip the remote search for a query too short to mean anything."""
     short_source = requested_source or deps.get_metadata_fallback_source()
     return {
         'db_artists': db_artists,
         'spotify_artists': [],
         'spotify_albums': [],
         'spotify_tracks': [],
+        'spotify_playlists': [],
         'metadata_source': short_source,
         'primary_source': short_source,
         'alternate_sources': [],
@@ -184,6 +254,7 @@ def _single_source_response(
             'spotify_artists': [],
             'spotify_albums': [],
             'spotify_tracks': [],
+            'spotify_playlists': [],
             'metadata_source': requested_source,
             'primary_source': requested_source,
             'alternate_sources': [],
@@ -194,12 +265,13 @@ def _single_source_response(
         source_results = sources.search_source(query, client, requested_source, prefer_free=prefer_free)
     except Exception as e:
         logger.warning(f"Single-source search ({requested_source}) failed: {e}")
-        source_results = {'artists': [], 'albums': [], 'tracks': [], 'available': False}
+        source_results = {'artists': [], 'albums': [], 'tracks': [], 'playlists': [], 'available': False}
 
     logger.info(
         f"Enhanced search [source={requested_source}] results: "
         f"{len(db_artists)} DB, {len(source_results['artists'])} artists, "
-        f"{len(source_results['albums'])} albums, {len(source_results['tracks'])} tracks"
+        f"{len(source_results['albums'])} albums, {len(source_results['tracks'])} tracks, "
+        f"{len(source_results.get('playlists', []))} playlists"
     )
 
     return {
@@ -207,6 +279,7 @@ def _single_source_response(
         'spotify_artists': source_results['artists'],
         'spotify_albums': source_results['albums'],
         'spotify_tracks': source_results['tracks'],
+        'spotify_playlists': source_results.get('playlists', []),
         'metadata_source': requested_source,
         'primary_source': requested_source,
         'alternate_sources': [],
@@ -294,7 +367,8 @@ def _fan_out_response(query: str, db_artists: list[dict], deps: SearchDeps) -> d
         f"Enhanced search results ({primary_source}): {len(db_artists)} DB artists, "
         f"{len(primary_results['artists'])} artists, "
         f"{len(primary_results['albums'])} albums, "
-        f"{len(primary_results['tracks'])} tracks | "
+        f"{len(primary_results['tracks'])} tracks, "
+        f"{len(primary_results.get('playlists', []))} playlists | "
         f"Alt sources available: {alternate_sources}"
     )
 
@@ -303,6 +377,7 @@ def _fan_out_response(query: str, db_artists: list[dict], deps: SearchDeps) -> d
         'spotify_artists': primary_results['artists'],
         'spotify_albums': primary_results['albums'],
         'spotify_tracks': primary_results['tracks'],
+        'spotify_playlists': primary_results.get('playlists', []),
         'metadata_source': primary_source,
         'primary_source': primary_source,
         'alternate_sources': alternate_sources,
@@ -316,6 +391,7 @@ def empty_response() -> dict:
         'spotify_artists': [],
         'spotify_albums': [],
         'spotify_tracks': [],
+        'spotify_playlists': [],
         'sources': {},
         'primary_source': 'spotify',
         'metadata_source': 'spotify',
@@ -330,7 +406,7 @@ def run_enhanced_search(query: str, requested_source: str, deps: SearchDeps) -> 
     """
     db_artists = _build_db_artists(query, deps)
 
-    if len(query) < 3:
+    if len(query) < MIN_REMOTE_QUERY_LENGTH:
         return _short_query_response(db_artists, requested_source, deps)
 
     if requested_source:
@@ -351,14 +427,37 @@ def resolve_youtube_videos_client(deps: SearchDeps):
     return deps.download_orchestrator.client('youtube')
 
 
-def stream_youtube_videos(query: str, youtube_client, run_async: Callable) -> Iterator[str]:
+# how many videos one yt-dlp search may ask for. the default is what the
+# search page has always fetched; the ceiling is the artist page's "show more"
+# path. above 60 yt-dlp pages through search results slowly enough that the
+# request stops feeling like a click.
+YOUTUBE_VIDEO_LIMIT_DEFAULT = 20
+YOUTUBE_VIDEO_LIMIT_MAX = 60
+
+
+def clamp_youtube_video_limit(value) -> int:
+    """the `limit` a client may send, pinned to [1, YOUTUBE_VIDEO_LIMIT_MAX].
+
+    anything that isn't a number (None, '', 'abc') means the default, so an
+    old client that never sends limit keeps its old result count.
+    """
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        return YOUTUBE_VIDEO_LIMIT_DEFAULT
+    return max(1, min(YOUTUBE_VIDEO_LIMIT_MAX, limit))
+
+
+def stream_youtube_videos(query: str, youtube_client, run_async: Callable,
+                          max_results: int = YOUTUBE_VIDEO_LIMIT_DEFAULT) -> Iterator[str]:
     """yt-dlp video search generator — yields one videos chunk + done marker.
 
-    Caller is responsible for verifying youtube_client is not None.
+    Caller is responsible for verifying youtube_client is not None and for
+    clamping max_results (clamp_youtube_video_limit).
     """
     try:
         video_query = f"{query} official music video"
-        results = run_async(youtube_client.search_videos(video_query, max_results=20))
+        results = run_async(youtube_client.search_videos(video_query, max_results=max_results))
         videos = []
         for v in (results or []):
             videos.append({
@@ -389,11 +488,12 @@ def stream_metadata_source(source_name: str, query: str, client,
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {
             executor.submit(sources.search_kind, client, query, 'artists', source_name, prefer_free): 'artists',
             executor.submit(sources.search_kind, client, query, 'albums', source_name, prefer_free): 'albums',
             executor.submit(sources.search_kind, client, query, 'tracks', source_name, prefer_free): 'tracks',
+            executor.submit(sources.search_kind, client, query, 'playlists', source_name, prefer_free): 'playlists',
         }
         for future in as_completed(futures):
             kind = futures[future]

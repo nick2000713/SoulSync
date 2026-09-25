@@ -52,10 +52,11 @@ class _Track:
 
 
 class _Client:
-    def __init__(self, artists=None, albums=None, tracks=None, fail=None):
+    def __init__(self, artists=None, albums=None, tracks=None, playlists=None, fail=None):
         self._artists = artists or []
         self._albums = albums or []
         self._tracks = tracks or []
+        self._playlists = playlists or []
         self._fail = fail or set()
 
     def search_artists(self, q, limit=10):
@@ -73,6 +74,11 @@ class _Client:
             raise RuntimeError("tracks boom")
         return self._tracks
 
+    def search_playlists(self, q, limit=10):
+        if 'playlists' in self._fail:
+            raise RuntimeError("playlists boom")
+        return self._playlists
+
 
 # ---------------------------------------------------------------------------
 # search_kind
@@ -87,7 +93,16 @@ def test_search_kind_artists_returns_normalized_dicts():
         'source': 'spotify',
         'image_url': 'thumb.jpg',
         'external_urls': {'spotify': 'url'},
+        'followers': None,
     }]
+
+
+def test_search_kind_artists_carries_the_fan_count():
+    """three deezer artists all called U2: the fan count is how you tell."""
+    artist = _Artist('id1', 'U2')
+    artist.followers = 9_800_000
+    result = sources.search_kind(_Client(artists=[artist]), 'u2', 'artists', 'deezer')
+    assert result[0]['followers'] == 9_800_000
 
 
 def test_search_kind_artists_handles_none_external_urls():
@@ -201,9 +216,30 @@ def test_search_source_partial_failure_does_not_break_others():
 
 
 def test_search_source_all_fail_returns_empty_lists():
-    client = _Client(fail={'artists', 'albums', 'tracks'})
+    client = _Client(fail={'artists', 'albums', 'tracks', 'playlists'})
     result = sources.search_source('q', client, 'spotify')
-    assert result == {'artists': [], 'albums': [], 'tracks': [], 'available': True}
+    assert result == {'artists': [], 'albums': [], 'tracks': [], 'playlists': [], 'available': True}
+
+
+def test_search_kind_playlists_returns_normalized_dicts():
+    client = _Client(playlists=[{
+        'id': '12345',
+        'title': 'Synthwave Nights',
+        'creator': 'RetroMaster',
+        'track_count': 50,
+        'image_url': 'https://image.url/cover.jpg',
+        'link': 'https://deezer.com/playlist/12345',
+    }])
+    result = sources.search_kind(client, 'synthwave', 'playlists', 'deezer')
+    assert result == [{
+        'id': '12345',
+        'name': 'Synthwave Nights',
+        'creator': 'RetroMaster',
+        'track_count': 50,
+        'image_url': 'https://image.url/cover.jpg',
+        'source': 'deezer',
+        'link': 'https://deezer.com/playlist/12345',
+    }]
 
 
 # ── source field on serialized results (Netti93 multi-artist fix) ───────────

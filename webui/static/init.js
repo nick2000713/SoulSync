@@ -519,6 +519,9 @@ function setCurrentProfile(profile) {
 const LEGACY_PROFILE_PAGE_ALIASES = {
     downloads: 'search',
     artists: 'search',
+    // Library v2 became the Library; anything still naming the old route id
+    // resolves to the same permission rather than to an unknown page.
+    'library-v2': 'library',
 };
 
 function normalizeProfilePageId(pageId) {
@@ -569,6 +572,10 @@ function getCurrentProfileContext() {
     return {
         profileId: currentProfile.id,
         isAdmin: !!currentProfile.is_admin,
+        // who's signed in, for the My Account header
+        name: currentProfile.name || '',
+        avatarColor: currentProfile.avatar_color || '',
+        avatarUrl: currentProfile.avatar_url || '',
     };
 }
 
@@ -1399,14 +1406,11 @@ function updateProfileIndicator() {
     const statusSection = document.querySelector('.status-section--clickable');
     if (statusSection) statusSection.classList.toggle('status-section--locked', !currentProfile.is_admin);
 
-    // My Accounts (per-profile streaming OAuth) and My Settings (per-profile
-    // server library) are inert for admin — admin uses the global app account
-    // for every service and the full Settings page. Hide both for admin; keep
-    // them for non-admins, who actually get a connect/library UI.
+    // My Account (your media server identity + your own music services) is
+    // inert for the admin, who uses the app's accounts and the full Settings
+    // page. hidden for the admin, shown to everyone else.
     const myAccountsBtn = document.getElementById('my-accounts-btn');
-    const personalSettingsBtn = document.getElementById('personal-settings-btn');
     if (myAccountsBtn) myAccountsBtn.style.display = currentProfile.is_admin ? 'none' : '';
-    if (personalSettingsBtn) personalSettingsBtn.style.display = currentProfile.is_admin ? 'none' : '';
 
     indicator.onclick = async () => {
         const res = await fetch('/api/profiles');
@@ -1428,8 +1432,7 @@ function updateProfileIndicator() {
         } else if (currentProfile.id === 1) {
             btn.style.display = ''; // Root admin sees all
         } else {
-            const ap = currentProfile.allowed_pages;
-            btn.style.display = (!ap || ap.includes(page)) ? '' : 'none';
+            btn.style.display = isPageAllowed(page) ? '' : 'none';
         }
     });
 
@@ -1488,505 +1491,6 @@ function profileAllowedSides() {
 // PERSONAL SETTINGS MODAL
 // =====================
 
-async function openPersonalSettings() {
-    const overlay = document.getElementById('personal-settings-overlay');
-    if (!overlay) return;
-    overlay.style.display = 'flex';
-
-    const body = document.getElementById('personal-settings-body');
-    body.innerHTML = '<div style="text-align:center;padding:20px;color:rgba(255,255,255,0.4);">Loading...</div>';
-
-    try {
-        body.innerHTML = '';
-        const isNonAdmin = currentProfile && !currentProfile.is_admin;
-
-        // Streaming-account connections now live in the My Accounts modal (the ♫
-        // button). Personal Settings keeps only the per-profile server library.
-        if (isNonAdmin) {
-            const serverTab = document.createElement('div');
-            serverTab.style.padding = '18px 22px 22px';
-            serverTab.innerHTML = '<div style="text-align:center;padding:20px;color:rgba(255,255,255,0.3);">Loading libraries...</div>';
-            body.appendChild(serverTab);
-            fetch('/api/profiles/me/server-library').then(r => r.json()).then(libData => {
-                serverTab.innerHTML = '';
-                renderPersonalSettingsServerLibrary(serverTab, libData);
-            }).catch(() => {
-                serverTab.innerHTML = '';
-                renderPersonalSettingsServerLibrary(serverTab, {});
-            });
-        } else {
-            const content = document.createElement('div');
-            content.style.padding = '24px';
-            content.innerHTML = '<div style="color:rgba(255,255,255,0.55);font-size:0.9rem;line-height:1.7;">'
-                + 'Your streaming accounts are in <b>My Accounts</b> (the ♫ button next to your profile).<br>'
-                + 'Global service setup lives in <b>Settings</b>.</div>';
-            body.appendChild(content);
-        }
-    } catch (e) {
-        body.innerHTML = '<div style="color:#ef4444;padding:16px;">Failed to load settings</div>';
-    }
-}
-
-function closePersonalSettings() {
-    const overlay = document.getElementById('personal-settings-overlay');
-    if (overlay) overlay.style.display = 'none';
-}
-
-function renderPersonalSettingsSpotify(body, data) {
-    const hasCreds = data.has_credentials;
-    const clientId = data.client_id || '';
-
-    let contentHtml;
-    if (hasCreds) {
-        contentHtml = `
-            <div class="ps-connected-info">
-                <div class="ps-connected-icon">🟢</div>
-                <div class="ps-connected-details">
-                    <div class="ps-connected-username">Credentials configured</div>
-                    <div class="ps-connected-server">Client ID: ${escapeHtml(clientId.substring(0, 8))}...</div>
-                    <div class="ps-connected-source">Personal Spotify app</div>
-                </div>
-            </div>
-            <div class="ps-actions">
-                <button class="ps-btn ps-btn-primary" onclick="authenticatePersonalSpotify()">🔐 Authenticate</button>
-                <button class="ps-btn ps-btn-danger" onclick="disconnectPersonalSpotify()">Remove</button>
-            </div>
-        `;
-    } else {
-        contentHtml = `
-            <div class="ps-form-group">
-                <label>Client ID</label>
-                <input type="text" id="ps-spotify-client-id" placeholder="Your Spotify Client ID">
-            </div>
-            <div class="ps-form-group">
-                <label>Client Secret</label>
-                <input type="password" id="ps-spotify-client-secret" placeholder="Your Spotify Client Secret">
-            </div>
-            <div class="ps-form-group">
-                <label>Redirect URI <span style="font-weight:400;color:rgba(255,255,255,0.3)">(optional)</span></label>
-                <input type="text" id="ps-spotify-redirect-uri" placeholder="http://127.0.0.1:8888/callback">
-                <div class="ps-help-text">
-                    Create an app at <a href="https://developer.spotify.com/dashboard" target="_blank">developer.spotify.com</a> and add the redirect URI
-                </div>
-            </div>
-            <div id="ps-spotify-result"></div>
-            <div class="ps-actions">
-                <button class="ps-btn ps-btn-primary" onclick="savePersonalSpotify()">Save Credentials</button>
-            </div>
-        `;
-    }
-
-    const section = document.createElement('div');
-    section.id = 'ps-spotify-section';
-    section.innerHTML = `
-        <div class="ps-section">
-            <div class="ps-section-header">
-                <h4 class="ps-section-title">Spotify</h4>
-                <span class="ps-connection-badge ${hasCreds ? 'connected' : 'disconnected'}">
-                    <span class="ps-connection-dot"></span>
-                    ${hasCreds ? 'Configured' : 'Not configured'}
-                </span>
-            </div>
-            <div class="ps-help-text" style="margin-bottom:12px;">
-                Connect your own Spotify account to see your playlists instead of the admin's.
-            </div>
-            ${contentHtml}
-        </div>
-    `;
-
-    const existing = document.getElementById('ps-spotify-section');
-    if (existing) existing.replaceWith(section);
-    else body.appendChild(section);
-}
-
-async function savePersonalSpotify() {
-    const clientId = document.getElementById('ps-spotify-client-id')?.value?.trim();
-    const clientSecret = document.getElementById('ps-spotify-client-secret')?.value?.trim();
-    const redirectUri = document.getElementById('ps-spotify-redirect-uri')?.value?.trim();
-    const resultEl = document.getElementById('ps-spotify-result');
-
-    if (!clientId || !clientSecret) {
-        if (resultEl) resultEl.innerHTML = '<div style="color:#ef4444;font-size:12px;margin-top:8px;">Client ID and Secret are required</div>';
-        return;
-    }
-
-    try {
-        const res = await fetch('/api/profiles/me/spotify', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ client_id: clientId, client_secret: clientSecret, redirect_uri: redirectUri })
-        });
-        const data = await res.json();
-        if (data.success) {
-            showToast('Spotify credentials saved', 'success');
-            openPersonalSettings(); // Reload to show connected state
-        } else {
-            if (resultEl) resultEl.innerHTML = `<div style="color:#ef4444;font-size:12px;margin-top:8px;">${data.error || 'Failed to save'}</div>`;
-        }
-    } catch (e) {
-        if (resultEl) resultEl.innerHTML = '<div style="color:#ef4444;font-size:12px;margin-top:8px;">Network error</div>';
-    }
-}
-
-async function authenticatePersonalSpotify() {
-    // Trigger OAuth flow with profile_id in state so callback knows which profile
-    window.open('/auth/spotify?profile_id=' + (currentProfile?.id || ''), '_blank');
-}
-
-function renderPersonalSettingsTidal(body) {
-    const section = document.createElement('div');
-    section.id = 'ps-tidal-section';
-    section.innerHTML = `
-        <div class="ps-section">
-            <div class="ps-section-header">
-                <h4 class="ps-section-title">Tidal</h4>
-            </div>
-            <div class="ps-help-text" style="margin-bottom:12px;">
-                Connect your own Tidal account to see your playlists. Uses the admin's Tidal app credentials.
-            </div>
-            <div class="ps-actions">
-                <button class="ps-btn ps-btn-primary" onclick="authenticatePersonalTidal()">🔐 Authenticate Tidal</button>
-            </div>
-        </div>
-    `;
-    const existing = document.getElementById('ps-tidal-section');
-    if (existing) existing.replaceWith(section);
-    else body.appendChild(section);
-}
-
-function authenticatePersonalTidal() {
-    window.open('/auth/tidal?profile_id=' + (currentProfile?.id || ''), '_blank');
-}
-
-async function renderPersonalSettingsServerLibrary(container, profileData) {
-    const section = document.createElement('div');
-    section.id = 'ps-server-library-section';
-
-    // Detect which server is active
-    let serverType = 'none';
-    let libraries = [];
-    let users = [];
-    const currentLib = profileData || {};
-
-    try {
-        // Try each server type to find the active one
-        const plexRes = await fetch('/api/plex/music-libraries');
-        if (plexRes.ok) {
-            const plexData = await plexRes.json();
-            if (plexData.libraries && plexData.libraries.length > 0) {
-                serverType = 'plex';
-                libraries = plexData.libraries;
-            }
-        }
-    } catch (e) { }
-
-    if (serverType === 'none') {
-        try {
-            const jellyRes = await fetch('/api/jellyfin/music-libraries');
-            if (jellyRes.ok) {
-                const jellyData = await jellyRes.json();
-                if (jellyData.libraries && jellyData.libraries.length > 0) {
-                    serverType = 'jellyfin';
-                    libraries = jellyData.libraries;
-                    users = jellyData.users || [];
-                }
-            }
-        } catch (e) { }
-    }
-
-    if (serverType === 'none') {
-        section.innerHTML = `
-            <div class="ps-section">
-                <div class="ps-section-header">
-                    <h4 class="ps-section-title">Media Server</h4>
-                </div>
-                <div class="ps-help-text">No media server connected. Ask your admin to configure Plex, Jellyfin, or Navidrome in Settings.</div>
-            </div>
-        `;
-    } else if (serverType === 'plex') {
-        const selectedLib = currentLib.plex_library_id || '';
-        const optionsHtml = libraries.map(lib => {
-            const name = lib.name || lib.title || lib;
-            const val = typeof lib === 'string' ? lib : (lib.name || lib.title);
-            return `<option value="${escapeHtml(val)}" ${val === selectedLib ? 'selected' : ''}>${escapeHtml(val)}</option>`;
-        }).join('');
-
-        section.innerHTML = `
-            <div class="ps-section">
-                <div class="ps-section-header">
-                    <h4 class="ps-section-title">Plex Library</h4>
-                    <span class="ps-connection-badge ${selectedLib ? 'connected' : 'disconnected'}">
-                        <span class="ps-connection-dot"></span>
-                        ${selectedLib ? 'Custom' : 'Default'}
-                    </span>
-                </div>
-                <div class="ps-help-text" style="margin-bottom:12px;">Choose which Plex music library your playlists sync to.</div>
-                <div class="ps-form-group">
-                    <label>Music Library</label>
-                    <select id="ps-plex-library-select">
-                        <option value="">Use admin default</option>
-                        ${optionsHtml}
-                    </select>
-                </div>
-                <div class="ps-actions">
-                    <button class="ps-btn ps-btn-primary" onclick="savePersonalServerLibrary()">Save</button>
-                </div>
-            </div>
-        `;
-    } else if (serverType === 'jellyfin') {
-        const selectedUser = currentLib.jellyfin_user_id || '';
-        const selectedLib = currentLib.jellyfin_library_id || '';
-
-        const userOpts = users.map(u => {
-            const uid = u.id || u.Id;
-            const uname = u.name || u.Name;
-            return `<option value="${escapeHtml(uid)}" ${uid === selectedUser ? 'selected' : ''}>${escapeHtml(uname)}</option>`;
-        }).join('');
-
-        const libOpts = libraries.map(lib => {
-            const lid = lib.key || lib.id || lib.Id;
-            const lname = lib.name || lib.Name || lib.title;
-            return `<option value="${escapeHtml(lid)}" ${lid === selectedLib ? 'selected' : ''}>${escapeHtml(lname)}</option>`;
-        }).join('');
-
-        section.innerHTML = `
-            <div class="ps-section">
-                <div class="ps-section-header">
-                    <h4 class="ps-section-title">Jellyfin</h4>
-                    <span class="ps-connection-badge ${selectedUser || selectedLib ? 'connected' : 'disconnected'}">
-                        <span class="ps-connection-dot"></span>
-                        ${selectedUser || selectedLib ? 'Custom' : 'Default'}
-                    </span>
-                </div>
-                <div class="ps-help-text" style="margin-bottom:12px;">Choose which Jellyfin user and library your playlists sync to.</div>
-                ${users.length ? `<div class="ps-form-group"><label>User</label><select id="ps-jellyfin-user-select"><option value="">Use admin default</option>${userOpts}</select></div>` : ''}
-                <div class="ps-form-group">
-                    <label>Music Library</label>
-                    <select id="ps-jellyfin-library-select">
-                        <option value="">Use admin default</option>
-                        ${libOpts}
-                    </select>
-                </div>
-                <div class="ps-actions">
-                    <button class="ps-btn ps-btn-primary" onclick="savePersonalServerLibrary()">Save</button>
-                </div>
-            </div>
-        `;
-    }
-
-    const existing = document.getElementById('ps-server-library-section');
-    if (existing) existing.replaceWith(section);
-    else container.appendChild(section);
-}
-
-async function savePersonalServerLibrary() {
-    try {
-        const plexSelect = document.getElementById('ps-plex-library-select');
-        const jellyUserSelect = document.getElementById('ps-jellyfin-user-select');
-        const jellyLibSelect = document.getElementById('ps-jellyfin-library-select');
-
-        if (plexSelect) {
-            await fetch('/api/profiles/me/server-library', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ server_type: 'plex', library_id: plexSelect.value || null })
-            });
-        }
-        if (jellyUserSelect || jellyLibSelect) {
-            await fetch('/api/profiles/me/server-library', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    server_type: 'jellyfin',
-                    user_id: jellyUserSelect?.value || null,
-                    library_id: jellyLibSelect?.value || null
-                })
-            });
-        }
-
-        showToast('Server library settings saved', 'success');
-    } catch (e) {
-        showToast('Error saving settings', 'error');
-    }
-}
-
-async function disconnectPersonalSpotify() {
-    try {
-        const res = await fetch('/api/profiles/me/spotify', { method: 'DELETE' });
-        const data = await res.json();
-        if (data.success) {
-            showToast('Spotify credentials removed — using shared config', 'info');
-            openPersonalSettings(); // Reload
-        }
-    } catch (e) {
-        showToast('Error removing credentials', 'error');
-    }
-}
-
-function renderPersonalSettingsLB(data, container) {
-    const body = container || document.getElementById('personal-settings-body');
-    const connected = data.connected;
-    const username = data.username || '';
-    const baseUrl = data.base_url || '';
-    const source = data.source || 'global';
-
-    const tokenFormHtml = `
-        <div class="ps-form-group">
-            <label>User Token</label>
-            <input type="password" id="ps-lb-token" placeholder="Paste your ListenBrainz token">
-        </div>
-        <div class="ps-form-group">
-            <label>Server URL <span style="font-weight:400;color:rgba(255,255,255,0.3)">(optional)</span></label>
-            <input type="text" id="ps-lb-base-url" placeholder="Leave empty for official (api.listenbrainz.org)">
-            <div class="ps-help-text">
-                Get your token from <a href="https://listenbrainz.org/profile/" target="_blank">listenbrainz.org/profile</a>
-            </div>
-        </div>
-        <div id="ps-lb-result"></div>
-        <div class="ps-actions">
-            <button class="ps-btn ps-btn-secondary" onclick="testPersonalListenBrainz()">Test</button>
-            <button class="ps-btn ps-btn-primary" onclick="connectPersonalListenBrainz()">Connect</button>
-        </div>
-    `;
-
-    let contentHtml;
-    if (connected && source === 'profile') {
-        // Personal token — show connected state with Disconnect
-        const serverDisplay = baseUrl ? baseUrl.replace(/\/1$/, '').replace(/^https?:\/\//, '') : 'api.listenbrainz.org';
-        contentHtml = `
-            <div class="ps-connected-info">
-                <div class="ps-connected-icon">&#129504;</div>
-                <div class="ps-connected-details">
-                    <div class="ps-connected-username">Connected as ${escapeHtml(username)}</div>
-                    <div class="ps-connected-server">${escapeHtml(serverDisplay)}</div>
-                    <div class="ps-connected-source">Personal token</div>
-                </div>
-            </div>
-            <div class="ps-actions">
-                <button class="ps-btn ps-btn-danger" onclick="disconnectPersonalListenBrainz()">Disconnect</button>
-            </div>
-        `;
-    } else if (connected && source === 'global') {
-        // Using admin's shared token — show status + option to set own token
-        const serverDisplay = baseUrl ? baseUrl.replace(/\/1$/, '').replace(/^https?:\/\//, '') : 'api.listenbrainz.org';
-        contentHtml = `
-            <div class="ps-connected-info">
-                <div class="ps-connected-icon">&#129504;</div>
-                <div class="ps-connected-details">
-                    <div class="ps-connected-username">Connected as ${escapeHtml(username)}</div>
-                    <div class="ps-connected-server">${escapeHtml(serverDisplay)}</div>
-                    <div class="ps-connected-source">Using shared token from Settings</div>
-                </div>
-            </div>
-            <div style="margin-top:14px;padding-top:14px;border-top:1px solid rgba(255,255,255,0.06);">
-                <div style="font-size:11px;color:rgba(255,255,255,0.45);margin-bottom:10px;">Set your own token to use a different ListenBrainz account:</div>
-                ${tokenFormHtml}
-            </div>
-        `;
-    } else {
-        // Not connected at all
-        contentHtml = tokenFormHtml;
-    }
-
-    const section = document.createElement('div');
-    section.id = 'ps-listenbrainz-section';
-    section.innerHTML = `
-        <div class="ps-section">
-            <div class="ps-section-header">
-                <h4 class="ps-section-title">ListenBrainz</h4>
-                <span class="ps-connection-badge ${connected ? 'connected' : 'disconnected'}">
-                    <span class="ps-connection-dot"></span>
-                    ${connected ? 'Connected' : 'Not connected'}
-                </span>
-            </div>
-            ${contentHtml}
-        </div>
-    `;
-    // Replace existing or append
-    const existing = document.getElementById('ps-listenbrainz-section');
-    if (existing) existing.replaceWith(section);
-    else body.appendChild(section);
-}
-
-async function testPersonalListenBrainz() {
-    const token = document.getElementById('ps-lb-token')?.value?.trim();
-    const baseUrl = document.getElementById('ps-lb-base-url')?.value?.trim() || '';
-    const resultEl = document.getElementById('ps-lb-result');
-    if (!token) {
-        if (resultEl) resultEl.innerHTML = '<div class="ps-inline-result error">Please enter a token</div>';
-        return;
-    }
-    if (resultEl) resultEl.innerHTML = '<div class="ps-inline-result" style="color:rgba(255,255,255,0.5);">Testing...</div>';
-    try {
-        const res = await fetch('/api/profiles/me/listenbrainz/test', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ token, base_url: baseUrl })
-        });
-        const data = await res.json();
-        if (data.success) {
-            resultEl.innerHTML = `<div class="ps-inline-result success">Valid token — ${escapeHtml(data.username)}</div>`;
-        } else {
-            resultEl.innerHTML = `<div class="ps-inline-result error">${escapeHtml(data.error || 'Invalid token')}</div>`;
-        }
-    } catch (e) {
-        resultEl.innerHTML = '<div class="ps-inline-result error">Connection failed</div>';
-    }
-}
-
-async function connectPersonalListenBrainz() {
-    const token = document.getElementById('ps-lb-token')?.value?.trim();
-    const baseUrl = document.getElementById('ps-lb-base-url')?.value?.trim() || '';
-    const resultEl = document.getElementById('ps-lb-result');
-    if (!token) {
-        if (resultEl) resultEl.innerHTML = '<div class="ps-inline-result error">Please enter a token</div>';
-        return;
-    }
-    // Disable buttons during connect
-    document.querySelectorAll('.ps-actions .ps-btn').forEach(b => b.disabled = true);
-    if (resultEl) resultEl.innerHTML = '<div class="ps-inline-result" style="color:rgba(255,255,255,0.5);">Connecting...</div>';
-    try {
-        const res = await fetch('/api/profiles/me/listenbrainz', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ token, base_url: baseUrl })
-        });
-        const data = await res.json();
-        if (data.success) {
-            showToast(`Connected to ListenBrainz as ${data.username}`, 'success');
-            // Re-render as connected
-            renderPersonalSettingsLB({ connected: true, username: data.username, base_url: baseUrl, source: 'profile' });
-            // Refresh LB playlists on discover page
-            _invalidateListenBrainzCache();
-            if (typeof initializeListenBrainzTabs === 'function') {
-                initializeListenBrainzTabs();
-            }
-        } else {
-            resultEl.innerHTML = `<div class="ps-inline-result error">${escapeHtml(data.error || 'Connection failed')}</div>`;
-            document.querySelectorAll('.ps-actions .ps-btn').forEach(b => b.disabled = false);
-        }
-    } catch (e) {
-        resultEl.innerHTML = '<div class="ps-inline-result error">Connection failed</div>';
-        document.querySelectorAll('.ps-actions .ps-btn').forEach(b => b.disabled = false);
-    }
-}
-
-async function disconnectPersonalListenBrainz() {
-    try {
-        await fetch('/api/profiles/me/listenbrainz', { method: 'DELETE' });
-        showToast('ListenBrainz disconnected', 'info');
-        // Re-render as disconnected — re-fetch to check if global fallback exists
-        const res = await fetch('/api/profiles/me/listenbrainz');
-        const data = await res.json();
-        renderPersonalSettingsLB(data);
-        // Refresh LB playlists on discover page
-        _invalidateListenBrainzCache();
-        if (typeof initializeListenBrainzTabs === 'function') {
-            initializeListenBrainzTabs();
-        }
-    } catch (e) {
-        showToast('Failed to disconnect', 'error');
-    }
-}
-
 function _invalidateListenBrainzCache() {
     if (typeof listenbrainzPlaylistsLoaded !== 'undefined') listenbrainzPlaylistsLoaded = false;
     if (typeof listenbrainzPlaylistsCache !== 'undefined') {
@@ -2013,6 +1517,8 @@ const PROFILE_PAGE_LABELS = {
     tools: 'Tools',
     hydrabase: 'Hydrabase',
     issues: 'Issues',
+    podcasts: 'Podcasts',
+    audiobooks: 'Audiobooks',
     help: 'Help & Docs',
     settings: 'Settings',
     'artist-detail': 'Artist Detail',
@@ -2335,6 +1841,11 @@ async function loadProfileManageList() {
         editBtn.dataset.allowedPages = p.allowed_pages ? JSON.stringify(p.allowed_pages) : '';
         editBtn.dataset.canDownload = p.can_download !== false ? '1' : '0';
         editBtn.dataset.isAdmin = p.is_admin ? '1' : '0';
+        editBtn.dataset.librarySupported = data.own_library_supported === false ? '0' : '1';
+        editBtn.dataset.libraryAvailable = data.own_library_available === false ? '0' : '1';
+        editBtn.dataset.libraryMode = p.library_mode || 'shared';
+        editBtn.dataset.libraryRoot = p.library_root || '';
+        editBtn.dataset.libraryHint = (data.own_library_root_hint || '').replace('<name>', (p.name || 'profile').toLowerCase().replace(/[^a-z0-9]+/g, '-'));
         editBtn.title = 'Edit profile';
         editBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>';
         actions.appendChild(editBtn);
@@ -2373,7 +1884,12 @@ async function loadProfileManageList() {
                 home_page: btn.dataset.homePage || '',
                 allowed_pages: btn.dataset.allowedPages ? JSON.parse(btn.dataset.allowedPages) : null,
                 can_download: btn.dataset.canDownload !== '0',
-                is_admin: btn.dataset.isAdmin === '1'
+                is_admin: btn.dataset.isAdmin === '1',
+                library_supported: btn.dataset.librarySupported !== '0',
+                library_available: btn.dataset.libraryAvailable !== '0',
+                library_mode: btn.dataset.libraryMode || 'shared',
+                library_root: btn.dataset.libraryRoot || '',
+                library_hint: btn.dataset.libraryHint || ''
             });
         };
     });
@@ -2570,6 +2086,8 @@ function showProfileEditForm(profileId, currentName, currentColor, currentAvatar
     // Admin-only settings: side access, allowed pages & can_download
     let pageCheckboxes = [];
     let canDlCheckbox = null;
+    let ownLibCheckbox = null;
+    let ownLibRootInput = null;
     let selectedSides = null;
     if (isAdmin && !isEditingAdmin) {
         // Side access — music | video | both, never nothing.
@@ -2628,8 +2146,72 @@ function showProfileEditForm(profileId, currentName, currentColor, currentAvatar
         canDlCheckbox.type = 'checkbox';
         canDlCheckbox.checked = profileSettings.can_download !== false;
         dlLabel.appendChild(canDlCheckbox);
-        dlLabel.appendChild(document.createTextNode(' Can download music'));
+        dlLabel.appendChild(document.createTextNode(' Can download (music, podcasts, audiobooks & video)'));
         form.appendChild(dlLabel);
+
+        // own library (#1199): this profile's downloads go to its own folder
+        // and the library it picked on the server, not the shared one
+        const olLabel = document.createElement('label');
+        olLabel.className = 'profile-checkbox-label';
+        ownLibCheckbox = document.createElement('input');
+        ownLibCheckbox.type = 'checkbox';
+        ownLibCheckbox.checked = profileSettings.library_mode === 'own';
+        // parked beats unsupported in the message: the server can be the right
+        // one and the feature still be off, and a control that cannot succeed
+        // has to say so rather than fail on save
+        const libParked = profileSettings.library_available === false;
+        ownLibCheckbox.disabled = libParked
+            || (profileSettings.library_supported === false && !ownLibCheckbox.checked);
+        olLabel.appendChild(ownLibCheckbox);
+        olLabel.appendChild(document.createTextNode(
+            libParked ? ' Own library (not available in this build yet)'
+            : profileSettings.library_supported === false
+            ? ' Own library (requires Plex or Jellyfin)'
+            : ' Own library (separate output folder + their own server library)'));
+        form.appendChild(olLabel);
+
+        let olWarn = null;
+        if (profileSettings.library_supported === false && ownLibCheckbox.checked) {
+            olWarn = document.createElement('div');
+            olWarn.className = 'profile-own-library-inactive-warning';
+            olWarn.style.cssText = 'margin: 6px 0 10px 0; padding: 8px 12px; background: rgba(245, 158, 11, 0.12); border: 1px solid rgba(245, 158, 11, 0.35); border-radius: 6px; font-size: 12px; color: #f59e0b; line-height: 1.4;';
+            olWarn.innerHTML = '⚠️ <strong>Inactive on current media server:</strong> Own libraries require Plex or Jellyfin. While Navidrome or Standalone is active, downloads for this profile will route to the shared library folder.';
+            form.appendChild(olWarn);
+        }
+
+        // the folder: prefilled with the install's expected path (a mount
+        // under /app/libraries/<name>, see docker-compose.yml); outside docker
+        // the admin corrects it, and a folder that is not there is refused on save
+        const olField = document.createElement('div');
+        olField.className = 'profile-folder-field';
+        olField.style.display = ownLibCheckbox.checked ? '' : 'none';
+        const olFieldLabel = document.createElement('label');
+        olFieldLabel.className = 'profile-settings-label';
+        olFieldLabel.textContent = 'Output folder';
+        olField.appendChild(olFieldLabel);
+        const olWrap = document.createElement('div');
+        olWrap.className = 'profile-folder-input';
+        olWrap.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>';
+        ownLibRootInput = document.createElement('input');
+        ownLibRootInput.type = 'text';
+        ownLibRootInput.spellcheck = false;
+        ownLibRootInput.autocomplete = 'off';
+        ownLibRootInput.placeholder = profileSettings.library_hint || '/app/libraries/name';
+        ownLibRootInput.value = profileSettings.library_root || profileSettings.library_hint || '';
+        olWrap.appendChild(ownLibRootInput);
+        olField.appendChild(olWrap);
+        const olHelp = document.createElement('div');
+        olHelp.className = 'profile-settings-help';
+        olHelp.textContent = 'Docker: mount this folder in docker-compose.yml (see the Per-profile libraries example). Not Docker: change it to a real folder. Then point a second music library on your Plex or Jellyfin server at it and have the profile pick that library under My Account.';
+        olField.appendChild(olHelp);
+        form.appendChild(olField);
+        ownLibCheckbox.addEventListener('change', () => {
+            olField.style.display = ownLibCheckbox.checked ? '' : 'none';
+            if (olWarn) olWarn.style.display = ownLibCheckbox.checked ? '' : 'none';
+            if (profileSettings.library_supported === false && !ownLibCheckbox.checked) {
+                ownLibCheckbox.disabled = true;
+            }
+        });
     }
 
     const btnRow = document.createElement('div');
@@ -2654,6 +2236,11 @@ function showProfileEditForm(profileId, currentName, currentColor, currentAvatar
             payload.allowed_pages = allChecked ? null : editablePageCheckboxes.filter(cb => cb.checked).map(cb => cb.value);
             payload.can_download = canDlCheckbox ? canDlCheckbox.checked : true;
             if (selectedSides) payload.allowed_sides = selectedSides;
+            if (ownLibCheckbox) {
+                payload.library_mode = ownLibCheckbox.checked ? 'own' : 'shared';
+                payload.library_root = ownLibCheckbox.checked ? (ownLibRootInput.value || '').trim() : '';
+                if (ownLibCheckbox.checked && !payload.library_root) { alert('An own library needs an output folder'); return; }
+            }
         }
 
         try {
@@ -2716,7 +2303,7 @@ function showSelfEditForm() {
     const pageLabels = {
         dashboard: 'Dashboard', sync: 'Sync', search: 'Search', discover: 'Discover',
         automations: 'Automations', library: 'Library', stats: 'Listening Stats',
-        'playlist-explorer': 'Playlist Explorer', import: 'Import', help: 'Help & Docs'
+        'playlist-explorer': 'Playlist Explorer', import: 'Import', podcasts: 'Podcasts', help: 'Help & Docs'
     };
 
     const form = document.createElement('div');
@@ -2882,7 +2469,7 @@ async function checkAdminPinRequired() {
 // localhost).
 if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => {
-        navigator.serviceWorker.register('/sw.js', { scope: '/' })
+        navigator.serviceWorker.register(window.SoulSyncURL?.resolve('/sw.js') || '/sw.js', { scope: window.SoulSyncURL?.resolve('/') || '/' })
             .catch((err) => console.warn('[SW] registration failed:', err));
     });
 }
@@ -3017,23 +2604,31 @@ function initializeNavigation() {
 
 const _DEEPLINK_VALID_PAGES = new Set([
     'dashboard', 'sync', 'search', 'discover', 'automations',
-    'library', 'import', 'settings', 'help', 'issues', 'stats', 'watchlist',
+    // iss29-B07: '/library-v2' is a live alias that redirects to '/library'
+    // (query string preserved). It was missing here, so this fallback resolved
+    // a bookmark to it as 'dashboard'. React usually wins the race and the
+    // right page appears anyway — which is exactly what makes the gap easy to
+    // miss and unreliable to depend on.
+    'library', 'library-v2', 'import', 'settings', 'help', 'issues', 'stats', 'watchlist',
     'wishlist', 'active-downloads', 'artist-detail', 'playlist-explorer',
-    'hydrabase', 'tools', 'chat'
+    'hydrabase', 'tools', 'chat', 'podcasts', 'audiobooks'
 ]);
 
 function _getPageFromPath() {
     const router = getWebRouter();
-    const resolved = router?.resolvePageId?.(window.location.pathname);
+    const resolved = router?.resolvePageId?.((window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname));
     if (resolved) return resolved;
 
-    const path = window.location.pathname.replace(/^\/+|\/+$/g, '');
+    const path = (window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname).replace(/^\/+|\/+$/g, '');
     if (!path) return 'dashboard';
     const segs = path.split('/');
     const basePage = segs[0];
     if (!_DEEPLINK_VALID_PAGES.has(basePage)) return 'dashboard';
     // Context-dependent pages fall back to a sensible parent
     if (basePage === 'playlist-explorer') return 'library';
+    // The alias and its target are the same page as far as the shell chrome
+    // is concerned (iss29-B07).
+    if (basePage === 'library-v2') return 'library';
     return basePage;
 }
 
@@ -3057,7 +2652,7 @@ function buildArtistDetailPath(artistId, source = null, name = null) {
     return path;
 }
 
-function parseArtistDetailPath(pathname = window.location.pathname) {
+function parseArtistDetailPath(pathname = (window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname)) {
     const segs = String(pathname || '').split('/').filter(Boolean);
     if (segs[0] !== 'artist-detail' || segs.length < 3) return null;
 
@@ -3122,18 +2717,31 @@ function initializeMobileNavigation() {
 
     if (!hamburgerBtn || !sidebar || !overlay) return;
 
+    // One explicit state: the drawer is open only because someone opened it at
+    // a mobile width. It is not a width, and it is not carried over from the
+    // desktop layout.
     function openMobileNav() {
         sidebar.classList.add('mobile-open');
         hamburgerBtn.classList.add('active');
+        hamburgerBtn.setAttribute('aria-expanded', 'true');
+        hamburgerBtn.setAttribute('aria-label', 'Close navigation');
         overlay.classList.add('active');
         document.body.classList.add('mobile-nav-open');
+        // Focus moves into the drawer so a keyboard isn't left behind the
+        // backdrop, and Escape below puts it back on the opener.
+        const first = sidebar.querySelector('.nav-button, a[href], button:not([disabled])');
+        if (first) first.focus();
     }
 
-    function closeMobileNav() {
+    function closeMobileNav(restoreFocus) {
+        const wasOpen = sidebar.classList.contains('mobile-open');
         sidebar.classList.remove('mobile-open');
         hamburgerBtn.classList.remove('active');
+        hamburgerBtn.setAttribute('aria-expanded', 'false');
+        hamburgerBtn.setAttribute('aria-label', 'Open navigation');
         overlay.classList.remove('active');
         document.body.classList.remove('mobile-nav-open');
+        if (wasOpen && restoreFocus === true) hamburgerBtn.focus();
     }
 
     hamburgerBtn.addEventListener('click', () => {
@@ -3144,7 +2752,33 @@ function initializeMobileNavigation() {
         }
     });
 
-    overlay.addEventListener('click', closeMobileNav);
+    overlay.addEventListener('click', () => closeMobileNav());
+
+    document.addEventListener('keydown', (event) => {
+        if (event.key !== 'Escape') return;
+        if (!sidebar.classList.contains('mobile-open')) return;
+        closeMobileNav(true);
+    });
+
+    // Crossing the breakpoint. Going desktop -> mobile the drawer defaults
+    // CLOSED: nobody asked for it, and the drawer's slide transition made the
+    // flip paint a half-open panel over the page. Going mobile -> desktop we
+    // just drop the mobile-only classes; the collapse preference lives in
+    // html[data-sidebar] and is untouched by any of this.
+    const mobileQuery = window.matchMedia ? window.matchMedia('(max-width: 768px)') : null;
+    if (mobileQuery) {
+        const onBreakpoint = () => {
+            // Kill the slide for one frame, so the layout change itself never
+            // animates across the viewport.
+            sidebar.classList.add('sidebar-no-transition');
+            closeMobileNav();
+            requestAnimationFrame(() => {
+                requestAnimationFrame(() => sidebar.classList.remove('sidebar-no-transition'));
+            });
+        };
+        if (mobileQuery.addEventListener) mobileQuery.addEventListener('change', onBreakpoint);
+        else if (mobileQuery.addListener) mobileQuery.addListener(onBreakpoint);
+    }
 
     // Backstop for the overlay click above: the overlay is one element at a
     // fixed z-index, so anything that paints over it swallows the tap and the
@@ -3239,7 +2873,7 @@ function toggleNavSection(label) {
 function restoreNavSections() {
     let saved = {};
     try { saved = JSON.parse(localStorage.getItem('navSections') || '{}'); } catch (e) { saved = {}; }
-    const path = window.location.pathname;
+    const path = (window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname);
     document.querySelectorAll('.nav-section-label').forEach(label => {
         // Expanded by default; collapsed only when the user explicitly collapsed it.
         let collapsed = saved[label.dataset.section] === true;
@@ -3478,7 +3112,7 @@ function navigateToPage(pageId, options = {}) {
             : (pageId === 'artist-detail' && options.artistId) ? buildArtistDetailPath(options.artistId, options.artistSource, options.artistName)
             : (pageId === 'label-detail' && options.labelId) ? buildLabelDetailPath(options.labelId, options.labelName)
             : '/' + pageId;
-        if (window.location.pathname !== urlPath) {
+        if ((window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname) !== urlPath) {
             if (options.replace === true) {
                 history.replaceState({ page: pageId }, '', urlPath);
             } else {
@@ -3776,7 +3410,7 @@ async function loadPageData(pageId) {
  */
 async function loadInitialData() {
     try {
-        const initialPath = window.location.pathname;
+        const initialPath = (window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname);
         const initialNavigationEpoch = navigationEpoch;
 
         // Snapshot hydration is best-effort chrome — bubbles and the discover
@@ -3824,7 +3458,7 @@ async function loadInitialData() {
         // was blank until you navigated by hand. Desktop wins that race and
         // never sees it; a phone is slow enough to lose it. A redirect only
         // answers the question startup was already asking, so adopt it.
-        if (window.location.pathname !== initialPath) {
+        if ((window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname) !== initialPath) {
             const redirectedPage = _getPageFromPath();
             if (redirectedPage && isPageAllowed(redirectedPage)) {
                 targetPage = redirectedPage;

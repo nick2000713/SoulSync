@@ -45,6 +45,35 @@ class WishlistService:
             source_context: Additional context (playlist name, album info, etc.)
         """
         try:
+            # Reject podcasts from music wishlist
+            _is_pod = False
+            if source_type == "podcast":
+                _is_pod = True
+            elif isinstance(track_info, dict) and (
+                track_info.get("download_source") == "Podcast"
+                or track_info.get("origin") == "podcast"
+                or track_info.get("batch_id") == "podcasts"
+                or track_info.get("playlist_id") == "podcasts"
+            ):
+                _is_pod = True
+            elif isinstance(source_context, dict) and (
+                source_context.get("source_page") == "Podcasts"
+                or source_context.get("playlist_id") == "podcasts"
+            ):
+                _is_pod = True
+            elif isinstance(source_context, str) and (
+                '"source_page": "Podcasts"' in source_context
+                or '"playlist_id": "podcasts"' in source_context
+            ):
+                _is_pod = True
+
+            if _is_pod:
+                logger.info(
+                    "Skipping wishlist addition for podcast item: %s",
+                    track_info.get("track_name") if isinstance(track_info, dict) else "",
+                )
+                return False
+
             # Extract track data from the modal structure.
             track_data = extract_wishlist_track_from_modal_info(track_info)
             if not track_data:
@@ -163,7 +192,7 @@ class WishlistService:
             logger.error("No track data provided for wishlist add")
             return self.database._wishlist_outcome("rejected", reason="no track data")
 
-        return self.database.add_to_wishlist_detailed(
+        outcome = self.database.add_to_wishlist_detailed(
             track_data=track_data,
             failure_reason=failure_reason,
             source_type=source_type,
@@ -172,6 +201,24 @@ class WishlistService:
             user_initiated=user_initiated,
             quality_profile_id=quality_profile_id,
         )
+        if outcome.get("applied"):
+            # dd28-12: the Wishlist→lib2 edge only existed for REMOVALS. A
+            # track queued here (failed-download dialog, retry logic, Artist
+            # Enhance) that maps onto a lib2 row but owns no lib2 rule making
+            # it wanted landed in the hourly reconciler's prune set and was
+            # dropped again within the hour — so it silently stopped being
+            # retried, the exact opposite of what queueing it meant.
+            try:
+                from core.settings import config_manager
+                from core.library2.monitor_sync import sync_wishlist_addition
+                sync_wishlist_addition(
+                    self.database, config_manager,
+                    [{"track_data": track_data, "source_info": source_context or {}}],
+                    profile_id=profile_id,
+                )
+            except Exception as exc:  # noqa: BLE001 - never fail the add
+                logger.debug("wishlist→library monitor sync skipped: %s", exc)
+        return outcome
 
     def add_spotify_track_to_wishlist(
         self,
@@ -297,6 +344,9 @@ class WishlistService:
         success: bool,
         error_message: str = None,
         profile_id: int = 1,
+        *,
+        profile_ids=None,
+        audit=None,
     ) -> bool:
         """
         Mark the result of a download attempt for a wishlist track.
@@ -306,8 +356,16 @@ class WishlistService:
             success: Whether the download was successful
             error_message: Error message if failed
             profile_id: Profile to scope the operation to
+            profile_ids: On success, the exact profiles whose library now holds
+                the file — those rows and no others are removed. None keeps the
+                historical all-profiles sweep for callers that cannot tell.
+            audit: Optional ``{reason, final_path, batch_id, source}`` recorded
+                alongside the removal so "why did this track vanish?" is a query
+                rather than a log-correlation exercise (#1289).
         """
-        return self.database.update_wishlist_retry(spotify_track_id, success, error_message, profile_id=profile_id)
+        return self.database.update_wishlist_retry(
+            spotify_track_id, success, error_message, profile_id=profile_id,
+            profile_ids=profile_ids, audit=audit)
 
     def remove_track_from_wishlist(self, spotify_track_id: str, profile_id: int = 1) -> bool:
         """Remove a track from the wishlist (typically after successful download)"""

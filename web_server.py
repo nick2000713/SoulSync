@@ -45,7 +45,7 @@ logger = setup_logging(_log_level, _log_path)
 
 # App version — single source of truth for backup metadata, system-info, update check, etc.
 # Semver: MAJOR.MINOR.PATCH. Bump at each dev→main release.
-_SOULSYNC_BASE_VERSION = "3.3.2"
+_SOULSYNC_BASE_VERSION = "3.4.6"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -139,6 +139,7 @@ from core.wishlist.processing import (
     cleanup_wishlist_against_library as _cleanup_wishlist_against_library,
     build_wishlist_source_context as _build_wishlist_source_context,
     finalize_auto_wishlist_completion as _finalize_auto_wishlist_completion,
+    start_direct_track_download_batch as _start_direct_track_download_batch,
     start_manual_wishlist_download_batch as _start_manual_wishlist_download_batch,
     process_wishlist_automatically as _process_wishlist_automatically_impl,
     recover_uncaptured_failed_tracks as _recover_uncaptured_failed_tracks,
@@ -189,6 +190,8 @@ from core.metadata.source import (
     mb_release_detail_cache_lock,
     normalize_album_cache_key,
 )
+from core import direct_download_state
+from core.downloads import music_video as _music_video
 from core import runtime_state as _rt_state
 from core.runtime_state import (
     activity_feed,
@@ -237,6 +240,7 @@ from core.tidal_worker import TidalWorker
 from core.qobuz_worker import QobuzWorker
 from core.hydrabase_worker import HydrabaseWorker
 from core.amazon_worker import AmazonWorker
+from core.amazon_outage import amazon_enrichment_should_run as _amazon_enrichment_should_run
 from core.hydrabase_client import HydrabaseClient
 from core.automation_engine import AutomationEngine
 
@@ -311,6 +315,83 @@ app.jinja_env.auto_reload = DEV_STATIC_NO_CACHE
 # In dev, DEV_STATIC_NO_CACHE flips this back to 0 so iterating on JS
 # / CSS doesn't require a server restart between edits.
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0 if DEV_STATIC_NO_CACHE else 31536000
+
+_MIGRATION_BLOCKED_ENDPOINTS = frozenset({
+    'start_download', 'start_matched_download', 'process_wishlist_api',
+    'start_wishlist_missing_downloads', 'start_playlist_missing_downloads',
+    'start_missing_downloads', 'start_database_update', 'start_watchlist_scan',
+    'update_similar_artists_endpoint', 'start_metadata_update', 'repair_job_run',
+    'repair_finding_fix', 'repair_findings_bulk_fix',
+    'repair_findings_bulk_fix_start', 'import_album_process',
+    'import_singles_process', 'start_duplicate_cleaner', 'start_popularity_backfill',
+    'listening_stats_sync', 'start_sync', 'start_playlist_sync',
+    'start_tidal_sync', 'start_deezer_sync', 'start_qobuz_sync',
+    'start_spotify_public_sync', 'start_itunes_link_sync', 'start_youtube_sync',
+    'start_listenbrainz_sync', 'start_beatport_sync',
+    'start_tidal_discovery', 'start_deezer_discovery', 'start_qobuz_discovery',
+    'start_spotify_public_discovery', 'start_itunes_link_discovery',
+    'start_youtube_discovery', 'start_listenbrainz_discovery',
+    'start_beatport_discovery', 'retry_failed_mirrored_discovery',
+    'run_mirrored_playlist_pipeline_endpoint', 'start_missing_tracks_process',
+    'rebuild_playlist_materialization_endpoint', 'download_music_video',
+    'clear_quarantine', 'approve_quarantine_item', 'approve_verification_item',
+    'delete_verification_item', 'deezer_download_test_download',
+    'clean_orphan_verification_items', 'recover_quarantine_item',
+    'delete_download_origins', 'write_artist_image_to_disk',
+    'set_album_art', 'set_artist_art', 'enhance_artist_quality',
+    'reorganize_album_files', 'reorganize_all_artist_albums',
+    'library_enrich_entity',
+    'download_selected_candidate', 'manual_search_for_task',
+    'request_media_scan', 'download_discography',
+    'library_import_existing_track_for_missing_slot',
+    'redownload_search_sources', 'redownload_start',
+    'refresh_spotify_library', 'enrich_similar_artists', 'wing_it_sync',
+    'enrich_beatport_tracks', 'repair_toggle', 'repair_resume',
+    'repair_job_toggle', 'auto_import_approve', 'auto_import_scan_now',
+    'auto_import_approve_all',
+    'auto_import_toggle', 'hydrabase_worker_resume',
+    'cleanup_wishlist', 'backup_database_endpoint', 'restore_backup_endpoint',
+    'database_vacuum', 'enable_incremental_vacuum', 'metadata_cache_evict',
+    'metadata_cache_save_mb_match', 'server_playlist_align',
+    'server_playlist_replace_track', 'server_playlist_add_track',
+    'server_playlist_remove_track', 'start_playlist_export_listenbrainz',
+    'start_playlist_export_service', 'watchlist_all_unwatched_library_artists',
+    'refresh_discover_data', 'refresh_seasonal_content',
+    'personalized_refresh_playlist', 'refresh_your_artists',
+    'refresh_your_albums', 'refresh_listenbrainz', 'lastfm_radio_generate',
+    'extract_beatport_chart_tracks', 'scrape_beatport_releases',
+    'mirror_playlist_endpoint',
+    'run_automation_endpoint',
+    'reconcile_embedded_ids',
+    'enrichment_api.enrichment_resume', 'enrichment_api.enrichment_retry',
+    'enrichment_api.enrichment_retry_all_failed',
+})
+
+
+@app.before_request
+def _hold_catalogue_jobs_during_upgrade():
+    lib2_write = (request.path.startswith('/api/library/v2/')
+                  and request.endpoint != 'lib2_import')
+    # Every unsafe HTTP verb can mutate the catalogue.  The old POST-only
+    # check left PATCH/PUT/DELETE live during the snapshot import, allowing a
+    # user edit or delete to race with (and then be resurrected by) migration.
+    from core.library2.migration_gate import endpoint_is_blocked, request_can_mutate
+    if (not request_can_mutate(request.method)
+            or (not endpoint_is_blocked(request.endpoint, _MIGRATION_BLOCKED_ENDPOINTS)
+                and not lib2_write)):
+        return None
+    try:
+        from core.library2.migration_gate import migration_required
+        blocked = migration_required(get_database())
+    except Exception as exc:  # fail closed: a half-known migration state is not writable
+        logger.warning("Could not verify Library v2 upgrade barrier: %s", exc)
+        blocked = True
+    if blocked:
+        return jsonify({
+            'success': False,
+            'error': 'Library upgrade in progress; this job will be available when it finishes.',
+        }), 409
+    return None
 
 
 # Cache-bust query string for static assets. Computed once per process
@@ -424,19 +505,16 @@ def _initial_appearance_context():
 
 @app.context_processor
 def _inject_static_cache_bust():
-    static_v = _STATIC_CACHE_BUST
-    if DEV_STATIC_NO_CACHE:
-        try:
-            static_dir = Path(app.static_folder)
-            mtimes = [
-                p.stat().st_mtime_ns
-                for p in static_dir.rglob('*')
-                if p.is_file() and p.suffix.lower() in {'.css', '.js'}
-            ]
-            if mtimes:
-                static_v = str(max(mtimes))
-        except Exception:
-            static_v = _STATIC_CACHE_BUST
+    try:
+        static_dir = Path(app.static_folder)
+        mtimes = [
+            p.stat().st_mtime_ns
+            for p in static_dir.rglob('*')
+            if p.is_file() and p.suffix.lower() in {'.css', '.js'}
+        ]
+        static_v = str(max(mtimes)) if mtimes else _STATIC_CACHE_BUST
+    except Exception:
+        static_v = _STATIC_CACHE_BUST
     return {'static_v': static_v, **_initial_appearance_context()}
 
 
@@ -481,6 +559,10 @@ from core.socketio_cors import (
 )
 _socketio_cors_origins = _resolve_socketio_cors_origins(config_manager)
 socketio = SocketIO(app, async_mode='threading', cors_allowed_origins=_socketio_cors_origins)
+
+# Wrap Socket.IO as well as Flask; set before serving any requests.
+from core.url_base import configure_url_base
+configure_url_base(app, os.environ.get("SOULSYNC_URL_BASE", ""))
 _log_socketio_startup_status(_socketio_cors_origins, logger)
 _socketio_rejection_logger = _SocketIORejectionLogger(logger)
 set_activity_toast_emitter(socketio.emit)
@@ -546,11 +628,23 @@ _launch_pin_limiter = _AttemptLimiter(max_attempts=10, window_seconds=300)
 from api.login import login_limiter as _login_limiter
 
 
+_last_known_require_login: bool = False
+
+
 def _require_login_enabled():
+    global _last_known_require_login
     try:
-        return bool(config_manager.get('security.require_login', False)) if config_manager else False
-    except Exception:
-        return False
+        if config_manager is None:
+            return _last_known_require_login
+        val = bool(config_manager.get('security.require_login', False))
+        _last_known_require_login = val
+        return val
+    except Exception as e:
+        logger.warning(
+            "[_require_login_enabled] config read failed, falling back to last known (%s): %s",
+            _last_known_require_login, e
+        )
+        return _last_known_require_login
 
 
 # --- Login gate (opt-in username/password mode; replaces the launch PIN) ---
@@ -568,6 +662,10 @@ def _enforce_login():
         require_login=True,
         authenticated=bool(session.get('login_authenticated', False)),
     ):
+        logger.warning(
+            "[Login Gate] Blocked unauthenticated %s request to %s",
+            request.method, request.path
+        )
         if is_html_navigation(request.method, request.headers.get('Accept', ''),
                               request.headers.get('Sec-Fetch-Mode', '')):
             return redirect('/')
@@ -629,15 +727,35 @@ def _enforce_launch_pin():
 def _set_profile_context():
     """Set g.profile_id from session for every request"""
     g.request_start_monotonic = time.perf_counter()
-    # Skip for profile management, static, and root routes
-    path = request.path
-    if (path.startswith('/api/profiles') or
-        path.startswith('/static/') or
-        path == '/' or
-        path.startswith('/api/v1/')):
-        g.profile_id = session.get('profile_id', 1)
+    g.request_start_cpu = time.thread_time()
+
+    # 1. Login mode: unauthenticated sessions have NO profile or admin rights (#GHSA-j7g5-8j44-jqhm).
+    if _require_login_enabled() and not session.get('login_authenticated', False):
+        g.profile_id = None
+        g.is_admin = False
+        g.can_download = False
+        g.profile_name = "Anonymous"
+        g.allowed_sides = 'none'
         return
 
+    # 2. Launch PIN mode: unverified sessions have NO profile or admin rights (#GHSA-j7g5-8j44-jqhm).
+    try:
+        require_pin = bool(config_manager.get('security.require_pin_on_launch', False)) if config_manager else False
+    except Exception:
+        require_pin = False
+    if require_pin and not _require_login_enabled():
+        _proxy_header = (config_manager.get('security.auth_proxy_header', '') or '') if config_manager else ''
+        from core.security.auth_proxy import trusted_proxy_user
+        _proxy_authed = bool(trusted_proxy_user(request.headers.get, _proxy_header))
+        if not session.get('launch_pin_verified', False) and not _proxy_authed:
+            g.profile_id = None
+            g.is_admin = False
+            g.can_download = False
+            g.profile_name = "Locked"
+            g.allowed_sides = 'none'
+            return
+
+    path = request.path
     pid = session.get('profile_id', 1)
 
     # Validate session profile still exists (handles deleted profiles), and stash
@@ -645,8 +763,24 @@ def _set_profile_context():
     # music-DB read. Admin (1) is always allowed.
     g.can_download = True
     g.profile_name = "Admin"   # display name for isolated blueprints (video issues reporter)
-    g.is_admin = True          # profile 1 is always admin; others per their is_admin flag
+    g.is_admin = (pid == 1)    # profile 1 is always admin; others per their is_admin flag
     g.allowed_sides = 'both'   # per-profile side access (music|video|both); admins always both
+
+    # Skip DB validation for profile management, static, and root routes
+    if (path.startswith('/api/profiles') or
+        path.startswith('/static/') or
+        path == '/' or
+        path.startswith('/api/v1/')):
+        g.profile_id = pid
+        if pid != 1 and 'profile_id' in session:
+            try:
+                database = get_database()
+                profile = database.get_profile(pid)
+                g.is_admin = bool((profile or {}).get('is_admin', False))
+            except Exception:
+                g.is_admin = False
+        return
+
     if pid != 1 and 'profile_id' in session:
         g.is_admin = False
         try:
@@ -683,12 +817,18 @@ def _log_slow_request(response):
         elapsed_ms = (time.perf_counter() - start) * 1000
         slow_threshold_ms = 1000.0
         if elapsed_ms >= slow_threshold_ms:
+            # cpu next to wall: a request that spent 2 s of wall on 30 ms of
+            # cpu was waiting (the gil, a lock, the disk), not working, and
+            # the fix is somewhere else entirely
+            cpu_start = getattr(g, 'request_start_cpu', None)
+            cpu_ms = (time.thread_time() - cpu_start) * 1000 if cpu_start is not None else -1
             logger.warning(
-                "Slow request: %s %s -> %s in %.1fms",
+                "Slow request: %s %s -> %s in %.1fms (cpu %.0fms)",
                 request.method,
                 request.full_path.rstrip('?'),
                 response.status_code,
                 elapsed_ms,
+                cpu_ms,
             )
     except Exception as e:
         logger.debug("slow request log failed: %s", e)
@@ -762,7 +902,7 @@ from api.mirrored_playlists import _owned_mirrored_playlist  # noqa: E402  (wiri
 # get_current_profile_id + admin_only live in core/profile_context.py now —
 # api/* blueprint modules need them at import time, and importing web_server
 # from there is circular. Same objects, one home.
-from core.profile_context import admin_only, get_current_profile_id  # noqa: E402
+from core.profile_context import admin_only, get_current_profile_id, is_admin_request  # noqa: E402
 
 
 def get_spotify_client_for_profile(profile_id=None):
@@ -850,6 +990,8 @@ VALID_PAGE_IDS = {
     'help',
     'hydrabase',
     'issues',
+    'podcasts',
+    'audiobooks',
     # Video side — per-profile page toggles (admin-only surfaces are gated separately,
     # not via allowed_pages: overlay studio, video-import, video-settings, video-automations).
     'video-dashboard',
@@ -877,6 +1019,23 @@ def check_download_permission():
     return None
 
 # --- Docker Helper Functions ---
+# The catalogue's artist row under the field names this file's handlers (and
+# their JSON responses) already speak. v2 promotes Spotify and MusicBrainz to
+# columns and keeps the rest in `external_ids`; aliasing here means the readers
+# below did not have to learn a second vocabulary (§50.4.4.30). The projection
+# itself lives next to the storage shape it hides, because `MusicDatabase`
+# serves the same field names (§50.4.4.31).
+from core.library2.provider_ids import ARTIST_IDS_SQL as _ARTIST_IDS_SQL
+
+
+def _catalogue_name_key(name):
+    """The catalogue's folded artist key. SQLite's LOWER() is ASCII-only, so a
+    stored "Björk" never answered a searched "björk" (iss29-D13)."""
+    from core.library2.importer import normalize_name
+
+    return normalize_name(str(name or ""))
+
+
 def docker_resolve_path(path_str):
     """Canonical absolute form of a configured folder.
 
@@ -919,6 +1078,27 @@ def _make_context_key(username, filename):
     normalized = filename.replace('\\', '/').lstrip('/') if filename else ''
     return f"{username}::{normalized}"
 
+
+def _register_matched_download_context(context_key: str, context: dict) -> None:
+    """Store download post-processing context, stamped with the profile (#1279)
+    and the library the request selected (#1199).
+
+    A direct grab has no batch to carry the selected library, and by the time
+    its file is organised the request (and the session holding the pick) is
+    gone -- so it is decided here, while both still exist.
+    """
+    if isinstance(context, dict) and 'profile_id' not in context:
+        try:
+            pid = get_current_profile_id()
+            context['profile_id'] = pid if pid is not None else 1
+        except Exception:
+            context['profile_id'] = 1
+    if isinstance(context, dict) and 'library_owner_id' not in context:
+        context['library_owner_id'] = _selected_library_owner()
+    with matched_context_lock:
+        matched_downloads_context[context_key] = context
+
+
 IS_SHUTTING_DOWN = False
 
 # --- Initialize Core Application Components ---
@@ -926,6 +1106,7 @@ IS_SHUTTING_DOWN = False
 # Previously, a single exception set ALL clients to None, breaking the entire app.
 logger.info("Initializing SoulSync services for Web UI...")
 spotify_client = download_orchestrator = tidal_client = matching_engine = sync_service = web_scan_manager = media_server_engine = None
+usenet_acquisition_monitor = None
 
 try:
     spotify_client = get_spotify_client()
@@ -1000,6 +1181,24 @@ try:
     logger.info("  Download orchestrator initialized")
 except Exception as e:
     logger.error(f"  Download orchestrator failed to initialize: {e}")
+
+try:
+    from core.acquisition.client_monitor import UsenetAcquisitionMonitor
+    usenet_acquisition_monitor = UsenetAcquisitionMonitor(
+        get_database()._get_connection,
+        category_getter=lambda: config_manager.get(
+            "usenet_client.category", "soulsync"),
+        interval_getter=lambda: config_manager.get(
+            "usenet_client.acquisition_monitor_interval_seconds", 15),
+        # Resolved when the monitor starts (after module initialization).  The
+        # same evidence-based runner also powers the admin dry-run endpoint.
+        persistent_reconciler_runner=lambda: (
+            _run_persistent_acquisition_reconciliation(dry_run=False)
+        ),
+    )
+    logger.info("  Usenet acquisition monitor initialized")
+except Exception as e:
+    logger.error(f"  Usenet acquisition monitor failed to initialize: {e}")
 
 try:
     tidal_client = TidalClient()
@@ -1134,8 +1333,10 @@ def _set_db_update_automation_id(value):
     progress callbacks that read it) live in api.database_admin now."""
     _set_db_update_automation_id_impl(value)
 
-# Quality scanning is now the 'quality_upgrade' library-maintenance repair job
-# (core/repair_jobs/quality_upgrade.py) — no standalone state/executor here.
+# Quality scanning has no standalone state/executor here, and no job of its own
+# either: a monitored track below its profile's cutoff is queued by the wanted
+# projection (core/library2/wishlist_mirror.track_wishlist_payload), mirrored
+# into the Wishlist by the monitoring_list_reconcile maintenance job.
 
 # Duplicate Cleaner state
 duplicate_cleaner_state = {
@@ -1191,6 +1392,14 @@ missing_download_executor = ThreadPoolExecutor(max_workers=_download_pool_size()
 # own bounded pool decouples that: hung/slow album downloads can only delay
 # other album downloads, never the user-facing path.
 album_bundle_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="AlbumBundleWorker")
+
+# Dedicated pool for Library-v2 scoped Automatic Search (§29/C1) — a user
+# clicking "Automatic Search" on one artist/album/track expects that item to
+# be searched right away, not queued behind whatever the periodic auto-
+# wishlist cycle currently has saturating missing_download_executor (docs
+# §69.3: same starvation class as #740, just never split out for the
+# per-track/scoped-search flow the way album bundles were).
+scoped_search_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ScopedSearchWorker")
 
 # Dedicated pool for post-processing a finished download, for the same reason
 # #740 gave album bundles their own. A search worker holds its thread for the
@@ -1416,9 +1625,11 @@ def _register_automation_handlers():
         duplicate_cleaner_lock=duplicate_cleaner_lock,
         duplicate_cleaner_executor=duplicate_cleaner_executor,
         run_duplicate_cleaner=_run_duplicate_cleaner,
-        run_repair_job_now=lambda job_id, respect_enabled=False: (
-            repair_worker.run_job_now(job_id, respect_enabled=respect_enabled)
-            if repair_worker else None),
+        run_repair_job_now=(
+            lambda job_id, scope=None, respect_enabled=False: repair_worker.run_job_now(
+                job_id, scope=scope, respect_enabled=respect_enabled)
+            if repair_worker else None
+        ),
         download_orchestrator=download_orchestrator,
         run_async=run_async,
         tasks_lock=tasks_lock,
@@ -1435,6 +1646,9 @@ def _register_automation_handlers():
         record_progress_history=_auto_progress.record_history,
         build_personalized_manager=_build_personalized_manager,
         lastfm_import_worker=lastfm_import_worker,
+        lastfm_import_workers=lastfm_import_workers,
+        listenbrainz_import_worker=listenbrainz_import_worker,
+        listenbrainz_import_workers=listenbrainz_import_workers,
     )
     _register_extracted_handlers(_automation_deps)
 
@@ -1724,6 +1938,7 @@ import core.downloads.monitor as _download_monitor_module
 # the post_processing stuck window, defined once in lifecycle where the rescue
 # itself lives. healing only decides WHEN to ask; lifecycle decides what to do.
 from core.downloads.lifecycle import _POST_PROCESSING_STUCK_TIMEOUT
+from core.downloads import lifecycle as _downloads_lifecycle
 
 # Global download monitor instance
 download_monitor = WebUIDownloadMonitor()
@@ -1751,6 +1966,9 @@ def validate_and_heal_batch_states():
                 active_count = batch_data.get('active_count', 0)
                 queue = batch_data.get('queue', [])
                 phase = batch_data.get('phase', 'unknown')
+
+                if not _downloads_lifecycle.is_music_batch(batch_id, batch_data):
+                    continue
 
                 # AUTO-CLEANUP: Remove terminal batches after 5 minutes to prevent stale state.
                 # 'failed' (e.g. an album-bundle hard failure) was missing here, so a failed
@@ -1840,19 +2058,87 @@ def validate_and_heal_batch_states():
                     if _new_orphans or stuck_post_processing:
                         batches_needing_completion_check.append(batch_id)
 
+                    # A failed publish has no new orphan on the next pass. Keep
+                    # retrying it until lifecycle succeeds or exhausts its budget.
+                    _publish_pending = (
+                        0 < batch_data.get('_atomic_publish_attempts', 0)
+                        < _downloads_lifecycle._ATOMIC_PUBLISH_MAX_ATTEMPTS
+                        and actually_active == 0
+                        and batch_data.get('queue_index', 0) >= len(queue)
+                    )
+                    if _publish_pending and batch_id not in batches_needing_completion_check:
+                        batches_needing_completion_check.append(batch_id)
+
+                    # STUCK-NO-WORKERS EMERGENCY HEAL (#1277): If all tasks have
+                    # been dispatched (queue_index >= len(queue)), no workers are
+                    # active, and no completion_time has been recorded for >10
+                    # minutes, the batch is permanently stuck (most likely because
+                    # _publish_atomic_album failed and the early-return path never
+                    # set completion_time). Force it to 'error' so:
+                    #   1. The 5-minute auto-cleanup at the top of this loop fires.
+                    #   2. The wishlist concurrency guard stops treating it as active.
+                    # This is a last-resort safety net; the primary fix is in
+                    # lifecycle.py (_ATOMIC_PUBLISH_MAX_ATTEMPTS).
+                    _all_dispatched = batch_data.get('queue_index', 0) >= len(queue)
+                    _no_workers = actually_active == 0
+                    if (_all_dispatched and _no_workers and not batch_data.get('completion_time')
+                            and not _publish_pending):
+                        _first_seen = batch_data.get('_heal_stuck_detected_at')
+                        if _first_seen is None:
+                            import time as _time
+                            batch_data['_heal_stuck_detected_at'] = _time.time()
+                            logger.warning(
+                                "[Batch Healing] Batch %s: all tasks dispatched, no workers, "
+                                "no completion_time — possibly stuck. Will force-error if still "
+                                "stuck in 600s.", batch_id)
+                        else:
+                            import time as _time
+                            if _time.time() - _first_seen > 600:  # 10 minutes
+                                logger.error(
+                                    "[Batch Healing] Batch %s has been stuck in 'downloading' "
+                                    "with no workers for >600s and no completion_time — "
+                                    "forcing 'error' to unblock wishlist (#1277).", batch_id)
+                                batch_data['phase'] = 'error'
+                                batch_data['completion_time'] = _time.time()
+                                try:
+                                    from core.downloads.history import record_sync_history_completion
+                                    from database.music_database import MusicDatabase
+                                    record_sync_history_completion(MusicDatabase(), batch_id, batch_data)
+                                except Exception as _hist_err:
+                                    logger.warning(
+                                        "[Batch Healing] Could not write sync history for "
+                                        "stuck batch %s: %s", batch_id, _hist_err)
+                    else:
+                        batch_data.pop('_heal_stuck_detected_at', None)
+
             # Cleanup stale batches inside the lock (safe - just dict mutations)
             for batch_id in batches_to_cleanup:
                 # #999: discard unpublished atomic staging for an abandoned batch
                 # (no-op for normal batches and for atomic batches that already
                 # published — their staging was pruned at publish).
                 _cleanup_batch = download_batches[batch_id]
-                if _cleanup_batch.get('_atomic_active') and _cleanup_batch.get('_atomic_staging_root'):
-                    try:
-                        from core.downloads.atomic_album_publish import discard_staging_root
+                # #1289: this used to preserve staging ONLY after an exhausted
+                # publish, so the batch force-errored by the stuck healer below
+                # (which never attempts a publish, leaving _atomic_publish_attempts
+                # at 0) had its finished audio rmtree'd five minutes later — and
+                # before the deferred-removal fix, its wishlist rows had already
+                # been deleted, so the track was gone from everywhere at once.
+                # Staged audio is now kept for startup reconciliation unless the
+                # user explicitly cancelled. Same lesson as #1210.
+                try:
+                    from core.downloads.atomic_album_publish import (
+                        discard_staging_root, should_discard_staging)
+                    _discard, _why = should_discard_staging(_cleanup_batch)
+                    if _discard:
                         if discard_staging_root(_cleanup_batch.get('_atomic_staging_root')):
-                            logger.info(f"[Atomic Publish] Discarded staging for abandoned batch {batch_id}")
-                    except Exception as _atomic_e:
-                        logger.debug(f"[Atomic Publish] staging discard failed: {_atomic_e}")
+                            logger.info("[Atomic Publish] Discarded staging for batch %s (%s)",
+                                        batch_id, _why)
+                    elif _cleanup_batch.get('_atomic_staging_root') and _cleanup_batch.get('_atomic_active'):
+                        logger.warning(
+                            "[Atomic Publish] Keeping staged audio for batch %s (%s): %s",
+                            batch_id, _why, _cleanup_batch.get('_atomic_staging_root'))
+                except Exception as _atomic_e:
+                    logger.debug(f"[Atomic Publish] staging discard check failed: {_atomic_e}")
                 task_ids_to_remove = download_batches[batch_id].get('queue', [])
                 del download_batches[batch_id]
                 # Clean up associated tasks
@@ -1882,7 +2168,9 @@ def validate_and_heal_batch_states():
                 _global_max = None
             if _global_max is not None:
                 _total_active = sum(
-                    b.get('active_count', 0) for b in download_batches.values()
+                    b.get('active_count', 0)
+                    for _k, b in download_batches.items()
+                    if _downloads_lifecycle.is_music_batch(_k, b)
                 )
                 # AT MOST ONE BATCH PER FREE SLOT. Queueing every held batch
                 # would have each acquire two locks only to find the limit full
@@ -1900,6 +2188,8 @@ def validate_and_heal_batch_states():
                         if _free_slots <= 0:
                             break
                         if _bid in batches_needing_workers:
+                            continue
+                        if not _downloads_lifecycle.is_music_batch(_bid, _bdata):
                             continue
                         if _bdata.get('phase') in ('complete', 'error', 'cancelled', 'failed'):
                             continue
@@ -2073,6 +2363,7 @@ def _shutdown_runtime_components():
     # Stop long-lived worker components in parallel so shutdown waits for the
     # slowest worker instead of serially burning the timeout for each one.
     _stop_components_parallel([
+        (usenet_acquisition_monitor, "usenet acquisition monitor"),
         (mb_worker, "musicbrainz worker"),
         (audiodb_worker, "audiodb worker"),
         (discogs_worker, "discogs worker"),
@@ -2100,6 +2391,7 @@ def _shutdown_runtime_components():
         (missing_download_executor, "missing download executor"),
         (post_processing_executor, "post processing executor"),
         (album_bundle_executor, "album bundle executor"),
+        (scoped_search_executor, "scoped search executor"),
         (import_singles_executor, "import singles executor"),
         (tidal_discovery_executor, "tidal discovery executor"),
         (deezer_discovery_executor, "deezer discovery executor"),
@@ -2113,6 +2405,15 @@ def _shutdown_runtime_components():
         (metadata_update_executor, "metadata update executor"),
     ]:
         _shutdown_executor(executor, name)
+
+    # rev25-08: the Library-v2 artwork background pool is created lazily on
+    # first use (not at import time like the pools above), so it's shut down
+    # through its own module rather than a direct executor reference here.
+    try:
+        from core.library2.artwork import shutdown_background_executor
+        shutdown_background_executor()
+    except Exception as e:
+        logger.error(f"Error shutting down lib2 artwork background executor: {e}")
 
     # Give daemon cleanup threads a moment to observe the shutdown flag.
     time.sleep(0.2)
@@ -2247,7 +2548,7 @@ def _prepare_stream_task(track_data, sess, sid):
 
 def _find_streaming_download_in_all_downloads(all_downloads, track_data):
     """
-    Find streaming download in DownloadStatus list (works for Soulseek, YouTube, and Tidal).
+    Find streaming download in DownloadStatus list (works for Soulseek, YouTube, Tidal, Deezer, etc.).
     Replaces the old _find_streaming_download_in_transfers function.
     """
     try:
@@ -2262,15 +2563,24 @@ def _find_streaming_download_in_all_downloads(all_downloads, track_data):
             download_filename = extract_filename(download.filename)
             download_username = download.username
 
-            if (download_filename == target_filename and
-                download_username == target_username):
+            username_match = (
+                download_username == target_username
+                or (
+                    download_username in ('deezer', 'deezer_dl')
+                    and target_username in ('deezer', 'deezer_dl')
+                )
+            )
+
+            if download_filename == target_filename and username_match:
                 # Convert DownloadStatus to dict format expected by caller
                 return {
+                    'id': getattr(download, 'id', ''),
                     'percentComplete': download.progress,
                     'state': download.state,
                     'size': download.size,
                     'bytesTransferred': download.transferred,
                     'averageSpeed': download.speed,
+                    'file_path': getattr(download, 'file_path', None),
                 }
 
         return None
@@ -2279,29 +2589,45 @@ def _find_streaming_download_in_all_downloads(all_downloads, track_data):
         return None
 
 def _find_downloaded_file(download_path, track_data):
-    """Find the downloaded audio file in the downloads directory tree (works for Soulseek, YouTube, and Tidal)"""
+    """Find the downloaded audio file in the downloads directory tree (works for Soulseek, YouTube, Tidal, Deezer, etc.)"""
     # Ensure path is accessible in Docker (handles E:/ -> /host/mnt/e/)
     download_path = docker_resolve_path(download_path)
 
     audio_extensions = {'.mp3', '.flac', '.ogg', '.aac', '.wma', '.wav', '.m4a'}
     target_filename = extract_filename(track_data.get('filename', ''))
 
-    # YOUTUBE/TIDAL/QOBUZ/HIFI/AMAZON SUPPORT: Handle encoded filename format "id||title"
+    # YOUTUBE/TIDAL/QOBUZ/HIFI/AMAZON/DEEZER/SOUNDCLOUD SUPPORT: Handle encoded filename format "id||title"
     # The file on disk will be "title.ext", not "id||title"
     is_youtube = track_data.get('username') == 'youtube'
     is_tidal = track_data.get('username') == 'tidal'
     is_qobuz = track_data.get('username') == 'qobuz'
     is_hifi = track_data.get('username') == 'hifi'
     is_amazon = track_data.get('username') == 'amazon'
-    is_streaming_source = is_youtube or is_tidal or is_qobuz or is_hifi or is_amazon
+    is_deezer = track_data.get('username') in ('deezer', 'deezer_dl')
+    is_soundcloud = track_data.get('username') == 'soundcloud'
+    is_streaming_source = (
+        is_youtube or is_tidal or is_qobuz or is_hifi or is_amazon
+        or is_deezer or is_soundcloud
+    )
     target_filename_youtube = None
     if is_streaming_source and '||' in target_filename:
-        _, title = target_filename.split('||', 1)
-        if is_tidal or is_qobuz or is_hifi or is_amazon:
-            # Tidal/Qobuz/HiFi/Amazon files can be flac, opus, eac3, or m4a — match any audio extension
+        parts = target_filename.split('||')
+        title = parts[-1]
+        if is_tidal or is_qobuz or is_hifi or is_amazon or is_deezer or is_soundcloud:
+            # Tidal/Qobuz/HiFi/Amazon/Deezer/SoundCloud files can be flac, mp3, opus, etc. — match any audio extension
             safe_title = re.sub(r'[<>:"/\\|?*]', '_', title)
             target_filename_youtube = safe_title  # Extension-less for flexible matching
-            source_name = 'HiFi' if is_hifi else ('Qobuz' if is_qobuz else ('Amazon' if is_amazon else 'Tidal'))
+            source_name = (
+                'HiFi' if is_hifi else (
+                    'Qobuz' if is_qobuz else (
+                        'Amazon' if is_amazon else (
+                            'Deezer' if is_deezer else (
+                                'SoundCloud' if is_soundcloud else 'Tidal'
+                            )
+                        )
+                    )
+                )
+            )
             logger.debug(f"[{source_name} Stream] Looking for file starting with: {target_filename_youtube}")
         else:
             # yt-dlp will create "Title.mp3" from "Title"
@@ -2339,11 +2665,23 @@ def _find_downloaded_file(download_path, track_data):
                     # For Tidal, compare without extension (file could be .flac or .m4a)
                     compare_target = target_filename_youtube.lower()
                     compare_file = file.lower()
-                    if is_tidal or is_qobuz or is_hifi or is_amazon:
+                    if is_tidal or is_qobuz or is_hifi or is_amazon or is_deezer or is_soundcloud:
                         compare_file = os.path.splitext(compare_file)[0]
                     similarity = SequenceMatcher(None, compare_file, compare_target).ratio()
 
-                    source_label = 'HiFi' if is_hifi else ('Qobuz' if is_qobuz else ('Amazon' if is_amazon else ('Tidal' if is_tidal else 'YouTube')))
+                    source_label = (
+                        'HiFi' if is_hifi else (
+                            'Qobuz' if is_qobuz else (
+                                'Amazon' if is_amazon else (
+                                    'Deezer' if is_deezer else (
+                                        'SoundCloud' if is_soundcloud else (
+                                            'Tidal' if is_tidal else 'YouTube'
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                    )
                     logger.debug(f"[{source_label} Stream] Comparing: '{file}' vs '{target_filename_youtube}' = {similarity:.2f}")
 
                     # Keep track of best match
@@ -2361,9 +2699,21 @@ def _find_downloaded_file(download_path, track_data):
                         logger.debug(f"Found streaming file: {file_path}")
                         return file_path
 
-        # For YouTube/Tidal, if we found a good enough match (80%+), use it
+        # For streaming sources, if we found a good enough match (80%+), use it
         if is_streaming_source and best_match and best_similarity >= 0.80:
-            source_label = 'Qobuz' if is_qobuz else ('Amazon' if is_amazon else ('Tidal' if is_tidal else 'YouTube'))
+            source_label = (
+                'HiFi' if is_hifi else (
+                    'Qobuz' if is_qobuz else (
+                        'Amazon' if is_amazon else (
+                            'Deezer' if is_deezer else (
+                                'SoundCloud' if is_soundcloud else (
+                                    'Tidal' if is_tidal else 'YouTube'
+                                )
+                            )
+                        )
+                    )
+                )
+            )
             logger.debug(f"Found good match ({best_similarity:.2f}) for {source_label} streaming file: {best_match}")
             return best_match
 
@@ -2755,51 +3105,6 @@ def get_status():
         return jsonify(status_data)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-
-@app.route('/api/fix-navidrome-urls', methods=['POST'])
-def fix_navidrome_urls():
-    """Fix Navidrome artist image URLs to use correct Subsonic format"""
-    try:
-        db = get_database()
-        with db._get_connection() as conn:
-            cursor = conn.cursor()
-
-            # Get all Navidrome artists with old URL format
-            cursor.execute('SELECT id, name, thumb_url FROM artists WHERE server_source = "navidrome" AND thumb_url LIKE "/api/artist/%"')
-            artists = cursor.fetchall()
-
-            if not artists:
-                return jsonify({"status": "success", "message": "No URLs needed fixing", "updated": 0})
-
-            # Update URLs to new Subsonic format
-            import re
-            updated = 0
-            examples = []
-
-            for artist_id, name, old_url in artists:
-                # Extract artist ID from old URL: /api/artist/ARTIST_ID/image
-                match = re.search(r'/api/artist/([^/]+)/image', old_url)
-                if match:
-                    artist_spotify_id = match.group(1)
-                    new_url = f'/rest/getCoverArt?id={artist_spotify_id}'
-
-                    cursor.execute('UPDATE artists SET thumb_url = ? WHERE id = ? AND server_source = "navidrome"', (new_url, artist_id))
-                    updated += 1
-
-                    if len(examples) < 3:  # Show first 3 as examples
-                        examples.append(f'{name}: {old_url} -> {new_url}')
-
-            conn.commit()
-
-            return jsonify({
-                "status": "success",
-                "message": f"Updated {updated} Navidrome artist URLs to Subsonic format",
-                "updated": updated,
-                "examples": examples
-            })
-
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
 
 def _m3u_entry_path(path):
     """Final transforms for one m3u entry line: the prefix hot-swap
@@ -3472,6 +3777,20 @@ def handle_settings():
             if not new_settings:
                 return jsonify({"success": False, "error": "No data received."}), 400
 
+            # Validate connection settings before persisting any part of the form.
+            if 'musicbrainz' in new_settings:
+                from core.musicbrainz_client import validate_server_settings
+                mb_settings = new_settings['musicbrainz']
+                if not isinstance(mb_settings, dict):
+                    return jsonify({"success": False, "error": "MusicBrainz settings must be an object."}), 400
+                try:
+                    mb_url, mb_interval = validate_server_settings(
+                        mb_settings.get('base_url', config_manager.get('musicbrainz.base_url')),
+                        mb_settings.get('request_interval', config_manager.get('musicbrainz.request_interval')))
+                except ValueError as exc:
+                    return jsonify({"success": False, "error": str(exc)}), 400
+                mb_settings.update(base_url=mb_url, request_interval=mb_interval)
+
             # Anti-lockout: refuse to turn ON login mode until the admin account
             # has a password — otherwise enabling it would lock everyone out.
             _sec_in = new_settings.get('security') or {}
@@ -3519,8 +3838,37 @@ def handle_settings():
             if _primary_err:
                 return jsonify({"success": False, "error": _primary_err}), 400
 
+            settings_warnings = []
             if 'active_media_server' in new_settings:
-                config_manager.set_active_media_server(new_settings['active_media_server'])
+                old_server = config_manager.get_active_media_server()
+                new_server = new_settings['active_media_server']
+                if old_server != new_server:
+                    config_manager.set_active_media_server(new_server)
+                    try:
+                        from core.library_scope import invalidate_library_scope_cache
+                        invalidate_library_scope_cache()
+                        from core.imports.paths import reset_own_library_fallback_notifications
+                        reset_own_library_fallback_notifications()
+                    except Exception as _inv_err:
+                        logger.debug("scope cache invalidation failed: %s", _inv_err)
+                    if new_server not in ('plex', 'jellyfin'):
+                        try:
+                            own_profs = get_database().get_own_library_profiles()
+                            if own_profs:
+                                names = ", ".join(p.get('name', f"Profile {p.get('id')}") for p in own_profs)
+                                logger.warning(
+                                    "[Media Server] Switched active server to '%s'. Own-library isolation is not supported by '%s'. "
+                                    "Profiles [%s] will fall back to the shared library for downloads and scans.",
+                                    new_server, new_server, names
+                                )
+                                server_display = (new_server or 'this server').capitalize()
+                                settings_warnings.append(
+                                    f"Switching to {server_display} disables own-library isolation for profiles: {names}. "
+                                    "Their downloads will route to the shared library folder."
+                                )
+                        except Exception as _ms_err:
+                            logger.debug("Error checking own-library profiles on server switch: %s", _ms_err)
+
 
             # ONE database write for the whole page save. Per-leaf saves were
             # hundreds of encrypt+serialize+commit cycles per click — enough
@@ -3531,7 +3879,7 @@ def handle_settings():
                     for key, value in _experimental_in.items():
                         config_manager.set(f'experimental.{key}', value)
 
-                for service in ['spotify', 'plex', 'jellyfin', 'navidrome', 'soulseek', 'download_source', 'settings', 'database', 'metadata_enhancement', 'file_organization', 'playlist_sync', 'tidal', 'tidal_download', 'qobuz', 'hifi_download', 'deezer_download', 'amazon_download', 'lidarr_download', 'prowlarr', 'torrent_client', 'usenet_client', 'listenbrainz', 'acoustid', 'lastfm', 'genius', 'import', 'lossy_copy', 'album_downloads', 'listening_stats', 'ui_appearance', 'youtube', 'content_filter', 'itunes', 'm3u_export', 'musicbrainz', 'deezer', 'audiodb', 'metadata', 'hydrabase', 'security', 'discogs', 'library', 'discover', 'wishlist', 'genre_whitelist', 'post_processing', 'playlists', 'experimental', 'image_cache']:
+                for service in ['spotify', 'plex', 'jellyfin', 'navidrome', 'soulseek', 'download_source', 'settings', 'database', 'metadata_enhancement', 'file_organization', 'playlist_sync', 'tidal', 'tidal_download', 'qobuz', 'hifi', 'hifi_download', 'soundcloud_download', 'deezer_download', 'amazon_download', 'lidarr_download', 'prowlarr', 'torrent_client', 'usenet_client', 'listenbrainz', 'acoustid', 'lastfm', 'genius', 'import', 'lossy_copy', 'album_downloads', 'listening_stats', 'ui_appearance', 'youtube', 'content_filter', 'itunes', 'm3u_export', 'musicbrainz', 'deezer', 'audiodb', 'metadata', 'hydrabase', 'security', 'discogs', 'concerts', 'library', 'discover', 'wishlist', 'genre_whitelist', 'post_processing', 'playlists', 'podcasts', 'audiobooks', 'experimental', 'image_cache']:
                     if service in new_settings:
                         if service == 'experimental' and isinstance(_experimental_in, dict):
                             continue
@@ -3555,6 +3903,26 @@ def handle_settings():
                     reset_image_cache()
                 except Exception as _ic_err:
                     logger.debug("image cache reset after settings save failed: %s", _ic_err)
+
+            if 'concerts' in new_settings:
+                # Answers are cached for six hours. Without this, fixing a
+                # rejected API key would keep showing the failure it produced
+                # for the rest of the afternoon, which reads as "my key doesn't
+                # work" rather than "the old answer is still cached".
+                try:
+                    from core.concerts_client import clear_cache as _clear_concerts
+                    _clear_concerts()
+                except Exception as _cc_err:
+                    logger.debug("concert cache clear after settings save failed: %s", _cc_err)
+
+            if 'soulseek' in new_settings or 'active_media_server' in new_settings:
+                # the shared folder or the server's own-library support may have
+                # moved: every file's library follows its folder (#1199)
+                try:
+                    from core.library_scope import library_config_changed
+                    library_config_changed()
+                except Exception as _lib_err:
+                    logger.debug("library folder sync after settings save failed: %s", _lib_err)
 
             if any(s in new_settings for s in ('acoustid', 'lossy_copy', 'post_processing', 'import')):
                 try:
@@ -3607,8 +3975,10 @@ def handle_settings():
                 )
             # Invalidate status cache so next poll reflects new settings (e.g. fallback source change)
             invalidate_metadata_status_caches()
-            logger.info("Service clients re-initialized with new settings.")
-            return jsonify({"success": True, "message": "Settings saved successfully."})
+            resp_data = {"success": True, "message": "Settings saved successfully."}
+            if settings_warnings:
+                resp_data["warnings"] = settings_warnings
+            return jsonify(resp_data)
         except Exception as e:
             return jsonify({"success": False, "error": str(e)}), 500
     else:  # GET request
@@ -3632,7 +4002,13 @@ def handle_settings():
             # dumps every download onto the install disk — Proxmox LXCs default
             # to an 8GB root, which fills until the container hangs — so the UI
             # needs to know which story to tell and when to warn.
-            data['_environment'] = {'docker': os.path.exists('/.dockerenv')}
+            # `windows` drives the YouTube cookie picker: Chromium-family browsers
+            # seal their cookie store with App-Bound Encryption on Windows, which
+            # yt-dlp cannot read (yt-dlp issue 10927). It is the SERVER's OS that
+            # decides, not the browser the settings page happens to be open in —
+            # SoulSync on Linux read by an admin on a Windows laptop is fine.
+            data['_environment'] = {'docker': os.path.exists('/.dockerenv'),
+                                    'windows': os.name == 'nt'}
             return jsonify(data)
         except Exception as e:
             return jsonify({"error": str(e)}), 500
@@ -3887,7 +4263,7 @@ def setup_status_endpoint():
     setup_done = config_manager.get('setup.completed', False)
     download_mode = config_manager.get('download_source.mode', '')
     # Either the explicit flag or a user-configured download source means setup is done
-    has_user_config = bool(setup_done) or bool(download_mode)
+    has_user_config = bool(setup_done) or (bool(download_mode) and not config_manager.get('setup.in_progress', False))
     return jsonify({
         "setup_complete": has_user_config,
     })
@@ -3896,6 +4272,7 @@ def setup_status_endpoint():
 def setup_complete_endpoint():
     """Mark first-run setup as completed."""
     config_manager.set('setup.completed', True)
+    config_manager.set('setup.in_progress', False)
     return jsonify({"success": True})
 
 @app.route('/api/test-connection', methods=['POST'])
@@ -4450,11 +4827,23 @@ def get_jellyfin_music_libraries():
                     current_library = lib['title']
                     break
 
+        # the jellyfin users a profile can sync as. personal settings has
+        # had a user dropdown keyed on this field since it was built, and
+        # nothing ever sent it, so the dropdown never appeared (#1265).
+        users = []
+        try:
+            users = [{'id': u.get('id'), 'name': u.get('name')}
+                     for u in (media_server_engine.client('jellyfin').get_available_users() or [])
+                     if u.get('id')]
+        except Exception as users_err:
+            logger.debug(f"Jellyfin users list failed: {users_err}")
+
         return jsonify({
             "success": True,
             "libraries": libraries,
             "selected": selected_library,
-            "current": current_library
+            "current": current_library,
+            "users": users,
         })
     except Exception as e:
         logger.error(f"Error getting Jellyfin music libraries: {e}")
@@ -5082,8 +5471,6 @@ def spotify_callback():
         token_info = auth_manager.get_access_token(auth_code)
 
         if token_info:
-            # CRITICAL: update the GLOBAL spotify_client, not a local variable
-            global spotify_client
             clear_cached_metadata_client("spotify")
             spotify_client = get_spotify_client()
             if spotify_client.is_spotify_authenticated():
@@ -5421,8 +5808,25 @@ def search_music():
     logger.info(f"Web UI Search initiated for: '{query}'" + (f" (source={requested_source})" if requested_source else ""))
     add_activity_item("", "Search Started", f"'{query}'", "Now")
 
+    # Candidate-token binding (audit §16.1): torrent/usenet results carry
+    # opaque candidate tokens; mint them bound to the searching profile.
+    # An entity-scoped search (Library-v2 interactive search names the
+    # track/album it acts for) additionally pins its tokens to that entity —
+    # a named-but-invalid entity fails the search instead of minting
+    # unbound tokens.
+    from core.download_plugins.candidate_store import candidate_binding
+    from core.library2.grab_context import resolve_lib2_grab_context
+    _lib2_state, _lib2_ctx = resolve_lib2_grab_context(get_database(), data)
+    if _lib2_state == 'invalid':
+        return jsonify({"error": "Unknown Library v2 entity for this search."}), 400
+
     try:
-        results = _search_basic.run_basic_search(query, download_orchestrator, run_async, source=requested_source)
+        with candidate_binding(get_current_profile_id(),
+                               lib2_track_id=(_lib2_ctx or {}).get('track_id'),
+                               lib2_album_id=(_lib2_ctx or {}).get('album_id')):
+            results = _search_basic.run_basic_search(
+                query, download_orchestrator, run_async,
+                source=requested_source, entity_context=_lib2_ctx)
         add_activity_item("", "Search Complete", f"'{query}' - {len(results)} results", "Now")
         return jsonify({"results": results})
     except ValueError as ve:
@@ -5538,9 +5942,13 @@ def enhanced_search_source(source_name):
         youtube_client = _search_orchestrator.resolve_youtube_videos_client(deps)
         if youtube_client is None:
             return jsonify({"videos": [], "available": False})
+        # the artist page's "show more" asks for a bigger pool; everyone else
+        # sends no limit and gets the default
+        max_results = _search_orchestrator.clamp_youtube_video_limit(data.get('limit'))
         try:
             return app.response_class(
-                _search_orchestrator.stream_youtube_videos(query, youtube_client, run_async),
+                _search_orchestrator.stream_youtube_videos(
+                    query, youtube_client, run_async, max_results=max_results),
                 mimetype='application/x-ndjson',
             )
         except Exception as e:
@@ -5632,47 +6040,18 @@ def stream_enhanced_search_track():
 # MUSIC VIDEO DOWNLOADS
 # =============================================================================
 
-_music_video_downloads = {}  # {video_id: {status, progress, path, error}}
+def _music_video_deps():
+    """the music video job's reach into the app. core/downloads/music_video.py"""
+    return _music_video.MusicVideoDeps(
+        search_tracks=lambda query, limit: _get_metadata_fallback_client().search_tracks(query, limit=limit),
+        download=lambda url, stem, progress, should_cancel: download_orchestrator.client("youtube").download_music_video(
+            url, stem, progress_callback=progress, should_cancel=should_cancel),
+        video_template=lambda: (config_manager.get('file_organization.templates', {}) or {}).get('video_path', ''),
+        artist_letter=_shared_artist_letter,
+        add_activity=lambda icon, title, subtitle: add_activity_item(icon, title, subtitle, "Now"),
+        record_history=lambda **fields: get_database().add_library_history_entry(**fields),
+    )
 
-
-def _clean_music_video_title(raw_title):
-    """Strip YouTube noise from a video title for metadata search + filing.
-
-    Handles the suffix both parenthesized — "(Official Music Video)" — and
-    BARE at the end of the title ("... Fat Official Music Video", the shape
-    fan uploads use constantly; the old parenthesized-only strip left the
-    noise in the search query, which is half of how a video ends up filed
-    under the uploader's channel name). Bare stripping is deliberately
-    conservative: only unambiguous multi-word forms ('official …', 'music
-    video', 'lyric video', 'visualizer'), so a song genuinely titled
-    "Video" or "Video Games" is never eaten."""
-    import re as _re
-    s = _re.sub(
-        r'\s*[\(\[](official\s*(music\s*)?video|official\s*lyric\s*video|official\s*audio'
-        r'|official\s*hd|hd|4k|remastered|lyric\s*video|visualizer|audio)[\)\]]',
-        '', raw_title or '', flags=_re.IGNORECASE).strip()
-    s = _re.sub(
-        r'[\s\-–—|]*\b(official\s+(music\s+|lyric\s+)?(video|audio)'
-        r'|music\s+video|lyric\s+video|visualizer)\s*$',
-        '', s, flags=_re.IGNORECASE).strip()
-    return _re.sub(r'\s*-\s*$', '', s).strip()
-
-
-def _parse_music_video_artist_title(raw_title, raw_channel):
-    """Artist/title for filing a music video, from the video's own name.
-
-    'Artist - Title' (hyphen, en or em dash) parses to the real artist —
-    the UPLOADER's channel name is only the last resort for titles with no
-    separator at all, because fan-channel uploads ("Bad Boy Edd") are the
-    norm and filing under them scatters one artist's videos across folders."""
-    import re as _re
-    for sep in (' - ', ' – ', ' — '):
-        if sep in (raw_title or ''):
-            artist, title = raw_title.split(sep, 1)
-            title = _re.sub(r'\s*[\(\[].*?[\)\]]', '', title).strip()
-            title = _clean_music_video_title(title) or title
-            return artist.strip(), title
-    return raw_channel, (_clean_music_video_title(raw_title) or raw_title)
 
 @app.route('/api/music-video/download', methods=['POST'])
 def download_music_video():
@@ -5680,17 +6059,9 @@ def download_music_video():
     data = request.get_json()
     if not data:
         return jsonify({"error": "No data"}), 400
-
-    video_id = data.get('video_id', '')
-    video_url = data.get('url', '')
-    raw_title = data.get('title', '')
-    raw_channel = data.get('channel', '')
-
-    if not video_id or not video_url:
+    if not data.get('video_id') or not data.get('url'):
         return jsonify({"error": "Missing video_id or url"}), 400
-
-    # Check if already downloading
-    if video_id in _music_video_downloads and _music_video_downloads[video_id].get('status') == 'downloading':
+    if _music_video.is_in_flight(str(data.get('video_id'))):
         return jsonify({"error": "Already downloading"}), 409
 
     # Get and validate music videos path
@@ -5708,124 +6079,103 @@ def download_music_video():
     except (OSError, PermissionError) as e:
         return jsonify({"error": f"Music Videos directory is not writable: {e}"}), 400
 
-    # Initialize download state
-    _music_video_downloads[video_id] = {'status': 'searching', 'progress': 0, 'path': None, 'error': None}
-
-    def _do_download():
-        try:
-            # Step 1: Try to match against primary metadata source for clean artist/title
-            _music_video_downloads[video_id]['status'] = 'matching'
-            artist_name = raw_channel
-            track_title = raw_title
-            year = ''
-            matched = False
-
-            import re as _re
-            clean_search = _clean_music_video_title(raw_title)
-
-            try:
-                fallback_client = _get_metadata_fallback_client()
-                results = fallback_client.search_tracks(clean_search, limit=5)
-                if results:
-                    from difflib import SequenceMatcher
-                    best = None
-                    best_score = 0
-                    for r in results:
-                        name_sim = SequenceMatcher(None, clean_search.lower(), r.name.lower()).ratio()
-                        if r.artists:
-                            artist_sim = SequenceMatcher(None, raw_channel.lower(), r.artists[0].lower()).ratio()
-                            name_sim = (name_sim * 0.6) + (artist_sim * 0.4)
-                        if name_sim > best_score:
-                            best_score = name_sim
-                            best = r
-                    if best and best_score >= 0.5 and best.artists:
-                        matched = True
-                        artist_name = best.artists[0]
-                        track_title = best.name
-                        if hasattr(best, 'release_date') and best.release_date:
-                            year = str(best.release_date)[:4]
-                        logger.info(f"[Music Video] Matched to: {artist_name} - {track_title} (confidence: {best_score:.2f})")
-            except Exception as e:
-                logger.error(f"[Music Video] Metadata lookup failed: {e}")
-
-            if not matched:
-                # No confident metadata match — parse 'Artist - Title' from the
-                # video's own name. This must cover EVERY unmatched path
-                # (weak match, lookup crash, and crucially an EMPTY result
-                # list — the old code skipped the parse entirely on zero
-                # results, so the video filed under the uploader's channel:
-                # the '"Weird Al" Yankovic - Fat' → 'bad boy edd/' bug).
-                artist_name, track_title = _parse_music_video_artist_title(raw_title, raw_channel)
-                logger.warning(f"[Music Video] No metadata match, using parsed: {artist_name} - {track_title}")
-
-            # Sanitize for filesystem
-            def _sanitize(s):
-                return _re.sub(r'[<>:"/\\|?*]', '_', s).strip().rstrip('.')
-
-            # Apply video path template
-            video_template = config_manager.get('file_organization.templates', {}).get('video_path', '$artist/$title-video')
-            if not video_template or not video_template.strip():
-                video_template = '$artist/$title-video'
-            safe_artist = _sanitize(artist_name)
-            video_path = video_template
-            video_path = video_path.replace('$artistletter', _shared_artist_letter(safe_artist) if safe_artist else 'A')
-            video_path = video_path.replace('$artist', safe_artist)
-            video_path = video_path.replace('$title', _sanitize(track_title))
-            video_path = video_path.replace('$year', str(year) if year else '')
-            # Clean up empty segments from missing variables
-            video_path = _re.sub(r'//+', '/', video_path).strip('/')
-            # Split into folder and filename
-            path_parts = video_path.rsplit('/', 1)
-            if len(path_parts) == 2:
-                folder_part, file_part = path_parts
-            else:
-                folder_part, file_part = '', path_parts[0]
-            output_dir = os.path.join(music_videos_path, folder_part) if folder_part else music_videos_path
-            os.makedirs(output_dir, exist_ok=True)
-            output_path = os.path.join(output_dir, file_part)
-
-            # Step 2: Download
-            _music_video_downloads[video_id]['status'] = 'downloading'
-            _music_video_downloads[video_id]['artist'] = artist_name
-            _music_video_downloads[video_id]['title'] = track_title
-
-            def _progress(pct):
-                _music_video_downloads[video_id]['progress'] = round(pct, 1)
-
-            final_path = download_orchestrator.client("youtube").download_music_video(video_url, output_path, progress_callback=_progress)
-
-            if final_path and os.path.exists(final_path):
-                _music_video_downloads[video_id]['status'] = 'completed'
-                _music_video_downloads[video_id]['progress'] = 100
-                _music_video_downloads[video_id]['path'] = final_path
-                logger.info(f"[Music Video] Downloaded: {artist_name} - {track_title} → {final_path}")
-                add_activity_item("", "Music Video Downloaded", f"{artist_name} - {track_title}", "Now")
-            else:
-                _music_video_downloads[video_id]['status'] = 'error'
-                _music_video_downloads[video_id]['error'] = 'Download failed — file not found'
-                logger.error(f"[Music Video] Download failed for: {artist_name} - {track_title}")
-
-        except Exception as e:
-            _music_video_downloads[video_id]['status'] = 'error'
-            _music_video_downloads[video_id]['error'] = str(e)
-            logger.error(f"[Music Video] {e}")
-
-    # Run in background thread
-    import threading
-    threading.Thread(target=_do_download, daemon=True, name=f'music-video-{video_id}').start()
-
-    return jsonify({"success": True, "video_id": video_id})
+    result = _music_video.start(data, music_videos_path, _music_video_deps())
+    if result.get('error'):
+        return jsonify({"error": result['error']}), result.get('code', 400)
+    return jsonify(result)
 
 
 @app.route('/api/music-video/status/<video_id>', methods=['GET'])
 def get_music_video_status(video_id):
     """Get download status for a music video."""
-    status = _music_video_downloads.get(video_id)
+    status = _music_video.state.get(video_id)
     if not status:
         return jsonify({"status": "unknown"})
     return jsonify(status)
 
 
+def _audit_manual_skip(context_key, title, artist, skip_checks, profile_id=1):
+    """Record a user-initiated check override in the Library v2 skip audit.
+
+    Only when the Library v2 feature is enabled — the audit exists for lib2's
+    cleanup/repair jobs, and a disabled feature shouldn't accumulate rows.
+    Best-effort: failures never block the download.
+    """
+    try:
+        from core.library2.manual_skips import record_manual_skip
+        record_manual_skip(
+            get_database(),
+            content_key=context_key,
+            title=title,
+            artist=artist,
+            skipped_checks=skip_checks,
+            profile_id=profile_id,
+        )
+    except Exception as _se:
+        logger.debug("manual-skip audit write failed: %s", _se)
+
+
+def _prepare_manual_grab(username, search_result, lib2_ctx, batch_id=None):
+    """Prepare Acquisition correlation before a manual client dispatch.
+
+    Entirely fail-open: correlation is observational bookkeeping and must
+    never fail or delay the download it describes. When the plugin registry
+    cannot identify the source, correlation is skipped instead of guessing a
+    source family from the username (ADR-08).
+    """
+    try:
+        from core.profile_context import is_admin_request
+        if not is_admin_request():
+            return None
+        spec = download_orchestrator.registry.get_spec(username) if username else None
+        source = spec.name if spec else 'soulseek'
+        from core.acquisition.manual_grab import try_prepare_manual_grab
+        return try_prepare_manual_grab(
+            lib2_context=lib2_ctx,
+            target_context=search_result,
+            search_result=search_result,
+            source=source,
+            batch_id=batch_id,
+        )
+    except Exception as _acq_err:
+        logger.debug("manual grab correlation skipped: %s", _acq_err)
+        return None
+
+
+def _manual_acquisition_preparation_required(username):
+    """Whether this route dispatch is covered by the opt-in strict gate."""
+    try:
+        from core.profile_context import is_admin_request
+        if not is_admin_request():
+            return False
+        spec = download_orchestrator.registry.get_spec(username) if username else None
+        source = spec.name if spec else 'soulseek'
+        from core.acquisition.capabilities import get_source_capabilities
+        capabilities = get_source_capabilities(source)
+        return bool(capabilities and capabilities.recording_download)
+    except Exception:
+        # The normal username-based route is Soulseek when no explicit plugin
+        # spec exists. Unknown bookkeeping state is in-scope under strict mode.
+        return True
+
+
+def _manual_acquisition_dispatch_blocked(username, markers):
+    from core.acquisition.manual_grab import correlation_enforcement_enabled
+    return (
+        not markers
+        and correlation_enforcement_enabled()
+        and _manual_acquisition_preparation_required(username)
+    )
+
+
+def _record_manual_acquisition_gap(username, markers, *, blocked):
+    if markers or not _manual_acquisition_preparation_required(username):
+        return
+    from core.acquisition.correlation_coverage import (
+        record_correlation_outcome_fail_open,
+    )
+    record_correlation_outcome_fail_open(
+        "manual", "blocked" if blocked else "unprepared_dispatched")
 _PLAYBACK_PREFETCH_ACTIVE_STATES = {
     'pending', 'queued', 'searching', 'downloading', 'post_processing',
 }
@@ -5981,6 +6331,9 @@ def _start_playback_queue_prefetch(raw_tracks):
                     'permanently_failed_tracks': [],
                     'cancelled_tracks': set(),
                     'profile_id': get_current_profile_id(),
+                    # the selected directory, resolved while a request still exists;
+                    # every later stage reads it back off the batch (#1199)
+                    'library_owner_id': _selected_library_owner(),
                     'playback_prefetch': True,
                     'created_at': time.time(),
                 }
@@ -6097,67 +6450,369 @@ def playback_queue_prefetch_status():
         return jsonify({'success': False, 'error': str(exc)}), 500
 
 
+# States a plugin reports when there is nothing left to wait for. Soulseek and
+# the torrent adapters spell success differently, so match on substrings.
+_QUICK_DONE = ('succeeded', 'completed', 'complete')
+_QUICK_DEAD = ('errored', 'error', 'failed', 'rejected', 'cancelled', 'canceled', 'aborted')
+
+
+def _track_quick_download(download_id, title, artist='', size_bytes=0, source_label=''):
+    """Put a basic-search download on the Downloads page and keep it moving.
+
+    This path hands the file to the orchestrator and returns, so there is no
+    batch and nothing writes a task row — which is why these downloads ran
+    invisibly. Registering a card is only half of it: a card nothing updates
+    would sit at "downloading" forever, which is worse than no card at all. So
+    a small poller follows this one download until it reaches a terminal state.
+
+    A thread per download matches what the music-video path already does, and
+    these are user-initiated one at a time. It is a daemon thread and every
+    exit path marks the card, including the give-up.
+    """
+    download_id = str(download_id or '').strip()
+    if not download_id or not direct_download_state.register(
+            direct_download_state.QUICK_BATCH, download_id, title=title,
+            artist=artist, album='Quick Downloads', size_bytes=size_bytes,
+            source_label=source_label or 'Search'):
+        return
+
+    def _poll():
+        import time as _t
+        misses = 0
+        # ~30 minutes at 2s. A download the client has forgotten stops being
+        # our problem long before that, but a slow Soulseek peer is normal.
+        for _ in range(900):
+            _t.sleep(2)
+            if direct_download_state.is_cancelled(download_id):
+                direct_download_state.mark_status(download_id, 'cancelled')
+                return
+            try:
+                st = run_async(download_orchestrator.get_download_status(download_id),
+                               timeout=20)
+            except Exception as poll_err:      # noqa: BLE001 - a status poll must not kill the thread
+                logger.debug("quick download poll failed for %s: %s", download_id, poll_err)
+                st = None
+            if st is None:
+                misses += 1
+                # Gone from the client: finished and reaped, or never started.
+                if misses >= 15:
+                    direct_download_state.mark_status(
+                        download_id, 'failed',
+                        error='The download client stopped reporting this transfer.')
+                    return
+                continue
+            misses = 0
+
+            size = int(getattr(st, 'size', 0) or 0)
+            done = int(getattr(st, 'transferred', 0) or 0)
+            # progress is 0-1 on some plugins and 0-100 on others; bytes are
+            # unambiguous, so prefer them and only fall back to the field.
+            if size > 0:
+                percent = (done / size) * 100.0
+            else:
+                raw = float(getattr(st, 'progress', 0) or 0)
+                percent = raw * 100.0 if raw <= 1.0 else raw
+            direct_download_state.update_progress(
+                download_id, percent=percent, bytes_done=done, bytes_total=size)
+
+            state = str(getattr(st, 'state', '') or '').lower()
+            if any(w in state for w in _QUICK_DEAD):
+                direct_download_state.mark_status(download_id, 'failed', error=state)
+                return
+            if any(w in state for w in _QUICK_DONE):
+                direct_download_state.mark_status(
+                    download_id, 'completed',
+                    file_path=str(getattr(st, 'file_path', '') or ''))
+                return
+
+        direct_download_state.mark_status(
+            download_id, 'failed', error='Timed out waiting for the download to finish.')
+
+    import threading as _threading
+    _threading.Thread(target=_poll, daemon=True,
+                      name=f'quick-dl-{download_id[:12]}').start()
+
+
+from core.downloads import pinned_batch as _pinned_batch
+
+
+def _pinned_batch_deps():
+    return _pinned_batch.PinnedBatchDeps(
+        start_monitoring=download_monitor.start_monitoring,
+        submit=missing_download_executor.submit,
+        attempt_download_with_candidates=_attempt_download_with_candidates,
+        on_download_completed=_on_download_completed,
+    )
+
+
 @app.route('/api/download', methods=['POST'])
 def start_download():
     """Simple download route"""
     dl_err = check_download_permission()
     if dl_err:
         return dl_err
-    data = request.get_json()
-    if not data:
+    raw_data = request.get_json()
+    if not raw_data:
         return jsonify({"error": "No download data provided."}), 400
 
     try:
-        result_type = data.get('result_type', 'track')
+        result_type = str(raw_data.get('result_type', 'track')).strip().lower()
+        if result_type not in ('track', 'album'):
+            return jsonify({"error": "Invalid result_type."}), 400
+
+        # Library-v2 entity context (audit P1-16): the browser may NAME the
+        # lib2 track/album this grab acts for; existence and the effective
+        # quality profile are resolved server-side. A named-but-invalid
+        # entity fails the grab instead of degrading to a context-free one.
+        from core.library2.grab_context import (
+            build_lib2_import_pipeline_fields,
+            build_lib2_track_info,
+            names_lib2_entity,
+            profile_may_grab,
+            resolve_lib2_grab_context,
+        )
+        from core.download_plugins.candidate_store import candidate_binding
+        if names_lib2_entity(raw_data) and not is_admin_request() \
+                and not profile_may_grab(get_database(), get_current_profile_id(), raw_data):
+            return jsonify({
+                "success": False,
+                "error": "Admin access required",
+            }), 403
+        _lib2_state, _lib2_ctx = resolve_lib2_grab_context(
+            get_database(), raw_data)
+        if _lib2_state == 'invalid':
+            return jsonify({"error": "Unknown Library v2 entity for this grab."}), 400
+        from core.imports.upgrade_intent import (
+            attach_upgrade_intent,
+            issue_upgrade_intent,
+            sanitize_client_import_metadata,
+        )
+        data = sanitize_client_import_metadata(raw_data)
+        _upgrade_intent = (
+            issue_upgrade_intent(_lib2_ctx['track_id'], origin='manual_grab')
+            if (_lib2_ctx or {}).get('track_id') is not None else None
+        )
+        if result_type == 'album' and (_lib2_ctx or {}).get('track_id') is not None:
+            return jsonify({
+                "success": False,
+                "error": (
+                    "Album results cannot be grabbed for a track-scoped "
+                    "Library v2 search. Select one track result instead."
+                ),
+            }), 400
+
+        # Candidate-token binding (audit §16.1): torrent/usenet grabs resolve
+        # an opaque candidate token server-side; the store revalidates that
+        # the token was minted for THIS profile (and, when entity-scoped,
+        # THIS lib2 entity). Grabs without tokens are unaffected. Factory,
+        # not instance — the album branch enters one scope per track.
+        _requesting_profile = get_current_profile_id()
+
+        def _cand_scope():
+            return candidate_binding(
+                _requesting_profile,
+                lib2_track_id=(_lib2_ctx or {}).get('track_id'),
+                lib2_album_id=(_lib2_ctx or {}).get('album_id'),
+                result_kind=result_type,
+            )
 
         if result_type == 'album':
             tracks = data.get('tracks', [])
             if not tracks:
                 return jsonify({"error": "No tracks found in album."}), 400
 
+            # A plain basic-search pick (no Library v2 target, no per-download
+            # check overrides): one batch, one pinned task per file, so it shows
+            # on the Downloads page like any other batch. torrent/usenet/lidarr
+            # are a whole release per download and stay on the direct route, as
+            # does a Library v2 grab, which needs its entity context, upgrade
+            # intent and two-phase acquisition preparation below.
+            _plain_pick = (_lib2_state == 'absent' and not data.get('skip_acoustid')
+                           and data.get('quality_check') is not False)
+            if _plain_pick and all(_pinned_batch.is_pinnable(t.get('username')) for t in tracks):
+                album_name = data.get('album_title') or data.get('album_name') or 'Unknown Album'
+                files = [
+                    _pinned_batch.PinnedFile(
+                        candidate=_pinned_batch.candidate_from_result(t),
+                        track_info=_pinned_batch.simple_track_info(t),
+                    )
+                    for t in tracks if t.get('username') and t.get('filename')
+                ]
+                if not files:
+                    return jsonify({"error": "No downloadable tracks in album."}), 400
+                batch_id, _task_ids = _pinned_batch.create_pinned_batch(
+                    files, name=album_name, profile_id=get_current_profile_id(),
+                    library_owner_id=_selected_library_owner())
+                _pinned_batch.dispatch_pinned_batch(batch_id, _task_ids, _pinned_batch_deps())
+                add_activity_item("", "Album Download Started", f"'{album_name}' - {len(files)} tracks", "Now")
+                return jsonify({
+                    "success": True,
+                    "batch_id": batch_id,
+                    "message": f"Started {len(files)} downloads from album",
+                })
+
+            # Per-download check overrides apply to every track of the album —
+            # the Library v2 interactive search sends them on album grabs too.
+            _album_skip_checks = []
+            if data.get('skip_acoustid'):
+                _album_skip_checks.append('acoustid')
+            if data.get('quality_check') is False:
+                _album_skip_checks.extend(['bit_depth', 'quality'])
+
+            # Acquisition correlation (roadmap 3): one shared batch id ties
+            # the per-file requests of this album grab together.
+            _album_batch_id = str(uuid.uuid4())
+
+            # Two-phase album grab: validate and persist every acquisition
+            # preparation before the first external client dispatch. A strict
+            # gate failure can therefore truthfully report zero starts and a
+            # browser retry cannot duplicate tracks that already escaped.
+            _prepared_album_tracks = []
+            try:
+                for track_data in tracks:
+                    username = track_data.get('username')
+                    _manual_result = {
+                        'username': username,
+                        'filename': track_data.get('filename'),
+                        'size': track_data.get('size', 0),
+                        'title': track_data.get('title'),
+                        'artist': track_data.get('artist'),
+                        'album': data.get('album_name'),
+                        'quality': track_data.get('quality'),
+                        'bitrate': track_data.get('bitrate'),
+                    }
+                    _acq_markers = _prepare_manual_grab(
+                        username,
+                        _manual_result,
+                        _lib2_ctx,
+                        batch_id=_album_batch_id,
+                    )
+                    _prepared_album_tracks.append((track_data, _acq_markers))
+                    if _manual_acquisition_dispatch_blocked(username, _acq_markers):
+                        _record_manual_acquisition_gap(
+                            username, _acq_markers, blocked=True)
+                        raise RuntimeError(
+                            "Acquisition preparation unavailable; album download not started."
+                        )
+                    _record_manual_acquisition_gap(
+                        username, _acq_markers, blocked=False)
+            except Exception as preflight_error:
+                from core.acquisition.manual_grab import fail_prepared_correlated_grab
+
+                for _track, prepared_markers in _prepared_album_tracks:
+                    fail_prepared_correlated_grab(
+                        prepared_markers, "album preflight aborted before dispatch")
+                logger.error("Manual album preflight failed: %s", preflight_error)
+                return jsonify({
+                    "success": False,
+                    "error": str(preflight_error),
+                    "started": 0,
+                    "requested": len(tracks),
+                }), 503
+
             started_downloads = 0
-            for track_data in tracks:
+            failed_downloads = 0
+            for track_data, _acq_markers in _prepared_album_tracks:
                 try:
                     username = track_data.get('username')
                     filename = track_data.get('filename')
                     file_size = track_data.get('size', 0)
-
-                    download_id = run_async(download_orchestrator.download(
-                        username,
-                        filename,
-                        file_size
-                    ))
+                    try:
+                        with _cand_scope():
+                            download_id = run_async(download_orchestrator.download(
+                                username,
+                                filename,
+                                file_size
+                            ))
+                    except Exception:
+                        from core.acquisition.manual_grab import fail_prepared_correlated_grab
+                        fail_prepared_correlated_grab(
+                            _acq_markers, "legacy client dispatch raised")
+                        raise
                     if download_id:
-                        # Register download for post-processing (simple transfer to /Transfer)
+                        from core.acquisition.manual_grab import bind_correlated_grab_transfer
+                        bind_correlated_grab_transfer(_acq_markers, download_id)
+                        # A grab naming a resolved Library-v2 entity runs
+                        # through the full import pipeline (real file
+                        # placement + tags + quarantine gate, docs §69.2) —
+                        # everything else falls back to the metadata-free
+                        # simple-download shortcut (transfer to /Transfer),
+                        # unchanged for grabs with no library target.
+                        _pipeline_fields = build_lib2_import_pipeline_fields(
+                            track_data, _lib2_ctx, album_name=data.get('album_name'),
+                        )
                         context_key = _make_context_key(username, filename)
-                        with matched_context_lock:
-                            matched_downloads_context[context_key] = {
-                                'search_result': {
-                                    'username': username,
-                                    'filename': filename,
-                                    'size': file_size,
-                                    'title': track_data.get('title', 'Unknown'),
-                                    'artist': track_data.get('artist', 'Unknown'),
-                                    'quality': track_data.get('quality', 'Unknown'),
-                                    'is_simple_download': True  # Flag for simple processing
-                                },
-                                'spotify_artist': None,  # No Spotify metadata
-                                'spotify_album': None,
-                                'track_info': None
-                            }
+                        _download_context = {
+                            'search_result': {
+                                'username': username,
+                                'filename': filename,
+                                'size': file_size,
+                                'title': track_data.get('title', 'Unknown'),
+                                'artist': track_data.get('artist', 'Unknown'),
+                                'quality': track_data.get('quality', 'Unknown'),
+                                'is_simple_download': _pipeline_fields.get('is_simple_download', True),
+                            },
+                            'artist': _pipeline_fields.get('artist'),
+                            'album': _pipeline_fields.get('album'),
+                            'spotify_artist': None,  # legacy alias; 'artist' above wins when set
+                            'spotify_album': None,
+                            'track_info': _pipeline_fields.get('track_info') or build_lib2_track_info(
+                                track_data,
+                                _lib2_ctx,
+                                album_name=data.get('album_name'),
+                            ),
+                            '_skip_quarantine_check': _album_skip_checks or None,
+                            'lib2_entity': _lib2_ctx,
+                            '_acquisition_grab_download_id': (
+                                _acq_markers or {}).get('download_id'),
+                        }
+                        attach_upgrade_intent(
+                            _download_context, _upgrade_intent)
+                        # stamps the profile and the selected library (#1279/#1199)
+                        _register_matched_download_context(context_key, _download_context)
+                        if _album_skip_checks:
+                            _audit_manual_skip(
+                                context_key, track_data.get('title'),
+                                track_data.get('artist'), _album_skip_checks,
+                                _requesting_profile)
+                        # Upstream 18c7c2ee7 gave this path a Downloads card,
+                        # because it hands the file to the orchestrator and
+                        # returns without a batch, so the download ran
+                        # invisibly. Only the metadata-free shortcut needs it
+                        # here: a grab that resolved a Library-v2 entity goes
+                        # through the import pipeline, which tracks it already,
+                        # and a second card would double-count the transfer.
+                        if _pipeline_fields.get('is_simple_download', True):
+                            _track_quick_download(
+                                download_id,
+                                title=track_data.get('title') or filename,
+                                artist=track_data.get('artist') or '',
+                                size_bytes=file_size,
+                                source_label='Album download',
+                            )
                         started_downloads += 1
+                    else:
+                        from core.acquisition.manual_grab import fail_prepared_correlated_grab
+                        fail_prepared_correlated_grab(
+                            _acq_markers, "legacy client rejected the dispatch")
+                        failed_downloads += 1
                 except Exception as e:
                     logger.error(f"Failed to start track download: {e}")
+                    failed_downloads += 1
                     continue
 
             # Add activity for album download start
-            album_name = data.get('album_name', 'Unknown Album')
+            # basic search albums carry album_title, album_name was never sent
+            album_name = data.get('album_title') or data.get('album_name') or 'Unknown Album'
             logger.info(f"Starting simple album download: '{album_name}' with {started_downloads}/{len(tracks)} tracks")
             add_activity_item("", "Album Download Started", f"'{album_name}' - {started_downloads} tracks", "Now")
 
             return jsonify({
                 "success": True,
-                "message": f"Started {started_downloads} downloads from album"
+                "message": f"Started {started_downloads}/{len(tracks)} downloads from album",
+                "started": started_downloads,
+                "failed": failed_downloads,
+                "requested": len(tracks),
             })
 
         else:
@@ -6166,10 +6821,10 @@ def start_download():
             filename = data.get('filename')
             file_size = data.get('size', 0)
 
-            logger.info(f"Download request - Username: {username}, Filename: {filename[:50]}...")
-
             if not username or not filename:
                 return jsonify({"error": "Missing username or filename."}), 400
+
+            logger.info(f"Download request - Username: {username}, Filename: {filename[:50]}...")
 
             # Blocklist guard (Phase 2b): a manual download is source-file-centric
             # (no metadata IDs), so this matches the blocked ARTIST by name. The
@@ -6190,45 +6845,136 @@ def start_download():
                 except Exception as _bl_err:
                     logger.debug("manual download blocklist check skipped: %s", _bl_err)
 
-            download_id = run_async(download_orchestrator.download(username, filename, file_size))
+            # one pinned task in its own batch, so it shows on the Downloads
+            # page. release-level sources stay on the direct route below
+            _plain_pick = (_lib2_state == 'absent' and not data.get('skip_acoustid')
+                           and data.get('quality_check') is not False)
+            if _plain_pick and _pinned_batch.is_pinnable(username):
+                title = data.get('title') or ''
+                artist = data.get('artist') or ''
+                batch_id, _task_ids = _pinned_batch.create_pinned_batch(
+                    [_pinned_batch.PinnedFile(
+                        candidate=_pinned_batch.candidate_from_result(data),
+                        track_info=_pinned_batch.simple_track_info(data),
+                    )],
+                    name=f"{artist} - {title}" if artist and title else (title or os.path.basename(str(filename).replace('\\', '/'))),
+                    profile_id=get_current_profile_id(),
+                    library_owner_id=_selected_library_owner(),
+                )
+                _pinned_batch.dispatch_pinned_batch(batch_id, _task_ids, _pinned_batch_deps())
+                add_activity_item("", "Track Download Started", f"'{title or filename}'", "Now")
+                return jsonify({"success": True, "batch_id": batch_id, "message": "Download started"})
+
+
+            _manual_result = {
+                'username': username,
+                'filename': filename,
+                'size': file_size,
+                'title': data.get('title'),
+                'artist': data.get('artist'),
+                'album': data.get('album_name'),
+                'quality': data.get('quality'),
+                'bitrate': data.get('bitrate'),
+            }
+            _acq_markers = _prepare_manual_grab(
+                username, _manual_result, _lib2_ctx)
+            if _manual_acquisition_dispatch_blocked(username, _acq_markers):
+                _record_manual_acquisition_gap(
+                    username, _acq_markers, blocked=True)
+                logger.error(
+                    "Manual dispatch blocked: acquisition preparation is required")
+                return jsonify({
+                    "success": False,
+                    "error": "Acquisition preparation unavailable; download not started.",
+                }), 503
+            _record_manual_acquisition_gap(
+                username, _acq_markers, blocked=False)
+            try:
+                with _cand_scope():
+                    download_id = run_async(download_orchestrator.download(
+                        username, filename, file_size))
+            except Exception:
+                from core.acquisition.manual_grab import fail_prepared_correlated_grab
+                fail_prepared_correlated_grab(
+                    _acq_markers, "legacy client dispatch raised")
+                raise
             logger.info(f"Download ID returned: {download_id}")
 
             if download_id:
+                from core.acquisition.manual_grab import bind_correlated_grab_transfer
+                bind_correlated_grab_transfer(_acq_markers, download_id)
                 # Register download for post-processing (simple transfer to /Transfer)
                 context_key = _make_context_key(username, filename)
                 is_streaming_source = username in ('youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon')
-                # Per-download check overrides: skip AcoustID and/or
-                # quality-quarantine checks on request.
+                # Per-download check overrides (Library v2 interactive search passes
+                # these): skip AcoustID and/or quality-quarantine checks on request.
                 _skip_checks = []
                 if data.get('skip_acoustid'):
                     _skip_checks.append('acoustid')
                 if data.get('quality_check') is False:
                     _skip_checks.extend(['bit_depth', 'quality'])
-                with matched_context_lock:
-                    matched_downloads_context[context_key] = {
-                        'search_result': {
-                            'username': username,
-                            'filename': filename,
-                            'size': file_size,
-                            'title': data.get('title', 'Unknown'),
-                            'artist': data.get('artist', 'Unknown'),
-                            'quality': data.get('quality', 'Unknown'),
-                            'is_simple_download': True  # Flag for simple processing
-                        },
-                        'spotify_artist': None,  # No Spotify metadata
-                        'spotify_album': None,
-                        'track_info': None,
-                        '_skip_quarantine_check': _skip_checks or None,
-                    }
-                    source_label = username.title() if is_streaming_source else 'Soulseek'
-                    logger.info(f"[{source_label}] Registered simple download for post-processing: {context_key}")
+                # A grab naming a resolved Library-v2 entity runs through the
+                # full import pipeline (real file placement + tags +
+                # quarantine gate, docs §69.2) — everything else falls back
+                # to the metadata-free simple-download shortcut (transfer to
+                # /Transfer), unchanged for grabs with no library target.
+                _pipeline_fields = build_lib2_import_pipeline_fields(
+                    data, _lib2_ctx, album_name=data.get('album_name'),
+                )
+                _download_context = {
+                    'search_result': {
+                        'username': username,
+                        'filename': filename,
+                        'size': file_size,
+                        'title': data.get('title', 'Unknown'),
+                        'artist': data.get('artist', 'Unknown'),
+                        'quality': data.get('quality', 'Unknown'),
+                        'is_simple_download': _pipeline_fields.get('is_simple_download', True),
+                    },
+                    'artist': _pipeline_fields.get('artist'),
+                    'album': _pipeline_fields.get('album'),
+                    'spotify_artist': None,  # legacy alias; 'artist' above wins when set
+                    'spotify_album': None,
+                    'track_info': _pipeline_fields.get('track_info') or build_lib2_track_info(
+                        data,
+                        _lib2_ctx,
+                        album_name=data.get('album_name'),
+                    ),
+                    '_skip_quarantine_check': _skip_checks or None,
+                    'lib2_entity': _lib2_ctx,
+                    '_acquisition_grab_download_id': (
+                        _acq_markers or {}).get('download_id'),
+                }
+                attach_upgrade_intent(_download_context, _upgrade_intent)
+                # stamps the profile and the selected library (#1279/#1199)
+                _register_matched_download_context(context_key, _download_context)
+                source_label = username.title() if is_streaming_source else 'Soulseek'
+                logger.info(f"[{source_label}] Registered download for post-processing: {context_key}")
+
+                # Audit a user-initiated override: record which profile-enforced
+                # checks were skipped so cleanup/repair jobs (and the user) know it
+                # was a deliberate manual choice (#library-v2).
+                if _skip_checks:
+                    _audit_manual_skip(
+                        context_key, data.get('title'), data.get('artist'),
+                        _skip_checks, _requesting_profile)
 
                 # Extract track name from filename for activity
                 track_name = filename.split('/')[-1] if '/' in filename else filename.split('\\')[-1] if '\\' in filename else filename
+                _track_quick_download(
+                    download_id,
+                    title=data.get('title') or track_name,
+                    artist=data.get('artist') or username or '',
+                    size_bytes=file_size,
+                    source_label=source_label or 'Search',
+                )
                 logger.info(f"Starting simple track download: '{track_name}'")
                 add_activity_item("", "Track Download Started", f"'{track_name}'", "Now")
                 return jsonify({"success": True, "message": "Download started"})
             else:
+                from core.acquisition.manual_grab import fail_prepared_correlated_grab
+                fail_prepared_correlated_grab(
+                    _acq_markers, "legacy client rejected the dispatch")
                 logger.error(f"Failed to start download for: {filename}")
                 return jsonify({"error": "Failed to start download"}), 500
 
@@ -6816,12 +7562,7 @@ def clear_finished_downloads():
         logger.error(f"Error clearing finished downloads: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
-# Streaming sources where the candidate's `username` field IS the source name
-# (Soulseek uses a real peer username; everything else stamps the source string).
-_STREAMING_SOURCE_NAMES = frozenset((
-    'youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon',
-    'torrent', 'usenet',
-))
+from core.downloads.source_policy import STREAMING_SOURCE_NAMES as _STREAMING_SOURCE_NAMES
 
 
 def _infer_candidate_source(username: str) -> str:
@@ -6947,7 +7688,7 @@ def get_task_detail(task_id):
             want_title = _norm_track_key(ti.get('name', ''))
             if want_title:
                 db = get_database()
-                entries, _ = db.get_library_history(event_type='download', page=1, limit=100)
+                entries, _ = db.get_library_history(event_type=('download', 'podcast'), page=1, limit=100)
                 for e in entries:
                     if _norm_track_key(e.get('title', '')) == want_title:
                         history = e
@@ -7110,10 +7851,18 @@ def download_selected_candidate(task_id):
         # pick indefinitely, leaving the user stuck at "downloading 0%".
         # Manual picks are user-initiated and infrequent; a fresh thread
         # per pick is cheaper than starving them behind background work.
+        # Candidate-token binding (audit §16.1): the worker thread below has
+        # no request context, so a torrent/usenet candidate token would be
+        # resolved as admin and rejected for any other profile. Bind the
+        # grab to the requesting profile explicitly.
+        from core.download_plugins.candidate_store import candidate_binding
+        _grab_profile = get_current_profile_id()
+
         def _run_manual_download():
             logger.info(f"[Manual Download] worker started for task {task_id} ({username} / {track_name})")
             try:
-                success = _attempt_download_with_candidates(task_id, [candidate], track, batch_id)
+                with candidate_binding(_grab_profile):
+                    success = _attempt_download_with_candidates(task_id, [candidate], track, batch_id)
                 logger.info(f"[Manual Download] worker finished for task {task_id} success={success}")
                 if not success:
                     with tasks_lock:
@@ -7150,26 +7899,54 @@ def download_selected_candidate(task_id):
         return jsonify({"error": str(e)}), 500
 
 
-def _resolve_link_track_query(source: str, track_id: str):
-    """Resolve a pasted (source, track_id) to a clean "artist title" search
-    query via the source client's get_track (#813). Returns (query, None) or
-    (None, error). Used so a pasted Tidal/Qobuz link runs the source's normal
-    search (proven-downloadable candidates) instead of a hand-built one."""
-    from core.downloads.track_link import query_from_track_payload
+def _resolve_link_track_query(source: str, entity_id: str, kind: str = 'track',
+                              prefer_title: str = ''):
+    """Resolve a pasted (source, kind, id) to a clean "artist title" search
+    query via the source client's get_track / get_album (#813). Returns
+    ``(query, track_id, None)`` or ``(None, None, error)``.
+
+    Album links (Deezer remix singles) resolve to a track id first, then
+    follow the same get_track path. Used so a pasted Tidal/Qobuz/Deezer
+    link runs the source's normal search (proven-downloadable candidates)
+    instead of a hand-built one."""
+    from core.downloads.track_link import (
+        query_from_album_payload, query_from_track_payload, track_id_from_album_payload,
+    )
     client = download_orchestrator.client(source) if download_orchestrator else None
-    if not client or not hasattr(client, 'get_track'):
-        return None, f"{source.title()} is not connected"
+    if not client:
+        return None, None, f"{source.title()} is not connected"
+
+    track_id = entity_id
+    if kind == 'album':
+        if not hasattr(client, 'get_album'):
+            return None, None, f"{source.title()} album links aren't supported"
+        try:
+            album = client.get_album(entity_id)
+        except Exception as e:
+            return None, None, f"Could not resolve {source.title()} album: {e}"
+        if not album:
+            return None, None, f"{source.title()} album {entity_id} not found"
+        track_id = track_id_from_album_payload(album, prefer_title)
+        if not track_id:
+            # No embedded tracks — still search by album artist+title.
+            query = query_from_album_payload(album)
+            if not query:
+                return None, None, f"Could not read the album title from {source.title()}"
+            return query, None, None
+
+    if not hasattr(client, 'get_track'):
+        return None, None, f"{source.title()} is not connected"
     try:
         raw = client.get_track(track_id)
     except Exception as e:
-        return None, f"Could not resolve {source.title()} track: {e}"
+        return None, None, f"Could not resolve {source.title()} track: {e}"
     if not raw:
-        return None, f"{source.title()} track {track_id} not found"
+        return None, None, f"{source.title()} track {track_id} not found"
 
     query = query_from_track_payload(source, raw)
     if not query:
-        return None, f"Could not read the track title from {source.title()}"
-    return query, None
+        return None, None, f"Could not read the track title from {source.title()}"
+    return query, str(track_id), None
 
 
 @app.route('/api/downloads/task/<task_id>/manual-search', methods=['POST'])
@@ -7211,14 +7988,14 @@ def manual_search_for_task(task_id):
         download_mode, available_sources = _list_available_download_sources()
         valid_source_ids = {s['id'] for s in available_sources}
 
-        # Pasted streaming-source track link (#813): resolve it to a clean
-        # "artist title" query and search ONLY that source, then bubble the
-        # exact track to the top. Falls back to a normal text search if the
+        # Pasted streaming-source track/album link (#813): resolve it to a
+        # clean "artist title" query and search ONLY that source, then bubble
+        # the exact track to the top. Falls back to a normal text search if the
         # source isn't connected or the link can't be resolved — so the user is
         # never worse off than typing the query themselves.
-        from core.downloads.track_link import parse_download_track_link
+        from core.downloads.track_link import parse_download_link
         from core.soundcloud_client import is_soundcloud_url
-        link = parse_download_track_link(query)
+        link = parse_download_link(query)
         link_source = None
         link_track_id = None
         linked_result = None  # the EXACT track fetched by id, injected into results
@@ -7234,8 +8011,8 @@ def manual_search_for_task(task_id):
                 }), 400
             source = 'soundcloud'
         elif link:
-            _src, _tid = link
-            # A parsed link is unambiguously a Tidal/Qobuz track URL, never a
+            _src, _kind, _eid = link.source, link.kind, link.entity_id
+            # A parsed link is unambiguously a Tidal/Qobuz/Deezer URL, never a
             # name a user would type — so if we can't use it, say why clearly
             # instead of running a useless search of the raw URL text.
             if _src not in valid_source_ids:
@@ -7243,26 +8020,30 @@ def manual_search_for_task(task_id):
                     "error": f"{_src.title()} isn't connected — can't resolve a "
                              f"{_src.title()} link. Connect it in Settings, or search by name."
                 }), 400
-            clean_q, link_err = _resolve_link_track_query(_src, _tid)
+            _prefer = track_info.get('name', '') if isinstance(track_info, dict) else ''
+            clean_q, resolved_tid, link_err = _resolve_link_track_query(
+                _src, _eid, kind=_kind, prefer_title=_prefer,
+            )
             if not clean_q:
                 return jsonify({
                     "error": link_err or f"Couldn't resolve that {_src.title()} link."
                 }), 400
             query = clean_q
             source = _src
-            link_source, link_track_id = _src, _tid
+            link_source, link_track_id = _src, resolved_tid
             # Fetch the EXACT linked track as a downloadable result to inject —
             # a text search for an obscure track's name often doesn't surface it
             # at all, so we can't rely on it being in the search results (#932).
-            # Defensive: only sources that expose get_track_result (Qobuz today);
+            # Defensive: only sources that expose get_track_result (Qobuz/Deezer);
             # others fall back to the bubble path below — never worse than before.
-            _link_client = download_orchestrator.client(_src) if download_orchestrator else None
-            if _link_client is not None and hasattr(_link_client, 'get_track_result'):
-                try:
-                    linked_result = _link_client.get_track_result(_tid)
-                except Exception as _lr_err:
-                    logger.debug("[Manual Search] get_track_result failed for %s %s: %s",
-                                 _src, _tid, _lr_err)
+            if resolved_tid:
+                _link_client = download_orchestrator.client(_src) if download_orchestrator else None
+                if _link_client is not None and hasattr(_link_client, 'get_track_result'):
+                    try:
+                        linked_result = _link_client.get_track_result(resolved_tid)
+                    except Exception as _lr_err:
+                        logger.debug("[Manual Search] get_track_result failed for %s %s: %s",
+                                     _src, resolved_tid, _lr_err)
 
         if source != 'all':
             if source not in valid_source_ids:
@@ -7279,13 +8060,21 @@ def manual_search_for_task(task_id):
         }
 
         from concurrent.futures import ThreadPoolExecutor, as_completed
+        from core.download_plugins.candidate_store import candidate_binding
+
+        # Captured NOW: the pool threads and the streaming generator run
+        # outside the Flask request context, where get_current_profile_id()
+        # would silently degrade to admin. Candidate tokens minted by this
+        # search must belong to the profile that asked for it (audit §16.1).
+        _search_profile = get_current_profile_id()
 
         def _search_one(src_name: str):
             client = download_orchestrator.client(src_name) if download_orchestrator else None
             if not client:
                 return src_name, [], None
             try:
-                result = run_async(client.search(query))
+                with candidate_binding(_search_profile):
+                    result = run_async(client.search(query))
                 if isinstance(result, tuple):
                     tracks = result[0] if result else []
                 else:
@@ -7403,147 +8192,6 @@ def get_scan_status():
 
     except Exception as e:
         logger.error(f"Error getting scan status: {e}")
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route('/api/database/incremental-update', methods=['POST'])
-def request_incremental_database_update():
-    """
-    Request an incremental database update with prerequisites checking.
-    """
-    try:
-        data = request.get_json() or {}
-        reason = data.get('reason', 'Web UI manual request')
-
-        # Check prerequisites (similar to GUI logic)
-        db = get_database()
-
-        # Check if database has enough content for incremental updates
-        track_count = db.execute("SELECT COUNT(*) FROM tracks").fetchone()[0]
-        if track_count < 100:
-            return jsonify({
-                "success": False,
-                "error": f"Database has only {track_count} tracks - insufficient for incremental updates (minimum 100)",
-                "track_count": track_count
-            }), 400
-
-        # Check if there's been a previous full refresh
-        last_refresh = db.execute(
-            "SELECT value FROM system_info WHERE key = 'last_full_refresh'"
-        ).fetchone()
-
-        if not last_refresh:
-            return jsonify({
-                "success": False,
-                "error": "No previous full refresh found - incremental updates require established database",
-                "suggestion": "Run a full refresh first"
-            }), 400
-
-        # Start incremental update
-        if db_update_state.get('status') == 'running':
-            return jsonify({"success": False, "error": "Database update already running"}), 409
-
-        active_server = config_manager.get_active_media_server()
-        with db_update_lock:
-            db_update_state.update({
-                "status": "running", "phase": "Initializing...",
-                "progress": 0, "current_item": "", "processed": 0, "total": 0, "error_message": "",
-                "last_progress_at": time.time(),  # seed heartbeat for the stall watchdog
-            })
-        db_update_executor.submit(_run_db_update_task, False, active_server)
-
-        add_activity_item("", "Database Update", f"Incremental update started: {reason}", "Now")
-        return jsonify({
-            "success": True,
-            "message": "Incremental database update started",
-            "track_count": track_count,
-            "last_refresh": last_refresh[0] if last_refresh else None,
-            "reason": reason
-        })
-
-    except Exception as e:
-        logger.error(f"Error requesting incremental database update: {e}")
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route('/api/test/automation', methods=['POST'])
-def test_automation_workflow():
-    """
-    Test endpoint to verify the automatic workflow functionality.
-    """
-    try:
-        data = request.get_json() or {}
-        test_type = data.get('test_type', 'full')
-
-        results = {}
-
-        # Test 1: Scan manager status
-        if web_scan_manager:
-            scan_status = web_scan_manager.get_scan_status()
-            results['scan_manager'] = {'status': 'available', 'current_status': scan_status}
-        else:
-            results['scan_manager'] = {'status': 'unavailable'}
-
-        # Test 2: Database prerequisites
-        try:
-            db = get_database()
-            track_count = db.execute("SELECT COUNT(*) FROM tracks").fetchone()[0]
-            last_refresh = db.execute(
-                "SELECT value FROM system_info WHERE key = 'last_full_refresh'"
-            ).fetchone()
-
-            results['database'] = {
-                'track_count': track_count,
-                'meets_minimum': track_count >= 100,
-                'has_previous_refresh': last_refresh is not None,
-                'last_refresh': last_refresh[0] if last_refresh else None
-            }
-        except Exception as e:
-            results['database'] = {'error': str(e)}
-
-        # Test 3: Media client connections
-        active_server = config_manager.get_active_media_server()
-        results['media_clients'] = {'active_server': active_server}
-
-        for client_name, client in [
-            ('plex', media_server_engine.client('plex')),
-            ('jellyfin', media_server_engine.client('jellyfin')),
-            ('navidrome', media_server_engine.client('navidrome'))
-        ]:
-            try:
-                is_connected = client.is_connected() if client else False
-                results['media_clients'][client_name] = {
-                    'available': client is not None,
-                    'connected': is_connected
-                }
-            except Exception as e:
-                results['media_clients'][client_name] = {
-                    'available': client is not None,
-                    'connected': False,
-                    'error': str(e)
-                }
-
-        # Test 4: If requested, actually test the scan request
-        if test_type == 'full' and web_scan_manager:
-            try:
-                scan_result = web_scan_manager.request_scan(
-                    reason="Automation test",
-                    callback=None
-                )
-                results['scan_test'] = {'success': True, 'result': scan_result}
-            except Exception as e:
-                results['scan_test'] = {'success': False, 'error': str(e)}
-
-        return jsonify({
-            "success": True,
-            "test_results": results,
-            "automation_ready": (
-                results.get('scan_manager', {}).get('status') == 'available' and
-                results.get('database', {}).get('meets_minimum', False) and
-                results.get('database', {}).get('has_previous_refresh', False)
-            )
-        })
-
-    except Exception as e:
-        logger.error(f"Error in automation test: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route('/api/searches/clear-all', methods=['POST'])
@@ -7688,7 +8336,9 @@ def get_library_history():
     """Get persistent library history (downloads and server imports)."""
     try:
         event_type = request.args.get('type', None)
-        if event_type and event_type not in ('download', 'import'):
+        if event_type == 'podcasts':
+            event_type = 'podcast'
+        if event_type and event_type not in ('download', 'import', 'podcast'):
             event_type = None
         page = max(1, int(request.args.get('page', 1)))
         limit = min(200, max(1, int(request.args.get('limit', 50))))
@@ -7760,7 +8410,10 @@ def get_library_artists():
         # Get database instance
         database = get_database()
 
-        # Get artists from database
+        # The public compatibility endpoint now reads the authoritative
+        # Library-v2 catalogue unconditionally. ``MusicDatabase`` preserves the
+        # response shape for older callers, but an empty/in-progress catalogue
+        # is reported honestly instead of silently serving stale legacy rows.
         result = database.get_library_artists(
             search_query=search_query,
             letter=letter,
@@ -7768,7 +8421,7 @@ def get_library_artists():
             limit=limit,
             watchlist_filter=watchlist_filter,
             profile_id=get_current_profile_id(),
-            source_filter=source_filter
+            source_filter=source_filter,
         )
 
         # Fix image URLs for all artists
@@ -7858,25 +8511,55 @@ def library_completion_stream():
             try:
                 candidate_albums = db.get_candidate_albums_for_artist(artist_name, server_source=_active_server)
             except Exception as _cand_err:
-                print(f"[completion-stream] Failed to pre-fetch album candidates for '{artist_name}': {_cand_err}")
+                logger.info(f"[completion-stream] Failed to pre-fetch album candidates for '{artist_name}': {_cand_err}")
                 candidate_albums = None
             _t1 = time.perf_counter()
-            print(f"[completion-stream] Pre-fetched {len(candidate_albums) if candidate_albums is not None else 0} library albums for '{artist_name}' in {(_t1 - _t0) * 1000:.0f}ms")
+            logger.info(f"[completion-stream] Pre-fetched {len(candidate_albums) if candidate_albums is not None else 0} library albums for '{artist_name}' in {(_t1 - _t0) * 1000:.0f}ms")
 
             if candidate_albums:
                 _t2 = time.perf_counter()
                 try:
                     candidate_tracks = db.get_candidate_tracks_for_albums([a.id for a in candidate_albums])
                 except Exception as _tr_err:
-                    print(f"[completion-stream] Failed to pre-fetch track candidates for '{artist_name}': {_tr_err}")
+                    logger.info(f"[completion-stream] Failed to pre-fetch track candidates for '{artist_name}': {_tr_err}")
                     candidate_tracks = None
                 _t3 = time.perf_counter()
-                print(f"[completion-stream] Pre-fetched {len(candidate_tracks) if candidate_tracks is not None else 0} library tracks in {(_t3 - _t2) * 1000:.0f}ms")
+                logger.info(f"[completion-stream] Pre-fetched {len(candidate_tracks) if candidate_tracks is not None else 0} library tracks in {(_t3 - _t2) * 1000:.0f}ms")
+
+            completeness_cache = None
+            album_source_ids_cache = None
+            canonical_cache = {}
+            track_cache = {}
+            pin_tracks_cache = {}
+            api_counts_cache = {}
+            if candidate_albums and hasattr(db, 'get_album_api_track_counts'):
+                try:
+                    api_counts_cache = dict(db.get_album_api_track_counts([a.id for a in candidate_albums]))
+                except Exception as _c_err:
+                    logger.debug(f"[completion-stream] Failed pre-fetching api track counts: {_c_err}")
+            if candidate_albums and candidate_tracks and hasattr(db, 'build_candidate_completeness_cache'):
+                try:
+                    completeness_cache = db.build_candidate_completeness_cache(candidate_albums, candidate_tracks)
+                except Exception as _b_err:
+                    logger.info(f"[completion-stream] Failed building completeness cache: {_b_err}")
+            if candidate_albums and hasattr(db, 'get_album_source_ids'):
+                try:
+                    album_source_ids_cache = db.get_album_source_ids([a.id for a in candidate_albums])
+                except Exception as _s_err:
+                    logger.info(f"[completion-stream] Failed fetching album source IDs: {_s_err}")
 
             yield f"data: {json.dumps({'type': 'start', 'total_items': len(all_items)})}\n\n"
 
             _loop_start = time.perf_counter()
+            _loop_cpu_start = time.thread_time()
+            # per-item timing, so a slow page can be told apart from a slow
+            # item: the log names the slowest few and how many took a second.
+            # thread cpu time next to wall time tells work apart from waiting
+            # (the gil, a lock, the disk): a loop that spent 18 s of wall on
+            # 0.5 s of cpu was starved, not slow.
+            _item_times = []
             for _i, (category, item) in enumerate(all_items):
+                _item_start = time.perf_counter()
                 try:
                     # Map Library field names to helper field names.
                     # CRUCIAL: carry the card's YEAR through — the re-release
@@ -7888,7 +8571,7 @@ def library_completion_stream():
                     mapped = {
                         'id': item['id'],
                         'name': item['title'],
-                        'total_tracks': item.get('track_count', 0),
+                        'total_tracks': item.get('total_tracks') or item.get('track_count') or 0,
                         'album_type': item.get('album_type', 'album'),
                         'year': item.get('year'),
                         'release_date': item.get('release_date') or item.get('releaseDate'),
@@ -7902,9 +8585,30 @@ def library_completion_stream():
                                    or source_override)
 
                     if category == 'singles':
-                        result = check_single_completion(db, mapped, artist_name, source_override=item_source, candidate_albums=candidate_albums, candidate_tracks=candidate_tracks)
+                        result = check_single_completion(
+                            db, mapped, artist_name,
+                            source_override=item_source,
+                            candidate_albums=candidate_albums,
+                            candidate_tracks=candidate_tracks,
+                            completeness_cache=completeness_cache,
+                            album_source_ids_cache=album_source_ids_cache,
+                            canonical_cache=canonical_cache,
+                            track_cache=track_cache,
+                            api_counts_cache=api_counts_cache,
+                        )
                     else:
-                        result = check_album_completion(db, mapped, artist_name, source_override=item_source, candidate_albums=candidate_albums)
+                        result = check_album_completion(
+                            db, mapped, artist_name,
+                            source_override=item_source,
+                            candidate_albums=candidate_albums,
+                            candidate_tracks=candidate_tracks,
+                            completeness_cache=completeness_cache,
+                            album_source_ids_cache=album_source_ids_cache,
+                            canonical_cache=canonical_cache,
+                            track_cache=track_cache,
+                            pin_tracks_cache=pin_tracks_cache,
+                            api_counts_cache=api_counts_cache,
+                        )
 
                     result['id'] = item['id']
                     result['category'] = category
@@ -7912,12 +8616,18 @@ def library_completion_stream():
                     yield f"data: {json.dumps(result)}\n\n"
                 except Exception as e:
                     yield f"data: {json.dumps({'type': 'completion', 'category': category, 'id': item['id'], 'status': 'error', 'owned_tracks': 0, 'expected_tracks': item.get('track_count', 0), 'completion_percentage': 0, 'confidence': 0.0, 'error': str(e)})}\n\n"
-
-                time.sleep(0.05)  # 50ms between items for visible streaming
+                finally:
+                    _item_times.append((time.perf_counter() - _item_start, category, str(item.get('title') or item.get('name') or item.get('id'))))
 
             _loop_elapsed = time.perf_counter() - _loop_start
-            _sleep_floor = 0.05 * len(all_items)
-            print(f"[completion-stream] Processed {len(all_items)} items for '{artist_name}' in {_loop_elapsed * 1000:.0f}ms (sleep floor: {_sleep_floor * 1000:.0f}ms)")
+            _loop_cpu = time.thread_time() - _loop_cpu_start
+            _slow = sorted(_item_times, reverse=True)[:3]
+            _over_1s = sum(1 for t, _c, _n in _item_times if t >= 1.0)
+            logger.info(
+                f"[completion-stream] Processed {len(all_items)} items for '{artist_name}' in {_loop_elapsed * 1000:.0f}ms wall / "
+                f"{_loop_cpu * 1000:.0f}ms cpu "
+                f"(total {(time.perf_counter() - _t0) * 1000:.0f}ms with pre-fetch; {_over_1s} items over 1s; slowest: "
+                + ", ".join(f"{n} [{c}] {t * 1000:.0f}ms" for t, c, n in _slow) + ")")
 
             yield f"data: {json.dumps({'type': 'complete', 'processed_count': len(all_items)})}\n\n"
 
@@ -7927,8 +8637,10 @@ def library_completion_stream():
             traceback.print_exc()
             yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
 
+    # the stream outlives the request: keep the caller's library (#1199)
+    from core.library_scope import scoped_stream
     return Response(
-        generate(),
+        scoped_stream(generate()),
         content_type='text/event-stream',
         headers={
             'Cache-Control': 'no-cache',
@@ -8172,7 +8884,13 @@ def reidentify_apply():
         conn = database._get_connection()
         try:
             cur = conn.cursor()
-            cur.execute("SELECT file_path FROM tracks WHERE id = ?", (str(library_track_id),))
+            # Library v2 owns the files: the path lives on lib2_track_files, and
+            # a track can carry several, so this takes the primary active one.
+            cur.execute(
+                "SELECT f.path AS file_path FROM lib2_track_files f "
+                "WHERE f.track_id = ? AND COALESCE(f.file_state, 'active') = 'active' "
+                "ORDER BY f.is_primary DESC, f.id ASC LIMIT 1",
+                (str(library_track_id),))
             row = cur.fetchone()
         finally:
             conn.close()
@@ -8492,235 +9210,6 @@ def _build_library_tag_db_data(track_data, album_genres=None):
     return db_data
 
 
-@app.route('/api/library/track/<track_id>/tag-preview', methods=['GET'])
-def get_track_tag_preview(track_id):
-    """Read current file tags and compare against DB metadata for a single track."""
-    try:
-        from core.tag_writer import read_file_tags, build_tag_diff
-        database = get_database()
-
-        # Get track + album + artist data from DB
-        conn = database._get_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT t.*, a.name as artist_name, al.title as album_title,
-                   al.year, al.release_date, al.genres as album_genres, al.track_count,
-                   al.thumb_url as album_thumb_url, a.thumb_url as artist_thumb_url
-            FROM tracks t
-            JOIN artists a ON t.artist_id = a.id
-            JOIN albums al ON t.album_id = al.id
-            WHERE t.id = ?
-        """, (str(track_id),))
-        row = cursor.fetchone()
-        if not row:
-            return jsonify({"success": False, "error": "Track not found"}), 404
-
-        track_data = dict(row)
-        file_path = track_data.get('file_path')
-
-        # Resolve path if needed
-        resolved_path = _resolve_library_file_path(file_path)
-        if not resolved_path:
-            return jsonify({"success": False, "error": _get_file_not_found_error(file_path), "file_path": file_path}), 404
-
-        # Read current file tags
-        file_tags = read_file_tags(resolved_path)
-        if file_tags.get('error'):
-            return jsonify({"success": False, "error": file_tags['error']}), 400
-
-        # Parse album genres for diff
-        album_genres = []
-        if track_data.get('album_genres'):
-            try:
-                import json as _json
-                parsed = _json.loads(track_data['album_genres'])
-                album_genres = parsed if isinstance(parsed, list) else [str(parsed)]
-            except (ValueError, TypeError):
-                album_genres = [g.strip() for g in track_data['album_genres'].split(',') if g.strip()]
-
-        # Build DB metadata dict for comparison
-        db_data = _build_library_tag_db_data(track_data, album_genres)
-
-        diff = build_tag_diff(file_tags, db_data)
-        has_changes = any(d['changed'] for d in diff)
-
-        # Include server type so frontend can offer server sync option
-        active_server = config_manager.get_active_media_server()
-        server_connected = media_server_engine.is_connected() if media_server_engine else False
-
-        return jsonify({
-            "success": True,
-            "file_path": resolved_path,
-            "file_tags": file_tags,
-            "db_data": db_data,
-            "diff": diff,
-            "has_changes": has_changes,
-            "server_type": active_server if server_connected else None,
-        })
-
-    except Exception as e:
-        logger.error(f"Tag preview error for track {track_id}: {e}")
-        return jsonify({"success": False, "error": str(e)}), 500
-
-
-@app.route('/api/library/tracks/tag-preview-batch', methods=['POST'])
-def get_batch_tag_preview():
-    """Read current file tags and compare against DB metadata for multiple tracks."""
-    try:
-        from core.tag_writer import read_file_tags, build_tag_diff
-        data = request.get_json()
-        track_ids = data.get('track_ids', [])
-        if not track_ids:
-            return jsonify({"success": False, "error": "No track IDs provided"}), 400
-
-        database = get_database()
-        conn = database._get_connection()
-        cursor = conn.cursor()
-
-        placeholders = ','.join('?' for _ in track_ids)
-        cursor.execute(f"""
-            SELECT t.*, a.name as artist_name, al.title as album_title,
-                   al.year, al.release_date, al.genres as album_genres, al.track_count,
-                   al.thumb_url as album_thumb_url, a.thumb_url as artist_thumb_url
-            FROM tracks t
-            JOIN artists a ON t.artist_id = a.id
-            JOIN albums al ON t.album_id = al.id
-            WHERE t.id IN ({placeholders})
-        """, [str(tid) for tid in track_ids])
-        rows = [dict(r) for r in cursor.fetchall()]
-
-        results = []
-        for track_data in rows:
-            track_id = track_data['id']
-            file_path = track_data.get('file_path')
-            resolved_path = _resolve_library_file_path(file_path)
-
-            entry = {
-                'track_id': track_id,
-                'title': track_data.get('title', 'Unknown'),
-                'track_number': track_data.get('track_number'),
-            }
-
-            if not resolved_path:
-                entry['error'] = _get_file_not_found_error(file_path)
-                results.append(entry)
-                continue
-
-            try:
-                file_tags = read_file_tags(resolved_path)
-                if file_tags.get('error'):
-                    entry['error'] = file_tags['error']
-                    results.append(entry)
-                    continue
-
-                album_genres = []
-                if track_data.get('album_genres'):
-                    try:
-                        parsed = json.loads(track_data['album_genres'])
-                        album_genres = parsed if isinstance(parsed, list) else [str(parsed)]
-                    except (ValueError, TypeError):
-                        album_genres = [g.strip() for g in track_data['album_genres'].split(',') if g.strip()]
-
-                db_data = _build_library_tag_db_data(track_data, album_genres)
-
-                diff = build_tag_diff(file_tags, db_data)
-                has_changes = any(d['changed'] for d in diff)
-                changed_fields = [d for d in diff if d['changed']]
-
-                entry['diff'] = diff
-                entry['has_changes'] = has_changes
-                entry['changed_count'] = len(changed_fields)
-
-            except Exception as e:
-                entry['error'] = str(e)
-
-            results.append(entry)
-
-        # Server type info — engine routes to active client.
-        active_server = config_manager.get_active_media_server()
-        server_connected = media_server_engine.is_connected() if media_server_engine else False
-
-        return jsonify({
-            "success": True,
-            "tracks": results,
-            "server_type": active_server if server_connected else None,
-        })
-
-    except Exception as e:
-        logger.error(f"Batch tag preview error: {e}")
-        return jsonify({"success": False, "error": str(e)}), 500
-
-
-@app.route('/api/library/track/<track_id>/write-tags', methods=['POST'])
-def write_track_tags(track_id):
-    """Write DB metadata into the audio file tags for a single track."""
-    try:
-        from core.tag_writer import write_tags_to_file
-        database = get_database()
-        data = request.get_json() or {}
-        embed_cover = data.get('embed_cover', True)
-
-        # Get full track data
-        conn = database._get_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT t.*, a.name as artist_name, al.title as album_title,
-                   al.year, al.release_date, al.genres as album_genres, al.track_count,
-                   al.thumb_url as album_thumb_url, a.thumb_url as artist_thumb_url
-            FROM tracks t
-            JOIN artists a ON t.artist_id = a.id
-            JOIN albums al ON t.album_id = al.id
-            WHERE t.id = ?
-        """, (str(track_id),))
-        row = cursor.fetchone()
-        if not row:
-            return jsonify({"success": False, "error": "Track not found"}), 404
-
-        track_data = dict(row)
-        file_path = track_data.get('file_path')
-        resolved_path = _resolve_library_file_path(file_path)
-        if not resolved_path:
-            return jsonify({"success": False, "error": _get_file_not_found_error(file_path)}), 404
-
-        # Parse genres
-        album_genres = []
-        if track_data.get('album_genres'):
-            try:
-                import json as _json
-                parsed = _json.loads(track_data['album_genres'])
-                album_genres = parsed if isinstance(parsed, list) else [str(parsed)]
-            except (ValueError, TypeError):
-                album_genres = [g.strip() for g in track_data['album_genres'].split(',') if g.strip()]
-
-        # Build data for writer
-        db_data = _build_library_tag_db_data(track_data, album_genres)
-
-        # Resolve cover URL
-        cover_url = None
-        if embed_cover:
-            thumb = track_data.get('album_thumb_url') or track_data.get('artist_thumb_url')
-            if thumb and thumb.startswith('http'):
-                cover_url = thumb
-
-        # Use file lock for thread safety
-        file_lock = get_file_lock(resolved_path)
-        with file_lock:
-            result = write_tags_to_file(resolved_path, db_data, embed_cover=embed_cover, cover_url=cover_url)
-
-        # Sync to media server if requested and write succeeded
-        sync_result = None
-        if result.get('success') and data.get('sync_to_server'):
-            server_type = config_manager.get_active_media_server()
-            sync_result = _sync_tracks_to_server([track_data], server_type)
-            result['server_sync'] = sync_result
-
-        return jsonify(result)
-
-    except Exception as e:
-        logger.error(f"Write tags error for track {track_id}: {e}")
-        return jsonify({"success": False, "error": str(e)}), 500
-
-
 _write_tags_batch_state = {
     'status': 'idle',  # idle | running | done
     'total': 0,
@@ -8736,196 +9225,6 @@ _write_tags_batch_state = {
     'sync_failed': 0,
 }
 _write_tags_batch_lock = threading.Lock()
-
-
-@app.route('/api/library/tracks/write-tags-batch', methods=['POST'])
-def write_tracks_tags_batch():
-    """Write DB metadata into audio file tags for multiple tracks (runs in background)."""
-    try:
-        with _write_tags_batch_lock:
-            if _write_tags_batch_state['status'] == 'running':
-                return jsonify({"success": False, "error": "A batch tag write is already in progress"}), 409
-
-        database = get_database()
-        data = request.get_json()
-        if not data or not data.get('track_ids'):
-            return jsonify({"success": False, "error": "track_ids required"}), 400
-
-        track_ids = data['track_ids']
-        embed_cover = data.get('embed_cover', True)
-
-        # Fetch all track data upfront (in the request thread, fast DB query)
-        conn = database._get_connection()
-        cursor = conn.cursor()
-        placeholders = ','.join('?' * len(track_ids))
-        cursor.execute(f"""
-            SELECT t.*, a.name as artist_name, al.title as album_title,
-                   al.year, al.release_date, al.genres as album_genres, al.track_count,
-                   al.thumb_url as album_thumb_url, a.thumb_url as artist_thumb_url
-            FROM tracks t
-            JOIN artists a ON t.artist_id = a.id
-            JOIN albums al ON t.album_id = al.id
-            WHERE t.id IN ({placeholders})
-        """, [str(tid) for tid in track_ids])
-
-        rows = [dict(r) for r in cursor.fetchall()]
-
-        sync_to_server = data.get('sync_to_server', False)
-
-        # Initialize state
-        with _write_tags_batch_lock:
-            _write_tags_batch_state.update({
-                'status': 'running',
-                'total': len(track_ids),
-                'processed': 0,
-                'written': 0,
-                'skipped': 0,
-                'failed': 0,
-                'current_track': '',
-                'errors': [],
-                'sync_phase': None,
-                'sync_server': None,
-                'sync_synced': 0,
-                'sync_failed': 0,
-            })
-
-        # Count missing DB rows
-        found_ids = {str(r['id']) for r in rows}
-        missing = [tid for tid in track_ids if str(tid) not in found_ids]
-        if missing:
-            with _write_tags_batch_lock:
-                _write_tags_batch_state['failed'] += len(missing)
-                _write_tags_batch_state['processed'] += len(missing)
-                for tid in missing:
-                    _write_tags_batch_state['errors'].append({'track_id': tid, 'error': 'Track not found in database'})
-
-        # Run the actual writes in a background thread
-        def _run_batch():
-            try:
-                from core.tag_writer import (write_tags_to_file, download_cover_art,
-                                             read_file_tags, build_tag_diff,
-                                             diff_has_actionable_change)
-
-                written_tracks = []  # Track dicts that were successfully written (for server sync)
-
-                # Pre-download cover art once per unique album URL
-                cover_cache = {}  # url → (bytes, mime) or None
-                if embed_cover:
-                    unique_urls = set()
-                    for td in rows:
-                        thumb = td.get('album_thumb_url') or td.get('artist_thumb_url')
-                        if thumb and thumb.startswith('http'):
-                            unique_urls.add(thumb)
-                    if unique_urls:
-                        with _write_tags_batch_lock:
-                            _write_tags_batch_state['current_track'] = f'Downloading cover art ({len(unique_urls)} album{"s" if len(unique_urls) != 1 else ""})...'
-                        for url in unique_urls:
-                            cover_cache[url] = download_cover_art(url)
-
-                for track_data in rows:
-                    file_path = track_data.get('file_path')
-                    resolved_path = _resolve_library_file_path(file_path)
-                    track_title = track_data.get('title', 'Unknown')
-
-                    with _write_tags_batch_lock:
-                        _write_tags_batch_state['current_track'] = track_title
-
-                    if not resolved_path:
-                        with _write_tags_batch_lock:
-                            _write_tags_batch_state['failed'] += 1
-                            _write_tags_batch_state['processed'] += 1
-                            _write_tags_batch_state['errors'].append({'track_id': track_data['id'], 'error': _get_file_not_found_error(file_path)})
-                        continue
-
-                    # Parse genres
-                    album_genres = []
-                    if track_data.get('album_genres'):
-                        try:
-                            parsed = json.loads(track_data['album_genres'])
-                            album_genres = parsed if isinstance(parsed, list) else [str(parsed)]
-                        except (ValueError, TypeError):
-                            album_genres = [g.strip() for g in track_data['album_genres'].split(',') if g.strip()]
-
-                    db_data = _build_library_tag_db_data(track_data, album_genres)
-
-                    # Get pre-downloaded cover art for this track's album
-                    art_data = None
-                    if embed_cover:
-                        thumb = track_data.get('album_thumb_url') or track_data.get('artist_thumb_url')
-                        if thumb and thumb.startswith('http'):
-                            art_data = cover_cache.get(thumb)
-
-                    # #1052 — only touch files that actually differ. Uses the SAME
-                    # build_tag_diff the preview does, so the write matches exactly
-                    # what the "N will change / M unchanged" preview showed. A
-                    # cover-only difference counts only when cover embedding is on
-                    # (otherwise the write wouldn't touch it anyway). If the diff
-                    # read fails, fall through and write — the safe default.
-                    try:
-                        existing_tags = read_file_tags(resolved_path)
-                        if not existing_tags.get('error'):
-                            diff = build_tag_diff(existing_tags, db_data)
-                            if not diff_has_actionable_change(diff, embed_cover):
-                                with _write_tags_batch_lock:
-                                    _write_tags_batch_state['processed'] += 1
-                                    _write_tags_batch_state['skipped'] += 1
-                                continue
-                    except Exception:
-                        logger.debug("tag diff pre-check failed for %s; writing anyway",
-                                     resolved_path, exc_info=True)
-
-                    file_lock = get_file_lock(resolved_path)
-                    with file_lock:
-                        write_result = write_tags_to_file(
-                            resolved_path, db_data,
-                            embed_cover=embed_cover,
-                            cover_data=art_data
-                        )
-
-                    with _write_tags_batch_lock:
-                        _write_tags_batch_state['processed'] += 1
-                        if write_result.get('success'):
-                            _write_tags_batch_state['written'] += 1
-                            written_tracks.append(track_data)
-                        else:
-                            _write_tags_batch_state['failed'] += 1
-                            _write_tags_batch_state['errors'].append({
-                                'track_id': track_data['id'],
-                                'error': write_result.get('error', 'Unknown')
-                            })
-
-                # Server sync phase
-                if sync_to_server and written_tracks:
-                    server_type = config_manager.get_active_media_server()
-                    with _write_tags_batch_lock:
-                        _write_tags_batch_state['sync_phase'] = 'syncing'
-                        _write_tags_batch_state['sync_server'] = server_type
-                        _write_tags_batch_state['current_track'] = f'Syncing to {server_type.title()}...'
-
-                    sync_result = _sync_tracks_to_server(written_tracks, server_type)
-
-                    with _write_tags_batch_lock:
-                        _write_tags_batch_state['sync_phase'] = 'done'
-                        _write_tags_batch_state['sync_synced'] = sync_result['synced']
-                        _write_tags_batch_state['sync_failed'] = sync_result['failed']
-
-            except Exception as e:
-                logger.error(f"Batch write tags background error: {e}")
-            finally:
-                with _write_tags_batch_lock:
-                    _write_tags_batch_state['status'] = 'done'
-                    _write_tags_batch_state['current_track'] = ''
-
-        thread = threading.Thread(target=_run_batch, daemon=True, name="WriteTagsBatch")
-        thread.start()
-
-        return jsonify({"success": True, "message": "Batch tag write started", "total": len(track_ids)})
-
-    except Exception as e:
-        logger.error(f"Batch write tags error: {e}")
-        with _write_tags_batch_lock:
-            _write_tags_batch_state['status'] = 'idle'
-        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route('/api/library/tracks/write-tags-batch/status', methods=['GET'])
@@ -8946,7 +9245,8 @@ def get_write_tags_batch_status():
 # the API lookup entirely — large API savings on an already-tagged library.
 # Gap-fill only: an existing id is never overwritten (see
 # core/library/embedded_id_reconcile.py).
-def _reconcile_library_tracks(conn, track_ids=None, on_progress=None, should_stop=None):
+def _reconcile_library_tracks(conn, track_ids=None, on_progress=None, should_stop=None,
+                              server_source=None):
     """Run the embedded-ID reconcile with web-server path resolution injected.
 
     Thin wrapper over core.library.embedded_id_reconcile.reconcile_library that
@@ -8965,17 +9265,26 @@ def _reconcile_library_tracks(conn, track_ids=None, on_progress=None, should_sto
         return info.get('tags') if info.get('available') else None
 
     return reconcile_library(conn, _read_tags, track_ids=track_ids,
-                             on_progress=on_progress, should_stop=should_stop)
+                             on_progress=on_progress, should_stop=should_stop,
+                             server_source=server_source)
 
 
 def _reconcile_after_scan(worker):
-    """Gap-fill embedded provider IDs for tracks a scan newly inserted.
+    """Gap-fill embedded provider IDs for the tracks a scan newly mapped.
 
-    Runs after a library scan/deep-scan completes, scoped to the rows the
-    worker actually INSERTED this run (``worker._new_track_ids``). New files
-    are written with empty provider-id columns, so this reads their tags and
-    fills any IDs present — keeping the DB current without a manual backfill.
-    Best-effort: never raises into the scan flow.
+    Runs as the FINAL phase of a library scan/deep-scan, before the `finished`
+    signal, so the whole thing reads as one running scan. Scoped to
+    `worker._new_track_ids` — the SERVER ids of the songs this run connected to
+    the catalogue for the first time. Files land with empty provider-id
+    columns, so reading their tags here keeps new music current without anyone
+    pressing the backfill button.
+
+    The ledger holds server ids, not catalogue ids, which is why
+    `server_source` goes with it: the reconcile resolves them through
+    `lib2_media_server_mappings`. Passing them bare would look up catalogue
+    rows by number and quietly reconcile the wrong tracks.
+
+    Best-effort throughout: it never raises into the scan flow.
     """
     try:
         new_ids = list(getattr(worker, '_new_track_ids', None) or [])
@@ -8998,10 +9307,13 @@ def _reconcile_after_scan(worker):
         database = get_database()
         conn = database._get_connection()
         try:
-            totals = _reconcile_library_tracks(conn, track_ids=new_ids, on_progress=_on_progress)
+            totals = _reconcile_library_tracks(
+                conn, track_ids=new_ids, on_progress=_on_progress,
+                should_stop=lambda: bool(getattr(worker, 'should_stop', False)),
+                server_source=getattr(worker, 'server_type', None))
             logger.info(
-                "[Reconcile] Post-scan: filled %d id(s) across %d row(s) from %d new "
-                "track(s) (%d unreadable, %d conflicts)",
+                "[Reconcile] Post-scan: filled %d id(s) across %d row(s) from %d newly "
+                "mapped track(s) (%d unreadable, %d conflicts)",
                 totals.ids_filled, totals.entities_updated, totals.processed,
                 totals.unreadable, totals.conflicts,
             )
@@ -9126,153 +9438,6 @@ _rg_batch_state = {
 _rg_batch_lock = threading.Lock()
 
 
-@app.route('/api/library/track/<int:track_id>/analyze-replaygain', methods=['POST'])
-def analyze_track_replaygain(track_id):
-    """
-    Analyze a single track and write ReplayGain track-level tags immediately.
-    Synchronous — runs FFmpeg inline (typically 1–3 s per track).
-    """
-    if not _rg_ffmpeg_available():
-        return jsonify({'success': False, 'error': 'ffmpeg not found on PATH'}), 500
-
-    database = get_database()
-    conn = database._get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM tracks WHERE id = ?", (str(track_id),))
-    row = cursor.fetchone()
-    if not row:
-        return jsonify({'success': False, 'error': 'Track not found'}), 404
-
-    file_path = _resolve_library_file_path(dict(row).get('file_path'))
-    if not file_path:
-        return jsonify({'success': False, 'error': 'File not found on disk'}), 404
-
-    try:
-        lufs, peak_dbfs = _rg_analyze_track(file_path)
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-    track_gain_db = _rg_get_target_lufs(config_manager) - lufs
-
-    file_lock = get_file_lock(file_path)
-    with file_lock:
-        ok = _rg_write_tags(file_path, track_gain_db, peak_dbfs)
-
-    if not ok:
-        return jsonify({'success': False, 'error': 'Failed to write tags to file'}), 500
-
-    return jsonify({
-        'success': True,
-        'track_gain': f"{track_gain_db:+.2f} dB",
-        'track_peak': f"{10 ** (peak_dbfs / 20.0):.6f}",
-        'lufs': round(lufs, 2),
-    })
-
-
-@app.route('/api/library/album/<int:album_id>/analyze-replaygain', methods=['POST'])
-def analyze_album_replaygain(album_id):
-    """
-    Analyze all tracks in an album and write both track-level and album-level
-    ReplayGain tags.  Runs in a background thread — poll /status for progress.
-    """
-    with _rg_album_lock:
-        if _rg_album_state['status'] == 'running':
-            return jsonify({'success': False, 'error': 'An album ReplayGain job is already running'}), 409
-
-    if not _rg_ffmpeg_available():
-        return jsonify({'success': False, 'error': 'ffmpeg not found on PATH'}), 500
-
-    database = get_database()
-    conn = database._get_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT * FROM tracks WHERE album_id = ? ORDER BY track_number, title",
-        (album_id,)
-    )
-    tracks = [dict(r) for r in cursor.fetchall()]
-    if not tracks:
-        return jsonify({'success': False, 'error': 'No tracks found for this album'}), 404
-
-    with _rg_album_lock:
-        _rg_album_state.update({
-            'status': 'running',
-            'album_id': album_id,
-            'total': len(tracks),
-            'processed': 0,
-            'analyzed': 0,
-            'failed': 0,
-            'current_track': '',
-            'errors': [],
-        })
-
-    def _run_album():
-        lufs_values = []
-        peak_values = []
-        track_results = []  # (file_path, track_gain_db, peak_dbfs)
-
-        # Pass 1: analyze every track
-        for track in tracks:
-            file_path = _resolve_library_file_path(track.get('file_path'))
-            title = track.get('title') or track.get('file_path') or ''
-            with _rg_album_lock:
-                _rg_album_state['current_track'] = title
-
-            if not file_path:
-                with _rg_album_lock:
-                    _rg_album_state['failed'] += 1
-                    _rg_album_state['errors'].append({'track': title, 'error': 'File not found'})
-                    _rg_album_state['processed'] += 1
-                track_results.append(None)
-                continue
-
-            try:
-                lufs, peak_dbfs = _rg_analyze_track(file_path)
-                lufs_values.append(lufs)
-                peak_values.append(peak_dbfs)
-                track_gain_db = _rg_get_target_lufs(config_manager) - lufs
-                track_results.append((file_path, track_gain_db, peak_dbfs))
-                with _rg_album_lock:
-                    _rg_album_state['analyzed'] += 1
-                    _rg_album_state['processed'] += 1
-            except Exception as e:
-                with _rg_album_lock:
-                    _rg_album_state['failed'] += 1
-                    _rg_album_state['errors'].append({'track': title, 'error': str(e)})
-                    _rg_album_state['processed'] += 1
-                track_results.append(None)
-
-        # Compute album gain from tracks that analyzed successfully
-        album_gain_db = None
-        album_peak_dbfs = None
-        if lufs_values:
-            mean_lufs = sum(lufs_values) / len(lufs_values)
-            album_gain_db = _rg_get_target_lufs(config_manager) - mean_lufs
-            album_peak_dbfs = max(peak_values)
-
-        # Pass 2: write tags to every successfully analyzed track
-        for i, track in enumerate(tracks):
-            entry = track_results[i]
-            if entry is None:
-                continue
-            file_path, track_gain_db, peak_dbfs = entry
-            try:
-                file_lock = get_file_lock(file_path)
-                with file_lock:
-                    _rg_write_tags(file_path, track_gain_db, peak_dbfs,
-                                   album_gain_db, album_peak_dbfs)
-            except Exception as e:
-                with _rg_album_lock:
-                    _rg_album_state['failed'] += 1
-                    _rg_album_state['errors'].append({'track': track.get('title', ''), 'error': str(e)})
-
-        with _rg_album_lock:
-            _rg_album_state['status'] = 'done'
-            _rg_album_state['current_track'] = ''
-
-    threading.Thread(target=_run_album, daemon=True, name='RgAlbum').start()
-    return jsonify({'success': True})
-
-
 @app.route('/api/library/album/<int:album_id>/analyze-replaygain/status', methods=['GET'])
 def get_album_replaygain_status(album_id):
     """Poll the status of a running album ReplayGain job."""
@@ -9280,86 +9445,6 @@ def get_album_replaygain_status(album_id):
         state = dict(_rg_album_state)
         state['errors'] = list(_rg_album_state['errors'])
     return jsonify(state)
-
-
-@app.route('/api/library/tracks/analyze-replaygain-batch', methods=['POST'])
-def analyze_tracks_replaygain_batch():
-    """
-    Analyze a set of selected tracks and write track-level ReplayGain tags.
-    No album gain is computed (tracks may span multiple albums).
-    Runs in a background thread — poll /status for progress.
-    """
-    with _rg_batch_lock:
-        if _rg_batch_state['status'] == 'running':
-            return jsonify({'success': False, 'error': 'A batch ReplayGain job is already running'}), 409
-
-    if not _rg_ffmpeg_available():
-        return jsonify({'success': False, 'error': 'ffmpeg not found on PATH'}), 500
-
-    data = request.get_json() or {}
-    track_ids = data.get('track_ids', [])
-    if not track_ids:
-        return jsonify({'success': False, 'error': 'No track IDs provided'}), 400
-
-    database = get_database()
-    conn = database._get_connection()
-    cursor = conn.cursor()
-    placeholders = ','.join('?' for _ in track_ids)
-    cursor.execute(
-        f"SELECT * FROM tracks WHERE id IN ({placeholders})",
-        [str(tid) for tid in track_ids]
-    )
-    tracks = [dict(r) for r in cursor.fetchall()]
-
-    if not tracks:
-        return jsonify({'success': False, 'error': 'No valid tracks found'}), 404
-
-    with _rg_batch_lock:
-        _rg_batch_state.update({
-            'status': 'running',
-            'total': len(tracks),
-            'processed': 0,
-            'analyzed': 0,
-            'failed': 0,
-            'current_track': '',
-            'errors': [],
-        })
-
-    def _run_batch():
-        for track in tracks:
-            file_path = _resolve_library_file_path(track.get('file_path'))
-            title = track.get('title') or track.get('file_path') or ''
-            with _rg_batch_lock:
-                _rg_batch_state['current_track'] = title
-
-            if not file_path:
-                with _rg_batch_lock:
-                    _rg_batch_state['failed'] += 1
-                    _rg_batch_state['errors'].append({'track': title, 'error': 'File not found'})
-                    _rg_batch_state['processed'] += 1
-                continue
-
-            try:
-                lufs, peak_dbfs = _rg_analyze_track(file_path)
-                track_gain_db = _rg_get_target_lufs(config_manager) - lufs
-                file_lock = get_file_lock(file_path)
-                with file_lock:
-                    _rg_write_tags(file_path, track_gain_db, peak_dbfs)
-                with _rg_batch_lock:
-                    _rg_batch_state['analyzed'] += 1
-                    _rg_batch_state['processed'] += 1
-            except Exception as e:
-                with _rg_batch_lock:
-                    _rg_batch_state['failed'] += 1
-                    _rg_batch_state['errors'].append({'track': title, 'error': str(e)})
-                    _rg_batch_state['processed'] += 1
-
-        with _rg_batch_lock:
-            _rg_batch_state['status'] = 'done'
-            _rg_batch_state['current_track'] = ''
-
-    threading.Thread(target=_run_batch, daemon=True, name='RgBatch').start()
-    return jsonify({'success': True})
 
 
 @app.route('/api/library/tracks/analyze-replaygain-batch/status', methods=['GET'])
@@ -9615,6 +9700,7 @@ try:
         get_transfer_path=lambda: config_root_path(
             config_manager.get('soulseek.transfer_path', './Transfer'), './Transfer'
         ),
+        get_config_manager=lambda: config_manager,
         # Rename-only mode (#875) computes destinations via the same path builder the
         # preview uses, so apply matches exactly what the user saw.
         build_final_path_fn=lambda *a, **kw: _build_final_path_for_track(*a, **kw),
@@ -9826,8 +9912,8 @@ def _build_library_stream_url(track_id, file_path):
     SoulSync filesystem (#809 — play via the server's API, no disk mount).
 
     Navidrome/Subsonic only for now (it has a clean token-authed stream
-    endpoint). ``track_id`` is the server's song id (the tracks-table id for a
-    Navidrome row); if missing, look it up by file_path. Returns None when the
+    endpoint). ``track_id`` is the server's mapped song id; if missing, look it
+    up by file_path. Returns None when the
     active server isn't Navidrome or no id resolves."""
     try:
         if config_manager.get_active_media_server() != 'navidrome':
@@ -9844,9 +9930,12 @@ def _build_library_stream_url(track_id, file_path):
                 db = get_database()
                 with db._get_connection() as conn:
                     row = conn.cursor().execute(
-                        "SELECT id FROM tracks WHERE file_path = ? AND server_source = 'navidrome' LIMIT 1",
+                        "SELECT m.server_id FROM lib2_track_files f "
+                        "JOIN lib2_media_server_mappings m ON m.entity_type='track' "
+                        "AND m.entity_id=f.track_id AND m.server_source='navidrome' "
+                        "WHERE f.path = ? LIMIT 1",
                         (file_path,)).fetchone()
-                if row:
+                if row and row[0]:
                     song_id = str(row[0])
             except Exception as e:
                 logger.debug("navidrome stream id lookup failed: %s", e)
@@ -9893,7 +9982,22 @@ def library_play_track():
             # Not on disk. For a streaming server (Navidrome/Subsonic) we can
             # play it through the server's own stream API instead of requiring
             # the library to be mounted into the SoulSync container (#809).
-            stream_url = _build_library_stream_url(data.get('track_id'), file_path)
+            server_track_id = (
+                data.get('server_track_id') or data.get('legacy_track_id')
+                or (None if data.get('lib2_track_id') else data.get('track_id'))
+            )
+            if not server_track_id and data.get('lib2_track_id'):
+                active_server = config_manager.get_active_media_server()
+                if active_server in ('plex', 'jellyfin', 'navidrome'):
+                    with get_database()._get_connection() as conn:
+                        row = conn.execute(
+                            "SELECT server_id FROM lib2_media_server_mappings "
+                            "WHERE entity_type='track' AND entity_id=? "
+                            "AND server_source=? LIMIT 1",
+                            (data.get('lib2_track_id'), active_server),
+                        ).fetchone()
+                    server_track_id = row[0] if row else None
+            stream_url = _build_library_stream_url(server_track_id, file_path)
             if not stream_url:
                 return jsonify({"success": False, "error": _get_file_not_found_error(file_path)}), 404
 
@@ -9945,7 +10049,12 @@ def library_log_play():
         event = build_play_event(track, played_at, duration_ms)
         if not event:
             return jsonify({"success": False, "skipped": True}), 200
-        get_database().record_web_player_play(event)
+        # the play goes in the listener's pile (#1293). no own listenbrainz
+        # means the shared one, same as before.
+        from core.listening_scope import listening_owner
+        db = get_database()
+        event['profile_id'] = listening_owner(db, get_current_profile_id())
+        db.record_web_player_play(event)
         return jsonify({"success": True})
     except Exception as e:
         logger.debug(f"log-play failed (non-fatal): {e}")
@@ -10034,9 +10143,11 @@ def _get_artist_id_for_entity(database, entity_type, entity_id):
         with database._get_connection() as conn:
             cursor = conn.cursor()
             if entity_type == 'album':
-                cursor.execute("SELECT artist_id FROM albums WHERE id = ?", (entity_id,))
+                cursor.execute("SELECT primary_artist_id AS artist_id FROM lib2_albums WHERE id = ?", (entity_id,))
             elif entity_type == 'track':
-                cursor.execute("SELECT artist_id FROM tracks WHERE id = ?", (entity_id,))
+                cursor.execute(
+                    "SELECT al.primary_artist_id AS artist_id FROM lib2_tracks t"
+                    "  JOIN lib2_albums al ON al.id = t.album_id WHERE t.id = ?", (entity_id,))
             else:
                 return entity_id
             row = cursor.fetchone()
@@ -10213,9 +10324,38 @@ def library_search_service():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@app.route('/api/library/match-artist-releases', methods=['POST'])
+def library_match_artist_releases():
+    """Return a lean release strip for one exact artist match candidate.
+
+    Kept separate from artist search so eight candidates do not force eight
+    provider discography calls. Library v2 auto-loads only the top candidates
+    and lets the user expand the rest on demand.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        service = str(data.get('service') or '').strip().lower()
+        artist_id = str(data.get('artist_id') or '').strip()
+        if not service or not artist_id:
+            return jsonify({"success": False, "error": "service and artist_id are required"}), 400
+        preview = artist_release_preview(
+            service,
+            artist_id,
+            artist_name=data.get('artist_name') or '',
+            limit=data.get('limit', 6),
+        )
+        return jsonify({"success": True, **preview})
+    except Exception as e:
+        logger.debug("Artist match release preview failed: %s", e)
+        # Candidate search remains usable even when a provider's release
+        # endpoint is unavailable or rate-limited.
+        return jsonify({"success": True, "supported": True, "albums": []})
+
+
 from core.library.service_search import (
     _detect_provider,
     _search_service,
+    artist_release_preview,
     init as _init_service_search,
 )
 
@@ -10237,6 +10377,45 @@ _SERVICE_ID_COLUMNS = {
     'jiosaavn': {'artist': 'jiosaavn_id', 'album': 'jiosaavn_id', 'track': 'jiosaavn_id'},
 }
 
+_WATCHLIST_PROVIDER_COLUMNS = {
+    'spotify': 'spotify_artist_id',
+    'itunes': 'itunes_artist_id',
+    'deezer': 'deezer_artist_id',
+    'discogs': 'discogs_artist_id',
+    'amazon': 'amazon_artist_id',
+    'musicbrainz': 'musicbrainz_artist_id',
+}
+
+
+def _watchlist_row_matches_legacy_artist(cursor, watchlist_row_id, artist_id):
+    """Fail closed before syncing a Library-v2 Settings provider change.
+
+    The combined Settings UI knows the concrete watchlist row. The public
+    legacy matcher historically knows only the legacy library artist id. This
+    guard accepts the bridge only when the rows already share a provider id or
+    the same normalized name; an arbitrary row id cannot be updated.
+    """
+    artist = cursor.execute(
+        f"""SELECT name, {_ARTIST_IDS_SQL}
+              FROM lib2_artists WHERE id=?""",
+        (artist_id,),
+    ).fetchone()
+    watchlist = cursor.execute(
+        """SELECT artist_name, spotify_artist_id, itunes_artist_id,
+                  deezer_artist_id, discogs_artist_id, amazon_artist_id,
+                  musicbrainz_artist_id
+             FROM watchlist_artists WHERE id=?""",
+        (watchlist_row_id,),
+    ).fetchone()
+    if not artist or not watchlist:
+        return False
+    if str(artist[0] or '').strip().casefold() == str(watchlist[0] or '').strip().casefold():
+        return True
+    return any(
+        left not in (None, '') and str(left) == str(right)
+        for left, right in zip(artist[1:], watchlist[1:], strict=True)
+    )
+
 @app.route('/api/library/manual-match', methods=['PUT'])
 def library_manual_match():
     """Manually set a service ID for an entity.
@@ -10248,6 +10427,7 @@ def library_manual_match():
         entity_id = data.get('entity_id')
         service = data.get('service')
         service_id = data.get('service_id')
+        watchlist_row_id = data.get('watchlist_row_id')
 
         if not all([entity_type, entity_id, service, service_id]):
             return jsonify({"success": False, "error": "entity_type, entity_id, service, and service_id are required"}), 400
@@ -10263,14 +10443,50 @@ def library_manual_match():
         database = get_database()
         with database._get_connection() as conn:
             cursor = conn.cursor()
+            if watchlist_row_id is not None:
+                if entity_type != 'artist' or service not in _WATCHLIST_PROVIDER_COLUMNS:
+                    return jsonify({"success": False, "error": "Watchlist sync is only supported for artist providers"}), 400
+                try:
+                    watchlist_row_id = int(watchlist_row_id)
+                except (TypeError, ValueError):
+                    return jsonify({"success": False, "error": "watchlist_row_id must be an integer"}), 400
+                if not _watchlist_row_matches_legacy_artist(cursor, watchlist_row_id, entity_id):
+                    return jsonify({"success": False, "error": "Watchlist artist does not match this library artist"}), 409
+                watchlist_col = _WATCHLIST_PROVIDER_COLUMNS[service]
+                duplicate = cursor.execute(
+                    f"SELECT artist_name FROM watchlist_artists WHERE {watchlist_col}=? AND id<>?",
+                    (service_id, watchlist_row_id),
+                ).fetchone()
+                if duplicate:
+                    return jsonify({
+                        "success": False,
+                        "error": f"Another watchlist artist ('{duplicate[0]}') already has this {service} ID",
+                    }), 409
             cursor.execute(f"""
                 UPDATE {table}
                 SET {id_col} = ?, {status_col} = 'matched', {attempted_col} = CURRENT_TIMESTAMP
                 WHERE id = ?
             """, (service_id, entity_id))
-            conn.commit()
             if cursor.rowcount == 0:
                 return jsonify({"success": False, "error": "Entity not found"}), 404
+            from core.enrichment.match_provenance import record_manual_match
+            record_manual_match(
+                conn,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                service=service,
+                external_id=service_id,
+                actor=f"profile:{get_current_profile_id()}",
+            )
+            if watchlist_row_id is not None:
+                cursor.execute(
+                    f"""UPDATE watchlist_artists
+                           SET {_WATCHLIST_PROVIDER_COLUMNS[service]}=?,
+                               updated_at=CURRENT_TIMESTAMP
+                         WHERE id=?""",
+                    (service_id, watchlist_row_id),
+                )
+            conn.commit()
 
         # #758 — a manual ALBUM match also pins (and LOCKS) the canonical album
         # version to the chosen release, so the auto resolve job and every tool
@@ -10317,6 +10533,7 @@ def library_clear_match():
         entity_type = data.get('entity_type')
         entity_id = data.get('entity_id')
         service = data.get('service')
+        watchlist_row_id = data.get('watchlist_row_id')
 
         if not all([entity_type, entity_id, service]):
             return jsonify({"success": False, "error": "entity_type, entity_id, and service are required"}), 400
@@ -10334,14 +10551,31 @@ def library_clear_match():
         database = get_database()
         with database._get_connection() as conn:
             cursor = conn.cursor()
+            if watchlist_row_id is not None:
+                if entity_type != 'artist' or service not in _WATCHLIST_PROVIDER_COLUMNS:
+                    return jsonify({"success": False, "error": "Watchlist sync is only supported for artist providers"}), 400
+                try:
+                    watchlist_row_id = int(watchlist_row_id)
+                except (TypeError, ValueError):
+                    return jsonify({"success": False, "error": "watchlist_row_id must be an integer"}), 400
+                if not _watchlist_row_matches_legacy_artist(cursor, watchlist_row_id, entity_id):
+                    return jsonify({"success": False, "error": "Watchlist artist does not match this library artist"}), 409
             cursor.execute(f"""
                 UPDATE {table}
                 SET {id_col} = NULL, {status_col} = 'not_found', {attempted_col} = NULL
                 WHERE id = ?
             """, (entity_id,))
-            conn.commit()
             if cursor.rowcount == 0:
                 return jsonify({"success": False, "error": "Entity not found"}), 404
+            if watchlist_row_id is not None:
+                cursor.execute(
+                    f"""UPDATE watchlist_artists
+                           SET {_WATCHLIST_PROVIDER_COLUMNS[service]}=NULL,
+                               updated_at=CURRENT_TIMESTAMP
+                         WHERE id=?""",
+                    (watchlist_row_id,),
+                )
+            conn.commit()
 
         # Re-fetch fresh data
         artist_id = data.get('artist_id', entity_id)
@@ -10422,89 +10656,6 @@ def library_import_existing_track_for_missing_slot(album_id):
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-@app.route('/api/library/track/<track_id>', methods=['DELETE'])
-@admin_only
-def library_delete_track(track_id):
-    """Delete a track from the database, optionally deleting the file and blacklisting the source."""
-    try:
-        delete_file = request.args.get('delete_file', 'false').lower() == 'true'
-        add_blacklist = request.args.get('blacklist', 'false').lower() == 'true'
-
-        database = get_database()
-        file_deleted = False
-        blacklisted = False
-
-        with database._get_connection() as conn:
-            cursor = conn.cursor()
-
-            # Get track info before deleting (for file removal + blacklist)
-            track_info = None
-            if delete_file or add_blacklist:
-                cursor.execute("""
-                    SELECT t.file_path, t.title, ar.name AS artist_name
-                    FROM tracks t
-                    JOIN artists ar ON t.artist_id = ar.id
-                    WHERE t.id = ?
-                """, (track_id,))
-                track_info = cursor.fetchone()
-
-            # Delete file from disk if requested
-            file_error = None
-            if delete_file and track_info and track_info['file_path']:
-                resolved = _resolve_library_file_path(track_info['file_path'])
-                if resolved and os.path.exists(resolved):
-                    try:
-                        os.remove(resolved)
-                        file_deleted = True
-                        logger.info(f"Deleted file from disk: {resolved}")
-                        # Clean up sidecar files (.lrc, .txt lyrics, cover.jpg)
-                        base_no_ext = os.path.splitext(resolved)[0]
-                        for sidecar_ext in ('.lrc', '.txt'):
-                            sidecar = base_no_ext + sidecar_ext
-                            if os.path.exists(sidecar):
-                                try:
-                                    os.remove(sidecar)
-                                    logger.info(f"Deleted sidecar file: {sidecar}")
-                                except Exception as e:
-                                    logger.debug("sidecar removal failed: %s", e)
-                    except Exception as e:
-                        logger.warning(f"Failed to delete file: {e}")
-                        file_error = str(e)
-                else:
-                    logger.warning(f"Could not resolve file path for deletion: {track_info['file_path']} (resolved={resolved})")
-                    file_error = _get_file_not_found_error(track_info['file_path'])
-
-            # Add to blacklist if requested
-            if add_blacklist and track_info and track_info['file_path']:
-                # Extract username and filename from the file path for blacklisting
-                # Soulseek paths are stored as: username/path/to/file.ext or just the local path
-                fp = track_info['file_path'].replace('\\', '/')
-                database.add_to_blacklist(
-                    track_title=track_info['title'],
-                    track_artist=track_info['artist_name'],
-                    blocked_filename=os.path.basename(fp),
-                    blocked_username='',  # Local files don't have a username
-                    reason='user_rejected'
-                )
-                blacklisted = True
-
-            # Delete DB record
-            cursor.execute("DELETE FROM tracks WHERE id = ?", (track_id,))
-            conn.commit()
-            if cursor.rowcount == 0:
-                return jsonify({"success": False, "error": "Track not found"}), 404
-
-            result = {"success": True, "deleted_count": cursor.rowcount, "file_deleted": file_deleted, "blacklisted": blacklisted}
-            if delete_file and not file_deleted and file_error:
-                result["file_error"] = file_error
-            return jsonify(result)
-    except Exception as e:
-        logger.error(f"Error deleting track {track_id}: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({"success": False, "error": str(e)}), 500
-
-
 # ==================================================================================
 # DOWNLOAD BLACKLIST API
 # ==================================================================================
@@ -10553,151 +10704,9 @@ def remove_from_blacklist(blacklist_id):
 # TRACK SOURCE INFO & PROVENANCE
 # ==================================================================================
 
-@app.route('/api/library/track/<track_id>/source-info', methods=['GET'])
-def get_track_source_info(track_id):
-    """Get download provenance info for a library track."""
-    try:
-        database = get_database()
-        downloads = database.get_track_downloads(str(track_id))
-
-        if not downloads:
-            # Try matching by file path as fallback (exact, then filename suffix)
-            conn = database._get_connection()
-            cursor = conn.cursor()
-            cursor.execute("SELECT file_path FROM tracks WHERE id = ?", (track_id,))
-            row = cursor.fetchone()
-            conn.close()
-            if row and row['file_path']:
-                dl = database.get_download_by_file_path(row['file_path'])
-                if dl:
-                    downloads = [dl]
-                else:
-                    # Path format mismatch (e.g. Plex path vs local Windows path) —
-                    # fall back to filename-only match and back-link the track_id
-                    import os as _os
-                    fname = _os.path.basename(row['file_path'].replace('\\', '/'))
-                    if fname:
-                        dl = database.get_download_by_filename(fname, link_track_id=track_id)
-                        if dl:
-                            downloads = [dl]
-
-        return jsonify({"success": True, "downloads": downloads})
-    except Exception as e:
-        logger.error(f"Error getting track source info: {e}")
-        return jsonify({"success": False, "error": str(e)}), 500
-
-
 # ==================================================================================
 # TRACK REDOWNLOAD — Search metadata, search download sources, start redownload
 # ==================================================================================
-
-@app.route('/api/library/track/<track_id>/redownload/search-metadata', methods=['POST'])
-def redownload_search_metadata(track_id):
-    """Search all available metadata sources for a track to find the correct version."""
-    try:
-        database = get_database()
-        conn = database._get_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT t.id, t.title, t.file_path, t.bitrate, t.duration,
-                   ar.name AS artist_name, al.title AS album_title,
-                   al.thumb_url AS album_thumb_url,
-                   t.spotify_track_id, t.deezer_id
-            FROM tracks t
-            JOIN artists ar ON t.artist_id = ar.id
-            JOIN albums al ON t.album_id = al.id
-            WHERE t.id = ?
-        """, (track_id,))
-        row = cursor.fetchone()
-        conn.close()
-
-        if not row:
-            return jsonify({"success": False, "error": "Track not found"}), 404
-
-        track_title = row['title']
-        artist_name = row['artist_name']
-        # Clean the title for better search results — strip version/edition suffixes
-        import re as _re
-        clean_title = _re.sub(r'\s*[\(\[](single version|album version|remaster|deluxe|bonus|explicit|clean|radio edit)[\)\]]', '', track_title, flags=_re.IGNORECASE).strip()
-        query = f"{artist_name} {clean_title}"
-
-        # Resolve file info
-        file_path = row['file_path'] or ''
-        ext = os.path.splitext(file_path)[1].lstrip('.').upper() if file_path else ''
-        fmt = ext if ext in ('FLAC', 'MP3', 'OPUS', 'OGG', 'M4A', 'WAV') else ''
-
-        # Resolve album thumb URL (may be relative Plex path)
-        thumb_url = row['album_thumb_url'] or ''
-        if thumb_url and not thumb_url.startswith('http'):
-            _ab = ''
-            _at = ''
-            if media_server_engine.client('plex') and media_server_engine.client('plex').server:
-                _ab = getattr(media_server_engine.client('plex').server, '_baseurl', '') or ''
-                _at = getattr(media_server_engine.client('plex').server, '_token', '') or ''
-            if not _ab:
-                _pc = config_manager.get_plex_config()
-                _ab = (_pc.get('base_url', '') or '').rstrip('/')
-                _at = _at or _pc.get('token', '')
-            if _ab and thumb_url.startswith('/'):
-                thumb_url = f"{_ab}{thumb_url}?X-Plex-Token={_at}" if _at else f"{_ab}{thumb_url}"
-
-        current_track = {
-            'id': row['id'],
-            'title': track_title,
-            'artist': artist_name,
-            'album': row['album_title'],
-            'duration_ms': row['duration'] or 0,
-            'file_path': file_path,
-            'format': fmt,
-            'bitrate': row['bitrate'] or 0,
-            'spotify_track_id': row['spotify_track_id'],
-            'deezer_id': row['deezer_id'],
-            'thumb_url': thumb_url,
-        }
-
-        # Search all available metadata sources in parallel via the
-        # shared module — same code path the Enhance Quality flow uses
-        # so both endpoints have identical scoring + per-source query
-        # optimization + current-match flagging.
-        from core.metadata.multi_source_search import (
-            TrackQuery,
-            search_all_sources,
-        )
-
-        sources_to_search = []
-        if spotify_client and spotify_client.is_authenticated():
-            sources_to_search.append(('spotify', spotify_client))
-        try:
-            sources_to_search.append(('itunes', _get_itunes_client()))
-        except Exception as e:
-            logger.debug(f"iTunes client not available for redownload search: {e}")
-        try:
-            sources_to_search.append(('deezer', _get_deezer_client()))
-        except Exception as e:
-            logger.debug(f"Deezer client not available for redownload search: {e}")
-
-        track_query = TrackQuery(
-            title=track_title,
-            artist=artist_name,
-            album=row['album_title'] or '',
-            duration_ms=row['duration'] or 0,
-            spotify_track_id=row['spotify_track_id'],
-            deezer_id=row['deezer_id'],
-        )
-        result = search_all_sources(
-            track_query, sources_to_search, clean_title=clean_title,
-        )
-
-        return jsonify({
-            "success": True,
-            "current_track": current_track,
-            "metadata_results": result.metadata_results,
-            "best_match": result.best_match,
-        })
-    except Exception as e:
-        logger.error(f"Error in redownload metadata search: {e}", exc_info=True)
-        return jsonify({"success": False, "error": str(e)}), 500
-
 
 @app.route('/api/library/track/<track_id>/redownload/search-sources', methods=['POST'])
 def redownload_search_sources(track_id):
@@ -10707,6 +10716,17 @@ def redownload_search_sources(track_id):
         metadata = data.get('metadata', {})
         if not metadata.get('name'):
             return jsonify({"success": False, "error": "metadata with name required"}), 400
+
+        # The ladder that judges these candidates is the item's, not the app's.
+        # Every other lane resolves it (task_worker reads it off the track, the
+        # album bundle off the batch); this one reads it off the library row,
+        # because the UI sends only metadata and this path deletes the file it
+        # replaces. An explicit choice from the caller still wins.
+        from core.quality.selection import profile_id_for_library_track
+        quality_profile_id = profile_id_for_library_track(
+            get_database(), track_id,
+            explicit=parse_strict_int(data.get('quality_profile_id')),
+        )
 
         # Build a track-like object for query generation
         from core.itunes_client import Track as MetaTrack
@@ -10750,12 +10770,19 @@ def redownload_search_sources(track_id):
         def _search_one_source(source_name, client):
             """Search a single download source and return formatted candidates."""
             source_candidates = []
+            # These clients are searched directly rather than through the
+            # orchestrator, so nothing else would enter the item's profile
+            # context and quality_tier_for_source would ask each source for the
+            # tier the APP default wants.
+            from core.quality.source_map import quality_profile_context
             for _qi, q in enumerate(search_queries):
                 try:
-                    tracks_result, _ = run_async(client.search(q, timeout=20))
+                    with quality_profile_context(quality_profile_id):
+                        tracks_result, _ = run_async(client.search(q, timeout=20))
                     if not tracks_result:
                         continue
-                    valid = get_valid_candidates(tracks_result, track_obj, q)
+                    valid = get_valid_candidates(tracks_result, track_obj, q,
+                                                 quality_profile_id)
                     for candidate in valid:
                         is_bl = database.is_blacklisted(candidate.username, candidate.filename)
                         display_name = os.path.basename(candidate.filename.replace('\\', '/'))
@@ -10828,314 +10855,6 @@ def redownload_start(track_id):
     return _redownload_start_impl(track_id)
 
 
-@app.route('/api/library/artist/<artist_id>/sync', methods=['POST'])
-@admin_only
-def sync_artist_library(artist_id):
-    """Bidirectional sync: pull new content from media server AND remove stale entries."""
-    try:
-        database = get_database()
-        with database._get_connection() as conn:
-            cursor = conn.cursor()
-
-            # Resolve artist_id: could be a DB integer ID or a source artist ID (Spotify/iTunes/Deezer)
-            db_artist_id = None
-            # Try direct ID match first (works for both integer and text IDs)
-            cursor.execute("SELECT id FROM artists WHERE id = ?", (artist_id,))
-            row = cursor.fetchone()
-            if row:
-                db_artist_id = row['id']
-            # Also try as integer (legacy integer PKs)
-            if not db_artist_id:
-                try:
-                    candidate = int(artist_id)
-                    cursor.execute("SELECT id FROM artists WHERE id = ?", (candidate,))
-                    row = cursor.fetchone()
-                    if row:
-                        db_artist_id = row['id']
-                except (ValueError, TypeError):
-                    pass
-            # Try source-specific ID columns
-            if not db_artist_id:
-                for col in ('spotify_artist_id', 'itunes_artist_id', 'deezer_id', 'discogs_id'):
-                    cursor.execute(f"SELECT id FROM artists WHERE {col} = ?", (artist_id,))
-                    row = cursor.fetchone()
-                    if row:
-                        db_artist_id = row['id']
-                        break
-
-            if not db_artist_id:
-                return jsonify({"success": False, "error": "Artist not found"}), 404
-
-            cursor.execute("SELECT name, server_source FROM artists WHERE id = ?", (db_artist_id,))
-            artist_row = cursor.fetchone()
-            artist_name = artist_row['name'] if artist_row else f'ID {db_artist_id}'
-            server_source = artist_row['server_source'] if artist_row else None
-
-        # ── Phase 1: Pull new content from media server ──
-        new_albums = 0
-        new_tracks = 0
-        name_updated = False
-        # Single-artist deep scan: collect the server track IDs we see during the
-        # pull. Stale removal (Phase 2) is a server-diff against this set — the SAME
-        # mechanism the whole-library deep scan uses, just scoped to one artist.
-        seen_track_ids = set()
-        pull_succeeded = False
-
-        if server_source:
-            media_client = None
-            if server_source == 'plex' and media_server_engine.client('plex') and media_server_engine.client('plex').server:
-                media_client = media_server_engine.client('plex')
-            elif server_source == 'jellyfin' and media_server_engine.client('jellyfin'):
-                media_client = media_server_engine.client('jellyfin')
-            elif server_source == 'navidrome' and media_server_engine.client('navidrome'):
-                media_client = media_server_engine.client('navidrome')
-
-            if media_client:
-                try:
-                    from core.database_update_worker import DatabaseUpdateWorker
-                    worker = DatabaseUpdateWorker(
-                        media_client=media_client,
-                        full_refresh=False,
-                        server_type=server_source,
-                        force_sequential=True,
-                    )
-                    worker.database = database  # Use existing DB instance instead of creating new one
-
-                    # Fetch the artist object from the server
-                    server_artist = None
-                    logger.info(f"[Artist Sync] Fetching artist {db_artist_id} from {server_source}...")
-                    if server_source == 'plex' and hasattr(media_client, 'server'):
-                        try:
-                            server_artist = media_client.server.fetchItem(int(db_artist_id))
-                            logger.info(f"[Artist Sync] Plex returned: {getattr(server_artist, 'title', 'None')}")
-                        except Exception as e:
-                            logger.error(f"[Artist Sync] Plex fetchItem failed: {e}")
-                    elif hasattr(media_client, 'get_artist_by_id'):
-                        try:
-                            server_artist = media_client.get_artist_by_id(str(db_artist_id))
-                            logger.info(f"[Artist Sync] Server returned: {getattr(server_artist, 'title', None) or server_artist}")
-                        except Exception as e:
-                            logger.error(f"[Artist Sync] get_artist_by_id failed: {e}")
-                    else:
-                        logger.warning(f"[Artist Sync] No get_artist_by_id method on {type(media_client).__name__}")
-
-                    if not server_artist:
-                        logger.error("[Artist Sync] Could not fetch artist from server — skipping pull phase")
-
-                    if server_artist:
-                        # Check for name change
-                        new_name = getattr(server_artist, 'title', None)
-                        if new_name and new_name != artist_name:
-                            database.execute_query(
-                                "UPDATE artists SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                                (new_name, db_artist_id)
-                            )
-                            logger.info(f"[Artist Sync] Name updated: '{artist_name}' → '{new_name}'")
-                            artist_name = new_name
-                            name_updated = True
-
-                        # Process artist content (deep scan mode — skip existing,
-                        # preserve enrichment) and collect the server's track IDs
-                        # for this artist into seen_track_ids.
-                        success, details, new_albums, new_tracks = worker._process_artist_with_content(
-                            server_artist, skip_existing_tracks=True, seen_track_ids=seen_track_ids
-                        )
-                        # Only a successful pull gives a trustworthy 'seen' set; a
-                        # failure/partial would make every track look stale.
-                        pull_succeeded = bool(success)
-                        logger.info(f"[Artist Sync] Server pull for {artist_name}: {details}")
-
-                except Exception as e:
-                    logger.error(f"[Artist Sync] Server pull failed for {artist_name}: {e}")
-
-        # ── Phase 2: Remove stale entries (tracks the server no longer has) ──
-        # Server-diff, exactly like the whole-library deep scan: stale = this
-        # artist's DB tracks that were NOT seen on the server during the pull.
-        stale_removed = 0
-        empty_albums_removed = 0
-        removal_skipped = False
-
-        if not pull_succeeded:
-            # No trustworthy server view (no server configured, unreachable, or the
-            # pull failed) — without it we can't tell stale from "server was down",
-            # so we remove nothing rather than risk wiping the artist.
-            removal_skipped = True
-            logger.info(f"[Artist Sync] {artist_name}: server pull unavailable — skipping stale removal")
-        else:
-            with database._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "SELECT id FROM tracks WHERE artist_id = ? AND server_source = ?",
-                    (db_artist_id, server_source),
-                )
-                artist_track_ids = {row['id'] for row in cursor.fetchall()}
-                stale = artist_track_ids - seen_track_ids
-
-                # Same safety net as deep scan (#828): if an implausibly large share
-                # of the artist's tracks went unseen, treat it as a flaky server
-                # response and skip rather than mass-delete.
-                from core.library.stale_guard import is_implausible_stale_removal
-                if is_implausible_stale_removal(len(stale), len(artist_track_ids)):
-                    removal_skipped = True
-                    logger.warning(
-                        f"[Artist Sync] {artist_name}: {len(stale)}/{len(artist_track_ids)} tracks "
-                        f"unseen on server — skipping stale removal (likely a flaky response)"
-                    )
-                elif stale:
-                    stale_removed = database.delete_stale_tracks(stale, server_source)
-
-            if not removal_skipped:
-                with database._get_connection() as conn:
-                    cursor = conn.cursor()
-                    # Prune albums left with no tracks. ``album_id IS NOT NULL``
-                    # avoids the NOT IN-with-NULL gotcha that would otherwise no-op
-                    # this whenever a track has a null album_id.
-                    cursor.execute("""
-                        DELETE FROM albums WHERE artist_id = ?
-                        AND id NOT IN (SELECT DISTINCT album_id FROM tracks WHERE album_id IS NOT NULL)
-                    """, (db_artist_id,))
-                    empty_albums_removed = cursor.rowcount
-                    cursor.execute("""
-                        UPDATE albums SET track_count = (
-                            SELECT COUNT(*) FROM tracks WHERE tracks.album_id = albums.id
-                        ) WHERE artist_id = ?
-                    """, (db_artist_id,))
-                    conn.commit()
-
-        logger.warning(f"[Artist Sync] {artist_name}: +{new_albums} albums, +{new_tracks} tracks, "
-              f"-{stale_removed} stale, -{empty_albums_removed} empty albums"
-              f"{' (removal skipped — storage unreachable)' if removal_skipped else ''}")
-
-        return jsonify({
-            "success": True,
-            "artist_name": artist_name,
-            "name_updated": name_updated,
-            "new_albums": new_albums,
-            "new_tracks": new_tracks,
-            "stale_removed": stale_removed,
-            "empty_albums_removed": empty_albums_removed,
-            "removal_skipped": removal_skipped,
-        })
-
-    except Exception as e:
-        logger.error(f"Error syncing artist {artist_id}: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route('/api/library/album/<album_id>', methods=['DELETE'])
-@admin_only
-def library_delete_album(album_id):
-    """Delete an album and all its tracks from the database, optionally deleting files on disk."""
-    try:
-        delete_files = request.args.get('delete_files', 'false').lower() == 'true'
-        database = get_database()
-        files_deleted = 0
-        files_failed = 0
-        file_errors = []
-
-        with database._get_connection() as conn:
-            cursor = conn.cursor()
-
-            # If deleting files, resolve and remove each track's file first
-            if delete_files:
-                cursor.execute("SELECT id, file_path FROM tracks WHERE album_id = ?", (album_id,))
-                track_rows = cursor.fetchall()
-                for row in track_rows:
-                    fp = row['file_path']
-                    if not fp:
-                        continue
-                    resolved = _resolve_library_file_path(fp)
-                    if resolved and os.path.exists(resolved):
-                        try:
-                            os.remove(resolved)
-                            files_deleted += 1
-                            # Clean up sidecar files (.lrc, .txt lyrics)
-                            base_no_ext = os.path.splitext(resolved)[0]
-                            for sidecar_ext in ('.lrc', '.txt'):
-                                sidecar = base_no_ext + sidecar_ext
-                                if os.path.exists(sidecar):
-                                    try:
-                                        os.remove(sidecar)
-                                    except Exception as e:
-                                        logger.debug("sidecar removal failed: %s", e)
-                        except Exception as e:
-                            logger.warning(f"Failed to delete track file: {e}")
-                            files_failed += 1
-                            file_errors.append(f"{os.path.basename(fp)}: {e}")
-                    else:
-                        files_failed += 1
-                        file_errors.append(_get_file_not_found_error(fp))
-
-                # Try to remove the album folder if it's now empty
-                if track_rows:
-                    first_fp = track_rows[0]['file_path']
-                    if first_fp:
-                        resolved_first = _resolve_library_file_path(first_fp)
-                        if resolved_first:
-                            album_dir = os.path.dirname(resolved_first)
-                            try:
-                                if os.path.isdir(album_dir) and not os.listdir(album_dir):
-                                    os.rmdir(album_dir)
-                                    logger.info(f"Removed empty album directory: {album_dir}")
-                            except Exception as e:
-                                logger.debug("empty album dir cleanup failed: %s", e)
-
-            # Delete all tracks belonging to this album
-            cursor.execute("DELETE FROM tracks WHERE album_id = ?", (album_id,))
-            tracks_deleted = cursor.rowcount
-            # Delete the album itself
-            cursor.execute("DELETE FROM albums WHERE id = ?", (album_id,))
-            if cursor.rowcount == 0:
-                conn.rollback()
-                return jsonify({"success": False, "error": "Album not found"}), 404
-            conn.commit()
-            return jsonify({
-                "success": True,
-                "deleted_count": 1,
-                "tracks_deleted": tracks_deleted,
-                "files_deleted": files_deleted,
-                "files_failed": files_failed,
-                "file_errors": file_errors[:5],
-            })
-    except Exception as e:
-        logger.error(f"Error deleting album {album_id}: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({"success": False, "error": str(e)}), 500
-
-
-@app.route('/api/library/tracks/delete-batch', methods=['POST'])
-@admin_only
-def library_delete_tracks_batch():
-    """Delete multiple track records from the database (does NOT delete files on disk).
-    Body: { track_ids: [int] }
-    """
-    try:
-        data = request.get_json()
-        track_ids = data.get('track_ids', [])
-        if not track_ids or not isinstance(track_ids, list):
-            return jsonify({"success": False, "error": "track_ids array is required"}), 400
-
-        database = get_database()
-        with database._get_connection() as conn:
-            cursor = conn.cursor()
-            placeholders = ','.join('?' for _ in track_ids)
-            cursor.execute(f"DELETE FROM tracks WHERE id IN ({placeholders})", track_ids)
-            conn.commit()
-            return jsonify({"success": True, "deleted_count": cursor.rowcount})
-    except Exception as e:
-        logger.error(f"Error batch deleting tracks: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({"success": False, "error": str(e)}), 500
-
-
-# ── discover endpoints live in api/discover_routes.py now ───────────────────
-from api.discover_routes import (  # noqa: E402
-    _autostart_popularity_backfill,
-    _build_personalized_manager,
-)
 
 
 @app.route('/api/library/radio')
@@ -11789,6 +11508,28 @@ def _is_explicit_blocked(track_data):
     return sp_data.get('explicit', False)
 
 
+def _preflight_mb_release(album_name, artist_name, track_count):
+    """Pre-populate the MusicBrainz release cache so every track of an album
+    download resolves to the same release."""
+    try:
+        mb_svc = mb_worker.mb_service if mb_worker else None
+        if mb_svc and album_name and artist_name:
+            from core.album_consistency import _find_best_release
+            _pf_release = _find_best_release(album_name, artist_name, track_count, mb_svc)
+            if _pf_release and _pf_release.get('id'):
+                _pf_mbid = _pf_release['id']
+                _pf_artist_key = artist_name.lower().strip()
+                with mb_release_cache_lock:
+                    mb_release_cache[(normalize_album_cache_key(album_name), _pf_artist_key)] = _pf_mbid
+                    mb_release_cache[(album_name.lower().strip(), _pf_artist_key)] = _pf_mbid
+                with mb_release_detail_cache_lock:
+                    mb_release_detail_cache[_pf_mbid] = _pf_release
+                logger.info(f"[Preflight] Pre-cached MB release for '{album_name}': "
+                      f"'{_pf_release.get('title', '')}' ({_pf_mbid[:8]}...)")
+    except Exception as pf_err:
+        logger.error(f"[Preflight] MB release preflight failed: {pf_err}")
+
+
 def _start_enhanced_album_download(enhanced_tracks, unmatched_tracks, spotify_artist, spotify_album):
     """
     Download album tracks that have been matched to Spotify with full track metadata.
@@ -11803,24 +11544,8 @@ def _start_enhanced_album_download(enhanced_tracks, unmatched_tracks, spotify_ar
     started_count = 0
 
     # PREFLIGHT: Pre-populate MusicBrainz release cache so all tracks get the same release
-    try:
-        mb_svc = mb_worker.mb_service if mb_worker else None
-        if mb_svc and spotify_album.get('name') and spotify_artist.get('name'):
-            from core.album_consistency import _find_best_release
-            _pf_count = len(enhanced_tracks) + len(unmatched_tracks)
-            _pf_release = _find_best_release(spotify_album['name'], spotify_artist['name'], _pf_count, mb_svc)
-            if _pf_release and _pf_release.get('id'):
-                _pf_mbid = _pf_release['id']
-                _pf_artist_key = spotify_artist['name'].lower().strip()
-                with mb_release_cache_lock:
-                    mb_release_cache[(normalize_album_cache_key(spotify_album['name']), _pf_artist_key)] = _pf_mbid
-                    mb_release_cache[(spotify_album['name'].lower().strip(), _pf_artist_key)] = _pf_mbid
-                with mb_release_detail_cache_lock:
-                    mb_release_detail_cache[_pf_mbid] = _pf_release
-                logger.info(f"[Preflight] Pre-cached MB release for '{spotify_album['name']}': "
-                      f"'{_pf_release.get('title', '')}' ({_pf_mbid[:8]}...)")
-    except Exception as pf_err:
-        logger.error(f"[Preflight] MB release preflight failed: {pf_err}")
+    _preflight_mb_release(spotify_album.get('name'), spotify_artist.get('name'),
+                          len(enhanced_tracks) + len(unmatched_tracks))
 
     # Process matched tracks with full Spotify metadata
     for matched_item in enhanced_tracks:
@@ -11845,26 +11570,26 @@ def _start_enhanced_album_download(enhanced_tracks, unmatched_tracks, spotify_ar
 
             if download_id:
                 context_key = _make_context_key(username, filename)
-                with matched_context_lock:
-                    # Create context with FULL Spotify track metadata (like Download Missing Tracks modal)
-                    matched_downloads_context[context_key] = {
-                        "spotify_artist": spotify_artist,
-                        "spotify_album": spotify_album,
-                        "track_info": spotify_track,  # Full Spotify track object!
-                        "original_search_result": {
-                            'username': username,
-                            'filename': filename,
-                            'size': size,
-                            'title': spotify_track['name'],  # Use Spotify title
-                            'artist': spotify_artist['name'],
-                            'album': spotify_album['name'],
-                            'track_number': spotify_track['track_number'],  # Use Spotify track number
-                            'disc_number': spotify_track.get('disc_number', 1),
-                            'spotify_clean_title': spotify_track['name']  # For filename generation
-                        },
-                        "is_album_download": True,
-                        "has_full_spotify_metadata": True  # Flag for robust processing
-                    }
+                # Create context with FULL Spotify track metadata (like Download Missing Tracks modal)
+                _register_matched_download_context(context_key, {
+                    "profile_id": get_current_profile_id(),
+                    "spotify_artist": spotify_artist,
+                    "spotify_album": spotify_album,
+                    "track_info": spotify_track,  # Full Spotify track object!
+                    "original_search_result": {
+                        'username': username,
+                        'filename': filename,
+                        'size': size,
+                        'title': spotify_track['name'],  # Use Spotify title
+                        'artist': spotify_artist['name'],
+                        'album': spotify_album['name'],
+                        'track_number': spotify_track['track_number'],  # Use Spotify track number
+                        'disc_number': spotify_track.get('disc_number', 1),
+                        'spotify_clean_title': spotify_track['name']  # For filename generation
+                    },
+                    "is_album_download": True,
+                    "has_full_spotify_metadata": True  # Flag for robust processing
+                })
 
                 logger.info(
                     "Queued matched track: title=%r track_number=%s",
@@ -11893,19 +11618,19 @@ def _start_enhanced_album_download(enhanced_tracks, unmatched_tracks, spotify_ar
 
             if download_id:
                 context_key = _make_context_key(username, filename)
-                with matched_context_lock:
-                    # Basic context for unmatched tracks (simple cleanup)
-                    matched_downloads_context[context_key] = {
-                        'search_result': {
-                            'username': username,
-                            'filename': filename,
-                            'size': size,
-                            'is_simple_download': True  # Falls back to simple transfer
-                        },
-                        'spotify_artist': None,
-                        'spotify_album': None,
-                        'track_info': None
-                    }
+                # Basic context for unmatched tracks (simple cleanup)
+                _register_matched_download_context(context_key, {
+                    'profile_id': get_current_profile_id(),
+                    'search_result': {
+                        'username': username,
+                        'filename': filename,
+                        'size': size,
+                        'is_simple_download': True  # Falls back to simple transfer
+                    },
+                    'spotify_artist': None,
+                    'spotify_album': None,
+                    'track_info': None
+                })
 
                 logger.info(f"Queued unmatched track (basic cleanup): {filename}")
                 started_count += 1
@@ -12001,17 +11726,17 @@ def _start_album_download_tasks(album_result, spotify_artist, spotify_album):
 
             if download_id:
                 context_key = _make_context_key(username, filename)
-                with matched_context_lock:
-                    # Enhanced context storage with Spotify clean titles (GUI parity)
-                    enhanced_context = individual_track_context.copy()
-                    enhanced_context['spotify_clean_title'] = individual_track_context.get('title', '')
+                # Enhanced context storage with Spotify clean titles (GUI parity)
+                enhanced_context = individual_track_context.copy()
+                enhanced_context['spotify_clean_title'] = individual_track_context.get('title', '')
 
-                    matched_downloads_context[context_key] = {
-                        "spotify_artist": spotify_artist,
-                        "spotify_album": spotify_album,
-                        "original_search_result": enhanced_context, # Contains corrected data + clean title
-                        "is_album_download": True
-                    }
+                _register_matched_download_context(context_key, {
+                    "profile_id": get_current_profile_id(),
+                    "spotify_artist": spotify_artist,
+                    "spotify_album": spotify_album,
+                    "original_search_result": enhanced_context, # Contains corrected data + clean title
+                    "is_album_download": True
+                })
                 logger.info(
                     "Queued track: filename=%s matched_title=%r",
                     filename,
@@ -12039,7 +11764,10 @@ def start_matched_download():
     if dl_err:
         return dl_err
     try:
-        data = request.get_json()
+        from core.imports.upgrade_intent import sanitize_client_import_metadata
+        from core.download_plugins.candidate_store import candidate_binding
+        data = sanitize_client_import_metadata(request.get_json() or {})
+        _matched_profile = get_current_profile_id()
         download_payload = data.get('search_result', {})
         spotify_artist = data.get('spotify_artist', {})
         spotify_album = data.get('spotify_album', None)
@@ -12064,29 +11792,31 @@ def start_matched_download():
             if not username or not filename:
                 return jsonify({"success": False, "error": "Missing username or filename"}), 400
 
-            download_id = run_async(download_orchestrator.download(username, filename, size))
+            with candidate_binding(_matched_profile, result_kind='track'):
+                download_id = run_async(
+                    download_orchestrator.download(username, filename, size))
 
             if download_id:
                 context_key = _make_context_key(username, filename)
-                with matched_context_lock:
-                    # Create context with FULL Spotify track metadata (like Download Missing Tracks modal)
-                    matched_downloads_context[context_key] = {
-                        "spotify_artist": spotify_artist,
-                        "spotify_album": spotify_track.get('album'),  # Single's album from Spotify
-                        "track_info": spotify_track,  # Full Spotify track object!
-                        "original_search_result": {
-                            'username': username,
-                            'filename': filename,
-                            'size': size,
-                            'title': spotify_track['name'],
-                            'artist': spotify_artist['name'],
-                            'album': spotify_track.get('album', {}).get('name', 'Unknown Album'),
-                            'track_number': spotify_track.get('track_number', 1),
-                            'spotify_clean_title': spotify_track['name']
-                        },
-                        "is_album_download": False,  # It's a single
-                        "has_full_spotify_metadata": True  # Flag for robust processing
-                    }
+                # Create context with FULL Spotify track metadata (like Download Missing Tracks modal)
+                _register_matched_download_context(context_key, {
+                    "profile_id": get_current_profile_id(),
+                    "spotify_artist": spotify_artist,
+                    "spotify_album": spotify_track.get('album'),  # Single's album from Spotify
+                    "track_info": spotify_track,  # Full Spotify track object!
+                    "original_search_result": {
+                        'username': username,
+                        'filename': filename,
+                        'size': size,
+                        'title': spotify_track['name'],
+                        'artist': spotify_artist['name'],
+                        'album': spotify_track.get('album', {}).get('name', 'Unknown Album'),
+                        'track_number': spotify_track.get('track_number', 1),
+                        'spotify_clean_title': spotify_track['name']
+                    },
+                    "is_album_download": False,  # It's a single
+                    "has_full_spotify_metadata": True  # Flag for robust processing
+                })
 
                 logger.info(f"Queued enhanced single track: '{spotify_track['name']}'")
                 return jsonify({"success": True, "message": "Enhanced single track download started"})
@@ -12096,7 +11826,9 @@ def start_matched_download():
         # NEW: Enhanced album download with track-to-track matching
         if enhanced_tracks:
             logger.info(f"Starting enhanced album download: {len(enhanced_tracks)} matched tracks, {len(unmatched_tracks)} unmatched")
-            started_count = _start_enhanced_album_download(enhanced_tracks, unmatched_tracks, spotify_artist, spotify_album)
+            with candidate_binding(_matched_profile, result_kind='album'):
+                started_count = _start_enhanced_album_download(
+                    enhanced_tracks, unmatched_tracks, spotify_artist, spotify_album)
             if started_count > 0:
                 return jsonify({"success": True, "message": f"Queued {started_count} tracks with full Spotify metadata."})
             else:
@@ -12106,7 +11838,9 @@ def start_matched_download():
         is_full_album_download = bool(spotify_album and download_payload.get('result_type') == 'album')
 
         if is_full_album_download:
-            started_count = _start_album_download_tasks(download_payload, spotify_artist, spotify_album)
+            with candidate_binding(_matched_profile, result_kind='album'):
+                started_count = _start_album_download_tasks(
+                    download_payload, spotify_artist, spotify_album)
             if started_count > 0:
                 return jsonify({"success": True, "message": f"Queued {started_count} tracks for matched album download."})
             else:
@@ -12123,25 +11857,27 @@ def start_matched_download():
             parsed_meta = _parse_filename_metadata(filename)
             download_payload['title'] = parsed_meta.get('title') or download_payload.get('title')
             download_payload['artist'] = parsed_meta.get('artist') or download_payload.get('artist')
-
-            download_id = run_async(download_orchestrator.download(username, filename, size))
+            
+            with candidate_binding(_matched_profile, result_kind='track'):
+                download_id = run_async(
+                    download_orchestrator.download(username, filename, size))
 
             if download_id:
                 context_key = _make_context_key(username, filename)
-                with matched_context_lock:
-                    # THE FIX: We preserve the spotify_album context if it was provided.
-                    # For a regular single, spotify_album will be None.
-                    # For an album track, it will contain the album's data.
-                    # Enhanced context storage with Spotify clean titles (GUI parity)
-                    enhanced_payload = download_payload.copy()
-                    enhanced_payload['spotify_clean_title'] = download_payload.get('title', '')
+                # THE FIX: We preserve the spotify_album context if it was provided.
+                # For a regular single, spotify_album will be None.
+                # For an album track, it will contain the album's data.
+                # Enhanced context storage with Spotify clean titles (GUI parity)
+                enhanced_payload = download_payload.copy()
+                enhanced_payload['spotify_clean_title'] = download_payload.get('title', '')
 
-                    matched_downloads_context[context_key] = {
-                        "spotify_artist": spotify_artist,
-                        "spotify_album": spotify_album, # PRESERVE album context
-                        "original_search_result": enhanced_payload,
-                        "is_album_download": False # It's a single track download, not a full album job.
-                    }
+                _register_matched_download_context(context_key, {
+                    "profile_id": get_current_profile_id(),
+                    "spotify_artist": spotify_artist,
+                    "spotify_album": spotify_album, # PRESERVE album context
+                    "original_search_result": enhanced_payload,
+                    "is_album_download": False # It's a single track download, not a full album job.
+                })
                 return jsonify({"success": True, "message": "Matched download started"})
             else:
                 return jsonify({"success": False, "error": "Failed to start download via slskd"}), 500
@@ -12150,6 +11886,283 @@ def start_matched_download():
         import traceback
         traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
+
+# ── enriched downloads from basic search ────────────────────────────────────
+# one metadata provider end to end: the release, its tracklist and the ids all
+# come from the provider the user picked. files are mapped to tracks on the
+# server with the import matcher. pinnable sources become a real batch, so the
+# download shows on the Downloads page; torrent/usenet keep the direct route.
+from core.search import enriched_download as _enriched
+
+
+def _enriched_blocklist_answer(data, artist, title):
+    """the same "blocked, download anyway?" 409 the as-is route gives"""
+    if data.get('ignore_blocklist') or not artist:
+        return None
+    try:
+        reason = get_database().blocklist_reason_for_track(
+            get_current_profile_id(), {'name': title, 'artists': [{'name': artist}]})
+    except Exception as bl_err:  # noqa: BLE001 - the guard is best-effort, like the as-is route
+        logger.debug("enriched download blocklist check skipped: %s", bl_err)
+        return None
+    if reason:
+        return jsonify({
+            "success": False, "blocked": True,
+            "blocked_entity_type": reason[0], "blocked_name": reason[1],
+        }), 409
+    return None
+
+
+def _enriched_files(data):
+    return [f for f in (data.get('files') or []) if isinstance(f, dict) and f.get('username') and f.get('filename')]
+
+
+@app.route('/api/search/enriched/match', methods=['POST'])
+def enriched_match():
+    """the chosen release's tracklist plus which picked file is which track"""
+    dl_err = check_download_permission()
+    if dl_err:
+        return dl_err
+    data = request.get_json(silent=True) or {}
+    source = str(data.get('source') or '').strip().lower()
+    album_id = str(data.get('album_id') or '').strip()
+    album_name = str(data.get('album_name') or '')
+    artist = str(data.get('artist') or '')
+    files = _enriched_files(data)
+    if not source or not album_id or not files:
+        return jsonify({"success": False, "error": "Pick a release and at least one file."}), 400
+    try:
+        release = _enriched.fetch_release(source, album_id, album_name, artist)
+    except _enriched.ProviderMismatch as mismatch:
+        return jsonify({"success": False, "error": f"{mismatch}. Try another source."}), 502
+    except LookupError as missing:
+        return jsonify({"success": False, "error": str(missing)}), 404
+    except Exception as err:  # noqa: BLE001 - surface it to the modal, don't 500 blind
+        logger.error("[Enriched] release lookup failed: %s", err, exc_info=True)
+        return jsonify({"success": False, "error": "Could not load that release."}), 500
+    album = _enriched.album_context(release['album'], source, artist)
+    assignments = _enriched.match_files(files, release['tracks'], album.get('name') or album_name)
+    tracks = [{
+        'index': i,
+        'name': t.get('name') or '',
+        'track_number': t.get('track_number') or 0,
+        'disc_number': t.get('disc_number') or 1,
+        'duration_ms': t.get('duration_ms') or 0,
+    } for i, t in enumerate(release['tracks'])]
+    return jsonify({"success": True, "album": album, "tracks": tracks, "assignments": assignments})
+
+
+@app.route('/api/search/enriched/start', methods=['POST'])
+def enriched_start():
+    """start an enriched download: an album (files + assignments) or a single
+    track (one file + track_id)"""
+    dl_err = check_download_permission()
+    if dl_err:
+        return dl_err
+    data = request.get_json(silent=True) or {}
+    source = str(data.get('source') or '').strip().lower()
+    files = _enriched_files(data)
+    if not source or not files:
+        return jsonify({"success": False, "error": "Pick a release and at least one file."}), 400
+    try:
+        if data.get('track_id'):
+            return _enriched_start_single(data, source, files[0])
+        return _enriched_start_album(data, source, files)
+    except _enriched.ProviderMismatch as mismatch:
+        return jsonify({"success": False, "error": f"{mismatch}. Try another source."}), 502
+    except LookupError as missing:
+        return jsonify({"success": False, "error": str(missing)}), 404
+    except Exception as err:  # noqa: BLE001
+        logger.error("[Enriched] start failed: %s", err, exc_info=True)
+        return jsonify({"success": False, "error": "Could not start the download."}), 500
+
+
+def _enriched_start_album(data, source, files):
+    album_id = str(data.get('album_id') or '').strip()
+    album_name = str(data.get('album_name') or '')
+    artist = str(data.get('artist') or '')
+    if not album_id:
+        return jsonify({"success": False, "error": "Pick a release first."}), 400
+    # re-fetched here, the browser never ships track objects we'd have to trust
+    release = _enriched.fetch_release(source, album_id, album_name, artist)
+    album = _enriched.album_context(release['album'], source, artist)
+    album_artist = (album.get('artists') or [{'name': artist}])[0].get('name') or artist
+
+    blocked = _enriched_blocklist_answer(data, album_artist, album.get('name'))
+    if blocked:
+        return blocked
+
+    by_key = {_enriched.file_key(f): f for f in files}
+    picked = []
+    for assignment in data.get('assignments') or []:
+        index = assignment.get('track_index')
+        file = by_key.get(assignment.get('file_key'))
+        if file is None or index is None or not (0 <= int(index) < len(release['tracks'])):
+            continue  # skipped by the user, or not a real track
+        track = release['tracks'][int(index)]
+        if _is_explicit_blocked(track):
+            logger.info("[Content Filter] Skipping explicit track: '%s'", track.get('name'))
+            continue
+        picked.append((file, track))
+    if not picked:
+        return jsonify({"success": False, "error": "No files are assigned to a track."}), 400
+
+    _preflight_mb_release(album.get('name'), album_artist, len(picked))
+    artist_ctx = {'name': album_artist, 'id': '', 'genres': [], 'source': source}
+
+    if all(_pinned_batch.is_pinnable(f.get('username')) for f, _t in picked):
+        batch_id, task_ids = _pinned_batch.create_pinned_batch(
+            [_pinned_batch.PinnedFile(
+                candidate=_pinned_batch.candidate_from_result(f),
+                track_info=_enriched.enriched_track_info(t, album, source, as_album=True),
+            ) for f, t in picked],
+            name=album.get('name') or album_name or 'Album',
+            profile_id=get_current_profile_id(),
+            is_album=True, album_context=album, artist_context=artist_ctx,
+        )
+        _pinned_batch.dispatch_pinned_batch(batch_id, task_ids, _pinned_batch_deps())
+        add_activity_item("", "Album Download Started", f"'{album.get('name')}' - {len(picked)} tracks", "Now")
+        return jsonify({"success": True, "batch_id": batch_id,
+                        "message": f"Downloading {len(picked)} tracks of {album.get('name')}"})
+
+    # torrent/usenet: one download is the whole release, keep the direct route
+    enhanced = [{'slskd_track': f, 'spotify_track': {**t, 'album': album}} for f, t in picked]
+    started = _start_enhanced_album_download(enhanced, [], artist_ctx, dict(album))
+    if not started:
+        return jsonify({"success": False, "error": "Failed to queue any tracks from the album."}), 500
+    return jsonify({"success": True, "message": f"Queued {started} tracks of {album.get('name')}"})
+
+
+def _enriched_start_single(data, source, file):
+    track_id = str(data.get('track_id'))
+    row = data.get('track') if isinstance(data.get('track'), dict) else {}
+    details = _enriched.single_track_details(source, track_id) or {}
+    artist = row.get('artist') or file.get('artist') or ''
+    track = {
+        'id': track_id,
+        'name': details.get('name') or row.get('name') or file.get('title') or '',
+        'artists': details.get('artists') or ([artist] if artist else []),
+        'duration_ms': details.get('duration_ms') or row.get('duration_ms') or 0,
+        'track_number': details.get('track_number') or 0,
+        'disc_number': details.get('disc_number') or 1,
+        'explicit': bool(details.get('explicit')),
+    }
+    raw_album = details.get('album') if isinstance(details.get('album'), dict) else {}
+    raw_album = dict(raw_album or {'name': row.get('album') or '', 'release_date': row.get('release_date') or ''})
+    if not raw_album.get('image_url') and row.get('image_url'):
+        raw_album['image_url'] = row['image_url']
+    album = _enriched.album_context(raw_album, source, artist)
+    # a track off a real album files under that album; a single stays a single
+    as_album = bool(album.get('id') and album.get('name') and album.get('album_type') != 'single')
+
+    names = [a.get('name') if isinstance(a, dict) else a for a in track['artists']]
+    first_artist = next((n for n in names if n), artist)
+    blocked = _enriched_blocklist_answer(data, first_artist, track['name'])
+    if blocked:
+        return blocked
+    if _is_explicit_blocked(track):
+        return jsonify({"success": False, "error": "Explicit content is disabled in settings",
+                        "explicit_blocked": True}), 403
+
+    track_info = _enriched.enriched_track_info(track, album, source, as_album=as_album)
+    title = f"{first_artist} - {track['name']}" if first_artist else track['name']
+
+    if _pinned_batch.is_pinnable(file.get('username')):
+        batch_id, task_ids = _pinned_batch.create_pinned_batch(
+            [_pinned_batch.PinnedFile(candidate=_pinned_batch.candidate_from_result(file), track_info=track_info)],
+            name=title, profile_id=get_current_profile_id(),
+            album_context=album if as_album else None,
+            artist_context={'name': first_artist, 'id': '', 'genres': [], 'source': source},
+        )
+        _pinned_batch.dispatch_pinned_batch(batch_id, task_ids, _pinned_batch_deps())
+        add_activity_item("", "Track Download Started", f"'{track['name']}'", "Now")
+        return jsonify({"success": True, "batch_id": batch_id, "message": f"Downloading {track['name']}"})
+
+    # release-level source: the direct route, as the old modal did
+    username, filename, size = file.get('username'), file.get('filename'), file.get('size', 0)
+    download_id = run_async(download_orchestrator.download(username, filename, size))
+    if not download_id:
+        return jsonify({"success": False, "error": "Failed to start the download"}), 500
+    _register_matched_download_context(_make_context_key(username, filename), {
+        "profile_id": get_current_profile_id(),
+        "spotify_artist": {'name': first_artist, 'id': '', 'genres': [], 'source': source},
+        "spotify_album": album,
+        "track_info": track_info,
+        "original_search_result": {
+            'username': username, 'filename': filename, 'size': size,
+            'title': track['name'], 'artist': first_artist, 'album': album.get('name') or '',
+            'track_number': track['track_number'] or 1,
+            'spotify_clean_title': track['name'],
+            'source': source,
+        },
+        "is_album_download": as_album,
+        "has_full_spotify_metadata": True,
+    })
+    return jsonify({"success": True, "message": f"Downloading {track['name']}"})
+
+
+# ── tag it yourself (basic search) ──────────────────────────────────────────
+# the user typed the release: bootlegs, live sets, mixtapes no service knows.
+# the tasks carry _manual_metadata, which stands tagging lookups, acoustid and
+# enrichment down (core/metadata/manual.py); the lock is recorded when each
+# file lands (pipeline _record_manual_lock).
+from core.search import manual_download as _manual
+
+
+@app.route('/api/search/manual/start', methods=['POST'])
+def manual_start():
+    dl_err = check_download_permission()
+    if dl_err:
+        return dl_err
+    data = request.get_json(silent=True) or {}
+    files = _enriched_files(data)
+    album = data.get('album') if isinstance(data.get('album'), dict) else {}
+    tracks = [t for t in (data.get('tracks') or []) if isinstance(t, dict)]
+    if not files:
+        return jsonify({"success": False, "error": "No files to download."}), 400
+    try:
+        album_ctx, tasks = _manual.build_manual_tasks(files, album, tracks, file_key=_enriched.file_key)
+    except _manual.ManualInputError as bad:
+        return jsonify({"success": False, "error": str(bad)}), 400
+
+    album_artist = album_ctx['artists'][0]['name']
+    blocked = _enriched_blocklist_answer(data, album_artist, album_ctx['name'])
+    if blocked:
+        return blocked
+
+    # the cover is saved only once everything else checked out
+    if album.get('image_data'):
+        try:
+            cover_path = _manual.save_cover(album['image_data'])
+        except _manual.ManualInputError as bad:
+            return jsonify({"success": False, "error": str(bad)}), 400
+        for _file, info in tasks:
+            info['_manual_cover_path'] = cover_path
+
+    name = album_ctx['name']
+    if all(_pinned_batch.is_pinnable(f.get('username')) for f, _i in tasks):
+        batch_id, task_ids = _pinned_batch.create_pinned_batch(
+            [_pinned_batch.PinnedFile(candidate=_pinned_batch.candidate_from_result(f), track_info=info)
+             for f, info in tasks],
+            name=name, profile_id=get_current_profile_id(),
+            is_album=True, album_context=album_ctx,
+            artist_context=tasks[0][1]['_explicit_artist_context'],
+        )
+        _pinned_batch.dispatch_pinned_batch(batch_id, task_ids, _pinned_batch_deps())
+        add_activity_item("", "Album Download Started", f"'{name}' - {len(tasks)} tracks (tagged by hand)", "Now")
+        return jsonify({"success": True, "batch_id": batch_id,
+                        "message": f"Downloading {len(tasks)} {'track' if len(tasks) == 1 else 'tracks'} of {name}"})
+
+    # torrent/usenet: one download is the whole release, the direct route.
+    # the track_info rides along as the context's track_info, so the manual
+    # flag reaches post-processing the same way
+    enhanced = [{'slskd_track': f, 'spotify_track': info} for f, info in tasks]
+    started = _start_enhanced_album_download(
+        enhanced, [], dict(tasks[0][1]['_explicit_artist_context']), dict(album_ctx))
+    if not started:
+        return jsonify({"success": False, "error": "Failed to queue any tracks."}), 500
+    return jsonify({"success": True, "message": f"Queued {started} tracks of {name}"})
+
 
 def _parse_filename_metadata(filename: str) -> dict:
     """
@@ -13289,10 +13302,12 @@ def _apply_path_template(template: str, context: dict) -> str:
         'discnum': str(clean_context.get('disc_number', 1)),
         'year': str(clean_context.get('year', '')),
         'quality': clean_context.get('quality', ''),
+        'disambiguation': clean_context.get('disambiguation', ''),
     }
     for var_name, val in _bracket_map.items():
         result = result.replace('${' + var_name + '}', val)
 
+    result = result.replace('$disambiguation', clean_context.get('disambiguation', ''))
     result = result.replace('$albumartist', album_artist_value)
     result = result.replace('$albumtype', clean_context.get('albumtype', 'Album'))
     result = result.replace('$playlist', clean_context.get('playlist_name', ''))
@@ -13531,14 +13546,31 @@ def _post_process_matched_download_with_verification(context_key, context, file_
     NEW VERIFICATION WORKFLOW: Enhanced post-processing with file verification.
     Only sets task status to 'completed' after successful file verification and move operation.
     """
-    from core.imports.pipeline import post_process_matched_download_with_verification
-    return post_process_matched_download_with_verification(
+    from core.acquisition.recovery import (
+        attach_recovered_staging_context,
+        record_recovered_staging_result,
+    )
+    recovered_context = attach_recovered_staging_context(
+        get_database()._get_connection, file_path, context,
+    )
+    context.clear()
+    context.update(recovered_context)
+    from core.imports.pipeline import (
+        import_rejection_reason,
+        post_process_matched_download_with_verification,
+    )
+    result = post_process_matched_download_with_verification(
         context_key,
         context,
         file_path,
         task_id,
         batch_id,
-        _build_import_pipeline_runtime(),
+        _build_import_pipeline_runtime(
+            automation_engine=automation_engine,
+            on_download_completed=_on_download_completed,
+            web_scan_manager=web_scan_manager,
+            repair_worker=repair_worker,
+        ),
         _build_metadata_enrichment_runtime(
             mb_worker=mb_worker,
             deezer_worker=deezer_worker,
@@ -13554,6 +13586,20 @@ def _post_process_matched_download_with_verification(context_key, context, file_
             hifi_client=download_orchestrator.client("hifi") if download_orchestrator else None,
         ),
     )
+    if context.get('_quarantine_recovery_entry_id'):
+        final_path = context.get('_final_processed_path') or context.get('_final_path')
+        rejection = import_rejection_reason(context)
+        success = bool(final_path and os.path.isfile(str(final_path)) and not rejection)
+        record_recovered_staging_result(
+            get_database()._get_connection,
+            context,
+            success=success,
+            error=rejection or (
+                None if success
+                else 'Shared import pipeline did not produce a final file'
+            ),
+        )
+    return result
 
 
 def _safe_move_file(src, dst):
@@ -13659,12 +13705,26 @@ def _post_process_matched_download(context_key, context, file_path):
     Also handles simple downloads (from search page "Download" button) which
     just move files to /Transfer without metadata enhancement.
     """
-    from core.imports.pipeline import post_process_matched_download
-    return post_process_matched_download(
+    from core.acquisition.recovery import (
+        attach_recovered_staging_context,
+        record_recovered_staging_result,
+    )
+    recovered_context = attach_recovered_staging_context(
+        get_database()._get_connection, file_path, context,
+    )
+    context.clear()
+    context.update(recovered_context)
+    from core.imports.pipeline import import_rejection_reason, post_process_matched_download
+    result = post_process_matched_download(
         context_key,
         context,
         file_path,
-        _build_import_pipeline_runtime(),
+        _build_import_pipeline_runtime(
+            automation_engine=automation_engine,
+            on_download_completed=_on_download_completed,
+            web_scan_manager=web_scan_manager,
+            repair_worker=repair_worker,
+        ),
         metadata_runtime=_build_metadata_enrichment_runtime(
             mb_worker=mb_worker,
             deezer_worker=deezer_worker,
@@ -13680,6 +13740,20 @@ def _post_process_matched_download(context_key, context, file_path):
             hifi_client=download_orchestrator.client("hifi") if download_orchestrator else None,
         ),
     )
+    if context.get('_quarantine_recovery_entry_id'):
+        final_path = context.get('_final_processed_path') or context.get('_final_path')
+        rejection = import_rejection_reason(context)
+        success = bool(final_path and os.path.isfile(str(final_path)) and not rejection)
+        record_recovered_staging_result(
+            get_database()._get_connection,
+            context,
+            success=success,
+            error=rejection or (
+                None if success
+                else 'Shared import pipeline did not produce a final file'
+            ),
+        )
+    return result
 
 # Track stale transfer keys (completed in slskd but no context — e.g., from before app restart)
 # so we only log the warning once per key instead of spamming every poll cycle
@@ -13930,7 +14004,13 @@ def is_watchlist_actually_scanning():
 
     return True
 
-def _process_wishlist_automatically(automation_id=None, apply_backoff=None):
+def _process_wishlist_automatically(
+    automation_id=None,
+    *,
+    apply_backoff=None,
+    track_ids=None,
+    profile_ids=None,
+):
     """Main automatic processing logic that runs in background thread."""
     from core.wishlist_service import get_wishlist_service
 
@@ -13972,12 +14052,25 @@ def _process_wishlist_automatically(automation_id=None, apply_backoff=None):
         profile_id=1,
     )
 
-    _process_wishlist_automatically_impl(runtime, automation_id=automation_id,
-                                         apply_backoff=apply_backoff)
+    _process_wishlist_automatically_impl(
+        runtime,
+        automation_id=automation_id,
+        apply_backoff=apply_backoff,
+        track_ids=track_ids,
+        profile_ids=profile_ids,
+    )
+
+
 # ── database updater/backup/maintenance endpoints live in api/database_admin.py
 # now. the callbacks, run tasks and stall check are imported back: the
 # incremental-update outlier route, the library scan path and the automation
 # deps still call them by name.
+import api.import_routes as _import_routes  # noqa: E402
+from api.discover_routes import (  # noqa: E402
+    _autostart_popularity_backfill,
+    _build_personalized_manager,
+)
+from api.user_profiles import _get_lb_credentials_for_profile  # noqa: E402
 from api.database_admin import (  # noqa: E402
     _check_db_update_stall,
     _db_update_phase_callback,
@@ -14002,16 +14095,24 @@ def ytdlp_status():
     than a guess. The PyPI lookup is best-effort — no network must never mean no
     version panel."""
     from core.ytdlp_update import (PYPI_URL, installed_version, is_behind,
-                                   normalize_channel, parse_pypi)
+                                   normalize_channel, parse_pypi, restart_pending,
+                                   version_on_disk)
     channel = normalize_channel(request.args.get('channel'))
     installed = installed_version()
+    on_disk = version_on_disk()
     latest, err = None, None
     try:
         import requests as _rq
         latest = parse_pypi(_rq.get(PYPI_URL, timeout=8).text, channel)
     except Exception as e:      # noqa: BLE001 - offline is a state, not an error page
         err = str(e)
+    # `installed` is what this process LOADED; `on_disk` is what pip has put
+    # there. They differ for the whole window between updating and restarting,
+    # and saying so is the difference between "you are behind" (which reads as
+    # "the update did not work") and "update done, restart to finish".
     return jsonify({'success': True, 'installed': installed, 'latest': latest,
+                    'on_disk': on_disk,
+                    'restart_pending': restart_pending(installed, on_disk),
                     'channel': channel, 'behind': is_behind(installed, latest),
                     'lookup_error': err})
 
@@ -14173,7 +14274,7 @@ def _get_quality_tier_from_extension(file_path):
 
     return ('unknown', 999)
 
-# (Quality scanning moved to the 'quality_upgrade' library-maintenance repair job.)
+# (Quality scanning is part of the wanted projection — see monitoring_list_reconcile.)
 
 from core.library.duplicate_cleaner import (
     _run_duplicate_cleaner,
@@ -14305,8 +14406,7 @@ def _get_batch_lock(batch_id):
             batch_locks[batch_id] = threading.Lock()
         return batch_locks[batch_id]
 
-# Batch lifecycle logic lives in core/downloads/lifecycle.py.
-from core.downloads import lifecycle as _downloads_lifecycle
+# Batch lifecycle logic lives in core/downloads/lifecycle.py (imported above as _downloads_lifecycle).
 
 
 def _build_lifecycle_deps():
@@ -14580,7 +14680,6 @@ def _try_version_mismatch_fallback_for_worker(expected_title, expected_artist, t
     from core.imports.version_mismatch_fallback import try_accept_version_mismatch_fallback
     from core.imports.quarantine import approve_quarantine_entry, list_quarantine_entries
     from core.settings import config_manager
-    from core.imports.paths import docker_resolve_path
     import os
     try:
         download_path = docker_resolve_path(
@@ -14732,6 +14831,10 @@ def _get_staging_file_cache(batch_id):
                 'full_path': full_path,
                 'title': meta['title'] or '',
                 'artist': meta['albumartist'] or meta['artist'] or '',
+                # the performer, when the file has one. 'artist' above reads the
+                # album artist first, so every compilation track looked like
+                # 'Various Artists' and never matched the track it was
+                'track_artist': meta['artist'] or '',
                 'album': meta['album'] or '',
                 'track_number': meta.get('track_number'),
                 'disc_number': meta.get('disc_number'),
@@ -15034,7 +15137,10 @@ def start_playlist_missing_downloads(playlist_id):
                 'permanently_failed_tracks': [],
                 'cancelled_tracks': set(),
                 # Profile context for failed track wishlist re-adds
-                'profile_id': get_current_profile_id()
+                'profile_id': get_current_profile_id(),
+                # the selected directory, resolved while a request still exists;
+                # every later stage reads it back off the batch (#1199)
+                'library_owner_id': _selected_library_owner(),
             }
 
             for i, track_entry in enumerate(missing_tracks):
@@ -15151,7 +15257,7 @@ def _build_status_deps():
         run_async=run_async,
         on_download_completed=_on_download_completed,
         get_persistent_download_history=lambda limit: get_database().get_library_history(
-            event_type='download',
+            event_type=('download', 'podcast'),
             page=1,
             limit=limit,
             # the acoustid scanner's synthetic review rows carry
@@ -15160,7 +15266,11 @@ def _build_status_deps():
             # and pushed every real download out of the cap
             exclude_download_sources=('acoustid_scan',),
         )[0],
-        get_unverified_download_history=lambda: get_database().get_library_history_unverified(),
+        # same exclusion as the tail above: a scan-flagged library file is
+        # reviewed from the acoustid scanner's findings, not as a download
+        get_unverified_download_history=lambda: get_database().get_library_history_unverified(
+            exclude_download_sources=('acoustid_scan',),
+        ),
     )
 
 
@@ -15317,6 +15427,14 @@ def cancel_download_task():
             # Immediately mark as cancelled to prevent race conditions
             task['status'] = 'cancelled'
 
+        # Acquisition tracks: cancel ends the persistent retry walk — it must
+        # never auto-restart after a process restart (docs/library-v2.md §8).
+        try:
+            from core.acquisition.pipeline_callback import notify_task_retry_cancelled
+            notify_task_retry_cancelled(task.get('track_info'))
+        except Exception as _acq_journal_exc:
+            logger.debug(f"[Cancel] acquisition retry journal close skipped: {_acq_journal_exc}")
+
         # IMPROVED WORKER SLOT MANAGEMENT: Use batch state validation instead of task status
         batch_id = task.get('batch_id')
         worker_slot_freed = False
@@ -15449,7 +15567,10 @@ def cancel_download_task():
                 failure_reason="Download cancelled by user",
                 source_type="playlist",
                 source_context=source_context,
-                profile_id=get_current_profile_id(),
+                # the wishlist of the library the batch was filling (E-12),
+                # not whoever pressed cancel
+                profile_id=(download_batches.get(task.get('batch_id')) or {}).get('profile_id')
+                or get_current_profile_id(),
                 quality_profile_id=resolve_task_quality_profile_id(task),
             )
 
@@ -15578,6 +15699,18 @@ def cancel_task_v2():
             "success": False,
             "error": "Missing playlist_id or track_index"
         }), 400
+
+    if playlist_id == 'audiobooks':
+        from core.audiobook_download_monitor import cancel_downloads as cancel_audiobooks
+        with tasks_lock:
+            task_id, _ = _find_task_by_playlist_track(playlist_id, track_index)
+        if not task_id:
+            return jsonify({"success": False, "error": "Audiobook task not found"}), 404
+        try:
+            cancel_audiobooks([task_id])
+            return jsonify({"success": True, "message": "Audiobook cancelled"})
+        except Exception as exc:
+            return jsonify({"success": False, "error": str(exc)}), 500
 
     try:
         # Everything in one atomic operation within the lock
@@ -15725,6 +15858,14 @@ def cancel_batch(batch_id):
     Cancels an entire batch - useful for cancelling during analysis phase
     or cancelling all downloads at once.
     """
+    if batch_id == 'audiobooks':
+        from core.audiobook_download_monitor import cancel_downloads as cancel_audiobooks
+        try:
+            count = cancel_audiobooks()
+            return jsonify({"success": True, "cancelled_tasks": count})
+        except Exception as exc:
+            return jsonify({"success": False, "error": str(exc)}), 500
+
     try:
         with tasks_lock:
             if batch_id not in download_batches:
@@ -15763,6 +15904,14 @@ def cancel_batch(batch_id):
                     if task['status'] not in ['completed', 'failed', 'not_found', 'cancelled']:
                         task['status'] = 'cancelled'
                         cancelled_count += 1
+
+            # close the sync history row with what finished before the cancel.
+            # nothing else ever will: a cancelled batch never reaches a
+            # completion check, and the row read "In progress" for good
+            try:
+                _record_sync_history_completion(batch_id, download_batches[batch_id])
+            except Exception as hist_err:
+                logger.warning(f"[Cancel Batch] Could not close sync history for {batch_id}: {hist_err}")
 
             # Add activity for batch cancellation
             playlist_name = download_batches[batch_id].get('playlist_name', 'Unknown Playlist')
@@ -15809,13 +15958,22 @@ def cleanup_batch():
 
                 # #999: discard unpublished atomic staging on cleanup/cancel of a
                 # staged album (no-op for normal batches and already-published ones).
-                if batch.get('_atomic_active') and batch.get('_atomic_staging_root'):
-                    try:
-                        from core.downloads.atomic_album_publish import discard_staging_root
+                # #1289: only an explicit cancel throws the audio away — a cleanup
+                # of an errored or stale batch leaves it for startup recovery.
+                try:
+                    from core.downloads.atomic_album_publish import (
+                        discard_staging_root, should_discard_staging)
+                    _discard, _why = should_discard_staging(batch)
+                    if _discard:
                         if discard_staging_root(batch.get('_atomic_staging_root')):
-                            logger.info(f"[Atomic Publish] Discarded staging for cleaned-up batch {batch_id}")
-                    except Exception as _atomic_e:
-                        logger.debug(f"[Atomic Publish] staging discard failed: {_atomic_e}")
+                            logger.info("[Atomic Publish] Discarded staging for cleaned-up batch %s (%s)",
+                                        batch_id, _why)
+                    elif batch.get('_atomic_active') and batch.get('_atomic_staging_root'):
+                        logger.warning(
+                            "[Atomic Publish] Keeping staged audio for cleaned-up batch %s (%s): %s",
+                            batch_id, _why, batch.get('_atomic_staging_root'))
+                except Exception as _atomic_e:
+                    logger.debug(f"[Atomic Publish] staging discard check failed: {_atomic_e}")
 
                 # Delete the batch record
                 del download_batches[batch_id]
@@ -16613,7 +16771,8 @@ def server_playlist_replace_track(playlist_id):
 
             if replaced:
                 new_track_objs = [type('T', (), {'ratingKey': tid, 'title': ''})() for tid in new_track_ids]
-                media_server_engine.client('navidrome').create_playlist(playlist_name, new_track_objs, playlist_id=playlist_id)
+                if not media_server_engine.client('navidrome').create_playlist(playlist_name, new_track_objs, playlist_id=playlist_id):
+                    return jsonify({"success": False, "error": "Navidrome playlist write failed or could not be verified"}), 502
                 _persist_replacement()
                 return jsonify({"success": True, "message": "Track replaced"})
             return jsonify({"success": False, "error": "Old track not found"}), 404
@@ -16803,7 +16962,8 @@ def server_playlist_add_track(playlist_id):
             plan = plan_playlist_add(track_ids, track_id, is_link=bool(source_track_id), position=position)
             if plan['should_insert']:
                 new_track_objs = [type('T', (), {'ratingKey': tid, 'title': ''})() for tid in plan['new_ids']]
-                media_server_engine.client('navidrome').create_playlist(playlist_name, new_track_objs, playlist_id=playlist_id)
+                if not media_server_engine.client('navidrome').create_playlist(playlist_name, new_track_objs, playlist_id=playlist_id):
+                    return jsonify({"success": False, "error": "Navidrome playlist write failed or could not be verified"}), 502
             _persist_find_and_add_match(source_track_id, active_server, track_id, server_track_title, source_title, source_artist, source_provider)
             return jsonify({"success": True, "message": "Track linked" if not plan['should_insert'] else "Track added"})
 
@@ -16890,7 +17050,8 @@ def server_playlist_remove_track(playlist_id):
             if not removed:
                 return jsonify({"success": False, "error": "Track not found in playlist"}), 404
             new_track_objs = [type('T', (), {'ratingKey': tid, 'title': ''})() for tid in new_ids]
-            media_server_engine.client('navidrome').create_playlist(playlist_name, new_track_objs, playlist_id=playlist_id)
+            if not media_server_engine.client('navidrome').create_playlist(playlist_name, new_track_objs, playlist_id=playlist_id):
+                return jsonify({"success": False, "error": "Navidrome playlist write failed or could not be verified"}), 502
             return jsonify({"success": True, "message": "Track removed"})
 
         return jsonify({"success": False, "error": f"Unsupported server: {active_server}"}), 400
@@ -17159,7 +17320,7 @@ def start_missing_tracks_process(playlist_id):
     A single, robust endpoint to kick off the entire missing tracks workflow.
     It creates a batch and starts the master worker in the background.
     """
-    data = request.get_json()
+    data = request.get_json() or {}
     tracks = data.get('tracks', [])
     playlist_name = data.get('playlist_name', 'Unknown Playlist')
     force_download_all = data.get('force_download_all', False)
@@ -17258,6 +17419,53 @@ def start_missing_tracks_process(playlist_id):
 
     batch_id = str(uuid.uuid4())
 
+    # §52.8/§55.2: an Enhanced-/Global-Search "Begin Analysis" click is a
+    # confirmed acquisition intent. Materialize its exact Artist/Release/Track
+    # rows before the background search can fail or quarantine, then carry the
+    # resolved ids/profile/correlation through the existing task payload. A
+    # plain /api/search candidate lookup remains read-only, and non-search
+    # playlist batches keep their established mirroring semantics.
+    try:
+        from core.library2 import ADMIN_PROFILE_ID
+        from core.library2.confirmed_intent import (
+            is_confirmed_search_process,
+            materialize_confirmed_search_tracks,
+        )
+        _materialize_search = (
+            is_admin_request()
+            and is_confirmed_search_process(playlist_id)
+        )
+        if _materialize_search:
+            _lib2_conn = get_database()._get_connection()
+            try:
+                _requested_quality_profile = data.get('quality_profile_id')
+                if _requested_quality_profile is None:
+                    from core.library2.profile_lookup import default_quality_profile_id
+                    _requested_quality_profile = default_quality_profile_id(_lib2_conn)
+                tracks = list(materialize_confirmed_search_tracks(
+                    _lib2_conn,
+                    tracks,
+                    album_context=album_context,
+                    artist_context=artist_context,
+                    explicit_profile_id=_requested_quality_profile,
+                    profile_id=ADMIN_PROFILE_ID,
+                    correlation_id=batch_id,
+                ))
+                _lib2_conn.commit()
+            except Exception:
+                _lib2_conn.rollback()
+                raise
+            finally:
+                _lib2_conn.close()
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+    except Exception as exc:
+        logger.exception("Confirmed Search intent materialization failed")
+        return jsonify({
+            "success": False,
+            "error": f"Could not prepare Library v2 search intent: {exc}",
+        }), 500
+
     with tasks_lock:
         download_batches[batch_id] = {
             'phase': 'analysis',
@@ -17273,6 +17481,9 @@ def start_missing_tracks_process(playlist_id):
             'analysis_total': len(tracks),
             # Profile context for failed track wishlist re-adds
             'profile_id': get_current_profile_id(),
+            # the selected directory, resolved while a request still exists;
+            # every later stage reads it back off the batch (#1199)
+            'library_owner_id': _selected_library_owner(),
             'analysis_processed': 0,
             'analysis_results': [],
             'force_download_all': force_download_all,  # Pass the force flag to the batch
@@ -17413,7 +17624,10 @@ def start_missing_downloads():
                 'permanently_failed_tracks': [],
                 'cancelled_tracks': set(),
                 # Profile context for failed track wishlist re-adds
-                'profile_id': get_current_profile_id()
+                'profile_id': get_current_profile_id(),
+                # the selected directory, resolved while a request still exists;
+                # every later stage reads it back off the batch (#1199)
+                'library_owner_id': _selected_library_owner(),
             }
 
             for track_index, track_data in enumerate(missing_tracks):
@@ -18177,6 +18391,35 @@ from api.source_playlists import (  # noqa: E402
 )
 # --- Discover Download Snapshot System ---
 
+_lib2_bootstrap_autostart_lock = threading.Lock()
+_lib2_bootstrap_autostart_thread = None
+
+
+def start_library_v2_bootstrap_autostart() -> bool:
+    """(Re)arm the one-shot catalogue migration loop. Returns whether it started.
+
+    MIG-02: the loop retires for good as soon as it has nothing left to do —
+    ``already_done``, ``empty_source``, or one successful import. A backup
+    restore then swaps in a database whose ``lib2_*`` tables are empty *after*
+    that, so nobody is left to notice the catalogue needs migrating again. The
+    supervisor sees ``migration_required`` and does the only thing it can: it
+    pauses the workers, forever. Re-arming here puts a restored database
+    through the same coordinated lifecycle (deferred backfills, claim, import,
+    post-import, worker release) a startup would give it.
+    """
+    global _lib2_bootstrap_autostart_thread
+    with _lib2_bootstrap_autostart_lock:
+        running = _lib2_bootstrap_autostart_thread
+        if running is not None and running.is_alive():
+            return False
+        thread = threading.Thread(
+            target=_autostart_library_v2_bootstrap_import, daemon=True,
+            name='Lib2BootstrapImportAutostart')
+        _lib2_bootstrap_autostart_thread = thread
+        thread.start()
+        return True
+
+
 # ── discover endpoints live in api/discover_routes.py now ───────────────────
 
 # --- Artist Bubble Snapshot System ---
@@ -18595,13 +18838,12 @@ def hydrate_beatport_bubbles():
 
 # --- Profile API Endpoints ---
 
-# /api/profiles* endpoints: lifted to api/user_profiles.py.
-# Per-profile service-connection helpers: moved to api/user_profiles.py with
-# the profile routes that use them.
-from api.user_profiles import _get_lb_credentials_for_profile  # one outside caller remains
-# --- Watchlist API Endpoints: lifted to api/artist_watchlist.py (wired near
-# the chat/labels/beatport/repair blueprints below) ---
-# --- Watchlist Auto-Scanning System ---
+# SERVICE CREDENTIAL SETS  (admin-created named "pills" per auth service; #profiles)
+# ----------------------------------------------------------------------------------
+# Admin manages the named credential sets; any profile only SELECTS among them
+# (see /api/credentials/active + /select below). Payloads (the actual secrets)
+# are NEVER returned to the browser — only id/service/label.
+# ===========================================================================# --- Watchlist Auto-Scanning System ---
 
 watchlist_scan_state = {
     'status': 'idle',
@@ -18725,6 +18967,137 @@ from core.discovery.hero import (
 # everything in the background so users only ever hit warm answers.
 # the shelf cache decorator + dial key moved to api/discover_routes.py -
 # they are applied at import time there, so they cannot be injected
+
+
+# ── discover + personalized endpoints live in api/discover_routes.py and
+# api/personalized.py now. The two below stayed: `_enrichment_workers` and the
+# Library-v2 bootstrap autostart are startup wiring this module owns, not
+# routes, and no lifted module has a home for them.
+
+def _enrichment_workers():
+    """Every background metadata worker, whatever exists at call time.
+
+    Deliberately resolved on each call rather than captured once: the workers
+    are constructed at different points during startup and some are
+    conditional on configuration, so a list built too early would silently
+    miss whoever was not ready yet (iss32-M02).
+    """
+    return [
+        w for w in (
+            mb_worker, audiodb_worker, discogs_worker, deezer_worker,
+            jiosaavn_worker, amazon_worker, similar_artists_worker,
+            spotify_enrichment_worker, itunes_enrichment_worker, lastfm_worker,
+            genius_worker, bandcamp_worker, tidal_enrichment_worker,
+            qobuz_enrichment_worker, soulid_worker, listening_stats_worker,
+            hydrabase_worker, repair_worker,
+            # The auto-import worker lives in api/import_routes now and is
+            # REBOUND there by _boot_auto_import_worker(), so it is read off
+            # the module rather than imported once - importing the name here
+            # would capture the pre-boot None forever.
+            getattr(_import_routes, 'auto_import_worker', None),
+        ) if w is not None
+    ]
+
+
+def _autostart_library_v2_bootstrap_import():
+    """Migrate an upgrading installation into `lib2_*` on its own.
+
+    Library is the native catalogue, so an installation that upgrades into it
+    must end up with rows without anyone clicking anything — the repair,
+    quality and wanted jobs all read `lib2_*`. This loop drives the persisted
+    claim/heartbeat/resume mechanics in core/library2/bootstrap.py; everything
+    interesting (locking, crash resume, retry) lives there.
+
+    Three things this loop is responsible for:
+
+    - releasing a claim a *previous* process died holding, so a restart mid
+      migration continues in seconds instead of waiting out the stale window;
+    - finishing the same post-import work the manual button does (tracklists,
+      tag facts, artwork), which used to be wired to the button only;
+    - retrying with backoff, and retiring once the library is migrated (an
+      empty fresh install is already converged; media scans do not import it).
+    """
+    import time as _t
+    from core.library2 import bootstrap as lib2_bootstrap
+    from core.library2.post_import import run_post_import_precache
+    from api.library_v2 import start_artwork_precache
+
+    process_started_at = _t.time()
+
+    def _post_import(progress):
+        """Everything a migrated library needs beyond its catalogue rows."""
+        run_post_import_precache(get_database(), config_manager, progress=progress)
+        # Artwork runs in its own worker: the library is browsable without it.
+        start_artwork_precache(get_database, config_manager)
+
+    try:
+        lib2_bootstrap.reclaim_abandoned_claim(
+            get_database(), process_started_at=process_started_at
+        )
+    except Exception as e:
+        logger.debug(f"lib2 bootstrap claim reclaim skipped: {e}")
+
+    # The delete journal writes `status='deleting'` BEFORE the unlink precisely
+    # so a process that dies mid-run leaves a state that can be settled rather
+    # than a file that is gone with nothing saying so. That recovery only ever
+    # ran when a *new* delete was started, which on most installs is never — so
+    # a container restart during a delete wedged the operation in `executing`
+    # forever and left the catalogue asserting a file that may already be gone.
+    # It belongs here, next to the other crash-recovery reclaim.
+    try:
+        from core.library2.file_delete import reconcile_incomplete_deletes
+        settled = reconcile_incomplete_deletes(get_database())
+        if settled:
+            logger.info(
+                "Library v2 delete journal: settled %d item(s) left by an "
+                "interrupted delete", settled,
+            )
+    except Exception as e:
+        logger.warning(f"lib2 delete-journal recovery skipped: {e}")
+
+    # iss32-M03: the whole-library convergence passes that used to run inside
+    # `_initialize_database`'s single transaction, on the startup path. Here
+    # they are in a daemon thread, commit per batch and checkpoint the WAL, so
+    # the server is already serving while they run. On a converged install
+    # this is a handful of indexed seeks that find nothing.
+    #
+    # They run BEFORE the import loop on purpose: an interrupted migration
+    # leaves exactly the unconverged state these passes exist for, and the
+    # import's own finalize then finds its work already done.
+    try:
+        lib2_bootstrap.run_deferred_backfills(get_database())
+    except Exception as e:
+        logger.warning(f"Library v2 convergence pass failed (retries next start): {e}")
+
+    # iss29-A06: the backoff must describe how long we have been waiting for
+    # something to happen, not how many times we have looked.
+    #
+    # It used to double on every retry and was never reset. Twelve quiet ticks
+    # reach the 30-minute ceiling, so failures became unnecessarily slow to
+    # recover from.
+    base_delay = 30
+    max_delay = 1800
+    delay = base_delay
+    while True:
+        try:
+            database = get_database()
+            result = lib2_bootstrap.run_bootstrap_if_needed(
+                database, config_manager.get, post_import=_post_import,
+            )
+            if lib2_bootstrap.should_stop_autostart(result):
+                from core.library2.migration_gate import start_deferred_workers
+                start_deferred_workers(database)
+                return
+            # A tick that actually migrated something means the source is live;
+            # start checking frequently again. Only genuinely idle ticks back off.
+            if result.get("success") or result.get("skipped") == "already_running":
+                delay = base_delay
+            else:
+                delay = min(delay * 2, max_delay)
+        except Exception as e:
+            delay = min(delay * 2, max_delay)
+            logger.debug(f"lib2 bootstrap import tick skipped: {e}")
+        _t.sleep(delay)
 
 
 # ── discover endpoints live in api/discover_routes.py now ───────────────────
@@ -19375,6 +19748,8 @@ def start_oauth_callback_servers():
 # ================================================================================================
 
 # --- MusicBrainz Worker Initialization ---
+from core.library2.migration_gate import defer_or_start
+
 mb_worker = None
 try:
     from database.music_database import MusicDatabase
@@ -19386,7 +19761,7 @@ try:
         contact_email=""
     )
     # Start worker automatically (can be paused via UI)
-    mb_worker.start()
+    defer_or_start(mb_worker, mb_db)
     if config_manager.get('musicbrainz_enrichment_paused', False):
         mb_worker.pause()
         logger.info("MusicBrainz enrichment worker initialized (paused — restored from config)")
@@ -19415,7 +19790,7 @@ try:
     from database.music_database import MusicDatabase
     audiodb_db = MusicDatabase()
     audiodb_worker = AudioDBWorker(database=audiodb_db)
-    audiodb_worker.start()
+    defer_or_start(audiodb_worker, audiodb_db)
     if config_manager.get('audiodb_enrichment_paused', False):
         audiodb_worker.pause()
         logger.info("AudioDB enrichment worker initialized (paused — restored from config)")
@@ -19439,7 +19814,7 @@ try:
     from database.music_database import MusicDatabase
     discogs_db = MusicDatabase()
     discogs_worker = DiscogsWorker(database=discogs_db)
-    discogs_worker.start()
+    defer_or_start(discogs_worker, discogs_db)
     if config_manager.get('discogs_enrichment_paused', False):
         discogs_worker.pause()
         logger.info("Discogs enrichment worker initialized (paused — restored from config)")
@@ -19462,7 +19837,7 @@ try:
     from database.music_database import MusicDatabase
     deezer_db = MusicDatabase()
     deezer_worker = DeezerWorker(database=deezer_db)
-    deezer_worker.start()
+    defer_or_start(deezer_worker, deezer_db)
     if config_manager.get('deezer_enrichment_paused', False):
         deezer_worker.pause()
         logger.info("Deezer enrichment worker initialized (paused — restored from config)")
@@ -19488,7 +19863,7 @@ try:
     from database.music_database import MusicDatabase
     jiosaavn_db = MusicDatabase()
     jiosaavn_worker = JioSaavnWorker(database=jiosaavn_db)
-    jiosaavn_worker.start()
+    defer_or_start(jiosaavn_worker, jiosaavn_db)
     if config_manager.get('jiosaavn_enrichment_paused', False):
         jiosaavn_worker.pause()
         logger.info("JioSaavn enrichment worker initialized (paused — restored from config)")
@@ -19509,12 +19884,14 @@ amazon_worker = None
 try:
     amazon_db = MusicDatabase()
     amazon_worker = AmazonWorker(database=amazon_db)
-    amazon_worker.start()
+    defer_or_start(amazon_worker, amazon_db)
     # Opt-in by default: Amazon enrichment depends on an external public proxy
     # (T2Tunes) that can be down, so it stays paused unless the user has
     # explicitly enabled it (amazon_enrichment_paused=False). This stops an
     # instance outage from grinding/log-flooding installs that never opted in.
-    if config_manager.get('amazon_enrichment_paused', True):
+    # the public t2tunes.site is gone for good (#1300), so an opt-in pointed at
+    # it just hammers a dead host. only a self-hosted amazon.base_url can run.
+    if not _amazon_enrichment_should_run(config_manager):
         amazon_worker.pause()
         logger.info("Amazon enrichment worker initialized (paused — enable it in Settings)")
     else:
@@ -19534,7 +19911,7 @@ try:
     from core.similar_artists_worker import SimilarArtistsWorker
     similar_artists_db = MusicDatabase()
     similar_artists_worker = SimilarArtistsWorker(database=similar_artists_db)
-    similar_artists_worker.start()
+    defer_or_start(similar_artists_worker, similar_artists_db)
     if config_manager.get('similar_artists_enrichment_paused', False):
         similar_artists_worker.pause()
         logger.info("Similar Artists worker initialized (paused — restored from config)")
@@ -19572,7 +19949,7 @@ try:
     _user_paused = config_manager.get('spotify_enrichment_paused', False)
     if _user_paused or _primary != 'spotify':
         spotify_enrichment_worker.paused = True  # Set BEFORE start() to prevent race condition
-    spotify_enrichment_worker.start()
+    defer_or_start(spotify_enrichment_worker, spotify_enrichment_db)
     if not spotify_enrichment_worker.paused:
         logger.info("Spotify enrichment worker initialized and started")
     elif _user_paused:
@@ -19619,7 +19996,7 @@ try:
     from database.music_database import MusicDatabase
     itunes_enrichment_db = MusicDatabase()
     itunes_enrichment_worker = iTunesWorker(database=itunes_enrichment_db)
-    itunes_enrichment_worker.start()
+    defer_or_start(itunes_enrichment_worker, itunes_enrichment_db)
     if config_manager.get('itunes_enrichment_paused', False):
         itunes_enrichment_worker.pause()
         logger.info("iTunes enrichment worker initialized (paused — restored from config)")
@@ -19646,7 +20023,7 @@ try:
     from database.music_database import MusicDatabase
     lastfm_db = MusicDatabase()
     lastfm_worker = LastFMWorker(database=lastfm_db)
-    lastfm_worker.start()
+    defer_or_start(lastfm_worker, lastfm_db)
     if config_manager.get('lastfm_enrichment_paused', False):
         lastfm_worker.pause()
         logger.info("Last.fm enrichment worker initialized (paused — restored from config)")
@@ -19660,6 +20037,78 @@ except Exception as e:
 # generic enrichment blueprint at /api/enrichment/lastfm/{status,pause,resume}.
 # The auto-pause token cleanup + yield-override behavior is encoded on the
 # EnrichmentService descriptor (see core/enrichment/services.py).
+
+def _int_or_none(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+@app.route('/api/artist/hero-stats', methods=['GET'])
+def get_artist_hero_stats():
+    """The numbers the rich artist header shows (ldp-05).
+
+    The legacy hero read listeners/plays off the library row, which a
+    Library-v2-native artist does not have — and on an instance without a
+    Last.fm key that row is empty anyway, so the header would show nothing at
+    all. Every number this can get is therefore resolved live: Last.fm
+    listeners/plays/bio by name (same lookup ``core/artist_source_detail.py``
+    does for a source-only artist, including its own client when the
+    enrichment worker is not running), plus the provider follower count, which
+    is the one figure that survives an unconfigured Last.fm.
+
+    Every field is independent and best-effort: a provider being down costs
+    that one number, never the response.
+    """
+    artist_name = (request.args.get('name', '') or '').strip()
+    spotify_id = (request.args.get('spotify_id', '') or '').strip()
+    deezer_id = (request.args.get('deezer_id', '') or '').strip()
+    if not artist_name and not spotify_id and not deezer_id:
+        return jsonify({'success': False, 'error': 'Artist name or id required'}), 400
+
+    result = {'success': True, 'listeners': None, 'playcount': None,
+              'bio': None, 'url': None, 'followers': None, 'popularity': None}
+
+    if artist_name:
+        try:
+            client = lastfm_worker.client if lastfm_worker else None
+            if client is None:
+                api_key = config_manager.get('lastfm.api_key', '')
+                if api_key:
+                    from core.lastfm_client import LastFMClient
+                    client = LastFMClient(api_key=api_key)
+            if client is not None:
+                info = client.get_artist_info(artist_name) or {}
+                stats = info.get('stats') or {}
+                bio = info.get('bio') or {}
+                result['listeners'] = _int_or_none(stats.get('listeners'))
+                result['playcount'] = _int_or_none(stats.get('playcount'))
+                result['bio'] = bio.get('content') or bio.get('summary')
+                result['url'] = info.get('url')
+        except Exception as e:
+            logger.debug(f"Last.fm artist info failed for {artist_name}: {e}")
+
+    if spotify_id:
+        try:
+            stats = _library_v2_live_artist_stats(spotify_id)
+            if stats:
+                result['followers'] = _int_or_none(stats.get('followers'))
+                result['popularity'] = _int_or_none(stats.get('popularity'))
+        except Exception as e:
+            logger.debug(f"Spotify artist stats failed for {spotify_id}: {e}")
+
+    if result['followers'] is None and deezer_id:
+        try:
+            client = _get_deezer_client()
+            info = client.get_artist_info(deezer_id) if client else None
+            if info:
+                result['followers'] = _int_or_none((info.get('followers') or {}).get('total'))
+        except Exception as e:
+            logger.debug(f"Deezer artist stats failed for {deezer_id}: {e}")
+
+    return jsonify(result)
+
 
 @app.route('/api/artist/<artist_id>/lastfm-top-tracks', methods=['GET'])
 def get_artist_lastfm_top_tracks(artist_id):
@@ -19741,7 +20190,7 @@ try:
     genius_worker = GeniusWorker(database=genius_db)
     if config_manager.get('genius_enrichment_paused', False):
         genius_worker.paused = True
-    genius_worker.start()
+    defer_or_start(genius_worker, genius_db)
     if genius_worker.paused:
         logger.info("Genius enrichment worker initialized (paused — restored from config)")
     else:
@@ -19777,7 +20226,7 @@ try:
     bandcamp_worker = BandcampWorker(database=bandcamp_db)
     if config_manager.get('bandcamp_enrichment_paused', False):
         bandcamp_worker.paused = True
-    bandcamp_worker.start()
+    defer_or_start(bandcamp_worker, bandcamp_db)
     if bandcamp_worker.paused:
         logger.info("Bandcamp enrichment worker initialized (paused — restored from config)")
     else:
@@ -19803,7 +20252,7 @@ try:
     from database.music_database import MusicDatabase
     tidal_enrich_db = MusicDatabase()
     tidal_enrichment_worker = TidalWorker(database=tidal_enrich_db, client=tidal_client)
-    tidal_enrichment_worker.start()
+    defer_or_start(tidal_enrichment_worker, tidal_enrich_db)
     if config_manager.get('tidal_enrichment_paused', False):
         tidal_enrichment_worker.pause()
         logger.info("Tidal enrichment worker initialized (paused — restored from config)")
@@ -19829,7 +20278,7 @@ try:
     qobuz_enrich_db = MusicDatabase()
     qobuz_enrich_client = QobuzClient()  # Separate client instance for thread safety
     qobuz_enrichment_worker = QobuzWorker(database=qobuz_enrich_db, client=qobuz_enrich_client)
-    qobuz_enrichment_worker.start()
+    defer_or_start(qobuz_enrichment_worker, qobuz_enrich_db)
     if config_manager.get('qobuz_enrichment_paused', False):
         qobuz_enrichment_worker.pause()
         logger.info("Qobuz enrichment worker initialized (paused — restored from config)")
@@ -19878,7 +20327,7 @@ try:
         from api import hydrabase_routes as _hb
         return (_hb._hydrabase_ws, _hb._hydrabase_lock)
     hydrabase_worker = HydrabaseWorker(get_ws_and_lock=_get_hydrabase_ws_and_lock)
-    hydrabase_worker.start()
+    defer_or_start(hydrabase_worker, get_database())
     hydrabase_client = HydrabaseClient(get_ws_and_lock=_get_hydrabase_ws_and_lock)
     logger.info("Hydrabase P2P mirror worker and metadata client initialized")
     # Update API blueprint references
@@ -19975,6 +20424,7 @@ _init_redownload(
     resolve_library_file_path_fn=_resolve_library_file_path,
     attempt_download_with_candidates_fn=_attempt_download_with_candidates,
     executor=missing_download_executor,
+    monitor=download_monitor,
 )
 
 _init_debug_info(
@@ -20096,7 +20546,7 @@ try:
     from database.music_database import MusicDatabase
     soulid_db = MusicDatabase()
     soulid_worker = SoulIDWorker(database=soulid_db)
-    soulid_worker.start()
+    defer_or_start(soulid_worker, soulid_db)
     logger.info("SoulID worker initialized and started")
 except Exception as e:
     logger.error(f"SoulID worker initialization failed: {e}")
@@ -20128,33 +20578,69 @@ try:
         config_manager=config_manager,
         media_server_engine=media_server_engine,
     )
-    listening_stats_worker.start()
+    defer_or_start(listening_stats_worker, listening_stats_db)
     logger.info("Listening stats worker initialized and started")
 except Exception as e:
     logger.error(f"Listening stats worker initialization failed: {e}")
     listening_stats_worker = None
 
 lastfm_import_worker = None
+lastfm_import_workers = None
 try:
-    from core.listening_import.lastfm import LastFMListeningImportWorker
+    from core.listening_import.lastfm import LastFMImportWorkers
 
-    def _emit_lastfm_import_progress(state):
+    def _emit_lastfm_import_progress(state, owner=None):
+        # a profile's own import is its business, only its room hears it (#1293)
         try:
-            socketio.emit('lastfm:import-progress', state or {})
+            if owner is None:
+                socketio.emit('lastfm:import-progress', state or {})
+            else:
+                socketio.emit('lastfm:import-progress', state or {}, room=f'profile:{owner}')
         except Exception as e:
             logger.debug("lastfm import progress emit failed: %s", e)
 
     lastfm_import_db = MusicDatabase()
-    lastfm_import_worker = LastFMListeningImportWorker(
+    lastfm_import_workers = LastFMImportWorkers(
         database=lastfm_import_db,
         config_manager=config_manager,
         cache_builder=(listening_stats_worker._build_stats_cache if listening_stats_worker else None),
         progress_callback=_emit_lastfm_import_progress,
     )
+    lastfm_import_worker = lastfm_import_workers.shared
     logger.info("Last.fm listening import worker initialized")
 except Exception as e:
     logger.error(f"Last.fm listening import worker initialization failed: {e}")
     lastfm_import_worker = None
+    lastfm_import_workers = None
+
+listenbrainz_import_worker = None
+listenbrainz_import_workers = None
+try:
+    from core.listening_import.listenbrainz import ListenBrainzImportWorkers
+
+    def _emit_listenbrainz_import_progress(state, owner=None):
+        # a profile's own import is its business, only its room hears it (#1293)
+        try:
+            if owner is None:
+                socketio.emit('listenbrainz:import-progress', state or {})
+            else:
+                socketio.emit('listenbrainz:import-progress', state or {}, room=f'profile:{owner}')
+        except Exception as e:
+            logger.debug("listenbrainz import progress emit failed: %s", e)
+
+    listenbrainz_import_db = MusicDatabase()
+    listenbrainz_import_workers = ListenBrainzImportWorkers(
+        database=listenbrainz_import_db,
+        config_manager=config_manager,
+        cache_builder=(listening_stats_worker._build_stats_cache if listening_stats_worker else None),
+        progress_callback=_emit_listenbrainz_import_progress,
+    )
+    listenbrainz_import_worker = listenbrainz_import_workers.shared
+    logger.info("ListenBrainz listening import worker initialized")
+except Exception as e:
+    logger.error(f"ListenBrainz listening import worker initialization failed: {e}")
+    listenbrainz_import_worker = None
+    listenbrainz_import_workers = None
 
 # --- Stats API Endpoints ---
 # Lifted to api/stats.py (wired near the other internal blueprints below).
@@ -20232,7 +20718,7 @@ try:
     # Raised' / 'Maintenance Scan Done' triggers — music parity with video)
     if automation_engine is not None:
         repair_worker._event_emit = automation_engine.emit
-    repair_worker.start()
+    defer_or_start(repair_worker, repair_db)
     logger.info("Repair worker initialized and started")
 except Exception as e:
     logger.error(f"Repair worker initialization failed: {e}")
@@ -20382,6 +20868,8 @@ def _hydrabase_reconnect_loop():
 # skip, only an all-or-nothing "does this broadcast have an audience".
 _connected_sids = set()
 _connected_sids_lock = threading.Lock()
+_log_live_sids = set()
+_log_live_sids_lock = threading.Lock()
 
 
 def _has_connected_clients() -> bool:
@@ -20518,6 +21006,18 @@ def _emit_chat_push_loop():
                             _ed2 = chat_codec.edit_of(dec)
                             if _ed2:
                                 out['ed'] = _ed2
+                            _np = chat_codec.np_of(dec)
+                            if _np:
+                                out['np'] = _np
+                            _w = chat_codec.want_of(dec)
+                            if _w:
+                                out['want'] = _w
+                            _ov = chat_codec.overlay_of(dec)
+                            if _ov:
+                                out['overlay'] = {'n': _ov['n'],
+                                                  'layers': len(_ov['d'].get('layers') or []),
+                                                  'assets': chat_codec.overlay_assets(_ov['d']),
+                                                  'd': _ov['d']}
                         return out
                     decoded = [x for x in (_unwrap(m) for m in fresh) if x]
                     if proto_events:
@@ -20646,8 +21146,7 @@ def _emit_server_activity_loop():
 
 def _ws_connection_blocked():
     """#852: mirror the HTTP launch-PIN / login gate for the socketio handshake
-    (before_request doesn't run for it). Fails OPEN on a config-read error, same
-    as the HTTP gate, so a broken config never wedges every client."""
+    (before_request doesn't run for it). Fails CLOSED on unexpected errors (#GHSA-j7g5-8j44-jqhm)."""
     try:
         require_login = _require_login_enabled()
         require_pin = bool(config_manager.get('security.require_pin_on_launch', False)) if config_manager else False
@@ -20665,8 +21164,8 @@ def _ws_connection_blocked():
             proxy_authed=proxy_authed,
         )
     except Exception as e:
-        logger.error(f"[WS gate] check failed, allowing (matches HTTP gate fail-open): {e}")
-        return False
+        logger.error(f"[WS gate] check failed, blocking unverified connection (fail-closed): {e}")
+        return True
 
 
 @socketio.on('connect')
@@ -20688,6 +21187,8 @@ def handle_disconnect():
     try:
         with _activity_sids_lock:
             _activity_sids.discard(request.sid)
+        with _log_live_sids_lock:
+            _log_live_sids.discard(request.sid)
     except Exception:   # noqa: BLE001, S110 - cleanup only; a missing sid is fine
         pass
     with _connected_sids_lock:
@@ -21064,7 +21565,10 @@ _configure_stats_api(get_database=get_database, config_manager=config_manager,
                      fix_artist_image_url=fix_artist_image_url,
                      _automation_engine=lambda: automation_engine,
                      listening_stats_worker_getter=lambda: listening_stats_worker,
-                     lastfm_import_worker_getter=lambda: lastfm_import_worker)
+                     lastfm_import_worker_getter=lambda: lastfm_import_worker,
+                     listenbrainz_import_worker_getter=lambda: listenbrainz_import_worker,
+                     listenbrainz_import_workers_getter=lambda: listenbrainz_import_workers,
+                     lastfm_import_workers_getter=lambda: lastfm_import_workers)
 app.register_blueprint(_create_stats_blueprint())
 
 # Quality profiles / auto-import watcher / metadata-cache browser - three
@@ -21118,7 +21622,10 @@ _cfg_quar(config_manager_=config_manager, docker_resolve_path_=docker_resolve_pa
           post_process_matched_download=_post_process_matched_download,
           post_process_matched_download_with_verification=_post_process_matched_download_with_verification,
           download_orchestrator_getter=lambda: download_orchestrator,
-          matching_engine_getter=lambda: matching_engine)
+          matching_engine_getter=lambda: matching_engine,
+          get_database_=get_database,
+          automation_engine_getter=lambda: automation_engine,
+          web_scan_manager_getter=lambda: web_scan_manager)
 app.register_blueprint(_bp_quar())
 # Download-client hub - the Clients tab on the downloads page (api/clients.py).
 def _client_known_items():
@@ -21180,7 +21687,9 @@ _cfg_up(get_database=get_database, config_manager=config_manager,
         download_orchestrator_getter=lambda: download_orchestrator,
         media_server_engine_getter=lambda: media_server_engine,
         spotify_client_getter=lambda: spotify_client,
-        tidal_client_clearer=clear_profile_tidal_client)
+        tidal_client_clearer=clear_profile_tidal_client,
+        listenbrainz_import_workers_getter=lambda: listenbrainz_import_workers,
+        lastfm_import_workers_getter=lambda: lastfm_import_workers)
 app.register_blueprint(_bp_up())
 
 from api.labels import configure as _configure_labels_api, create_blueprint as _create_labels_blueprint
@@ -21325,6 +21834,7 @@ _cfg_dba(
     _automatic_wishlist_cleanup_after_db_update=_automatic_wishlist_cleanup_after_db_update,
     _reconcile_after_scan=_reconcile_after_scan,
     _update_automation_progress=_update_automation_progress,
+    _restart_library_v2_migration=start_library_v2_bootstrap_autostart,
     _amazon_worker=lambda: amazon_worker,
     _audiodb_worker=lambda: audiodb_worker,
     _bandcamp_worker=lambda: bandcamp_worker,
@@ -21412,6 +21922,29 @@ app.register_blueprint(_bp_sp())
 from api.video import create_video_blueprint as _create_video_blueprint
 app.register_blueprint(_create_video_blueprint(), url_prefix='/api/video')
 
+# Podcasts API (isolated: public discovery, RSS parsing, episode downloads)
+from api.podcasts import create_podcasts_blueprint as _create_podcasts_blueprint
+app.register_blueprint(_create_podcasts_blueprint())
+
+# Audiobooks API (isolated: its own database file, its own download category,
+# never touches the music worker pool, wishlist or batches)
+from api.audiobooks import create_audiobooks_blueprint as _create_audiobooks_blueprint
+app.register_blueprint(_create_audiobooks_blueprint())
+
+# NOTE: the audiobook wishlist is NOT started here. It is drained by the shared
+# automation engine as the 'audiobook_process_wishlist' system automation, the same
+# way music and video drain theirs — so it can be paused, rescheduled or run by hand
+# from the Automations page instead of being a thread nobody can see.
+
+# Follow grabbed audiobooks to completion and file them into the library. Without this
+# a grab is fire-and-forget: the download client fetches something the app never
+# notices finishing.
+try:
+    from core.audiobook_download_monitor import ensure_started as _ensure_audiobook_downloads
+    _ensure_audiobook_downloads()
+except Exception as _ab_monitor_err:  # noqa: BLE001
+    logger.warning(f"Audiobook download monitor did not start: {_ab_monitor_err}")
+
 # Resume video downloads at boot: without this the monitor only starts on a grab or
 # when the Downloads page opens, so in-flight downloads (and orphaned 'searching' rows)
 # after a restart would sit untracked until the user happened to visit the page.
@@ -21421,6 +21954,383 @@ try:
     _ensure_video_download_monitor(_get_video_db)
 except Exception:
     logger.warning("could not start the video download monitor at boot", exc_info=True)
+
+# Library Manager v2 — the UI-facing API mounted on /api/library/v2/*.
+# NOT opt-in: the cutover happened, lib2_* is the maintained catalogue, and
+# zero runtime SQL touches the legacy tables (enforced by
+# tests/library2/test_legacy_usage_ratchet.py against a 0-reads/0-writes
+# baseline). See core/library2/__init__.py.
+# Library V2 is the native, non-disableable catalogue surface.
+from api.library_v2 import register_library_v2_routes as _register_library_v2_routes
+
+
+def _library_v2_submission_adapter(source):
+    if source != "usenet" or download_orchestrator is None:
+        return None
+    plugin = download_orchestrator.registry.get("usenet")
+    if plugin is None:
+        return None
+    from core.acquisition.submission import UsenetSubmissionAdapter
+    return UsenetSubmissionAdapter(
+        monitor_callback=(
+            usenet_acquisition_monitor.notify_submission
+            if usenet_acquisition_monitor is not None else None
+        ))
+
+
+def _library_v2_scoped_wishlist_search(track_ids, profile_id):
+    """Submit a manual wishlist batch scoped to exactly ``track_ids`` — same
+    executors/pools ``/api/wishlist/download_missing`` uses. Injected into
+    the Library-v2 scoped Automatic Search endpoint (C1) so it dispatches
+    through the identical download path instead of a second one."""
+    from database.music_database import MusicDatabase
+    db = MusicDatabase()
+    runtime = _WishlistManualDownloadRuntime(
+        get_music_database=lambda: db,
+        download_batches=download_batches,
+        tasks_lock=tasks_lock,
+        # Its own small pool (not the shared missing_download_executor) so a
+        # scoped/manual single-item search is never starved by a busy
+        # periodic wishlist auto-cycle (docs §69.3) — same precedent as
+        # album_bundle_executor below.
+        missing_download_executor=scoped_search_executor,
+        album_bundle_executor=album_bundle_executor,
+        run_full_missing_tracks_process=_run_full_missing_tracks_process,
+        get_batch_max_concurrent=_get_batch_max_concurrent,
+        add_activity_item=add_activity_item,
+        active_server=config_manager.get_active_media_server(),
+        profile_id=profile_id,
+    )
+    payload, _status = _start_manual_wishlist_download_batch(runtime, track_ids=track_ids)
+    return payload
+
+
+def _library_v2_scoped_direct_search(tracks, profile_id):
+    """Run transient Library-v2 payloads through the shared download engine.
+
+    Unlike the Wishlist-scoped adapter above, this is used for one concrete
+    track click and never persists the track in Wishlist merely to make the
+    existing worker see it.
+    """
+    from database.music_database import MusicDatabase
+    from core.imports.upgrade_intent import CONTEXT_KEY, issue_upgrade_intent
+    tracks = [dict(track) for track in tracks]
+    for track in tracks:
+        source_info = track.get('source_info') or {}
+        if isinstance(source_info, str):
+            try:
+                source_info = json.loads(source_info)
+            except (TypeError, ValueError):
+                source_info = {}
+        track_id = source_info.get('lib2_track_id') if isinstance(source_info, dict) else None
+        if track_id:
+            track[CONTEXT_KEY] = issue_upgrade_intent(
+                track_id, origin='scoped_automatic_search')
+    db = MusicDatabase()
+    runtime = _WishlistManualDownloadRuntime(
+        get_music_database=lambda: db,
+        download_batches=download_batches,
+        tasks_lock=tasks_lock,
+        missing_download_executor=scoped_search_executor,
+        album_bundle_executor=album_bundle_executor,
+        run_full_missing_tracks_process=_run_full_missing_tracks_process,
+        get_batch_max_concurrent=_get_batch_max_concurrent,
+        add_activity_item=add_activity_item,
+        active_server=config_manager.get_active_media_server(),
+        profile_id=profile_id,
+    )
+    payload, _status = _start_direct_track_download_batch(runtime, tracks)
+    return payload
+
+
+# core.library2.match_status.SERVICES ids that spell their "configured" flag
+# under a different key in _get_enrichment_status() (the enrichment workers'
+# keys carry a '_enrichment' suffix for some services; others match as-is).
+_LIB2_MATCH_SERVICE_ENRICHMENT_KEYS = {
+    "spotify": "spotify_enrichment",
+    "deezer": "deezer_enrichment",
+    "itunes": "itunes_enrichment",
+    "tidal": "tidal_enrichment",
+    "qobuz": "qobuz_enrichment",
+    "amazon": "amazon_enrichment",
+    "jiosaavn": "jiosaavn_enrichment",
+    "bandcamp": "bandcamp_enrichment",
+}
+
+
+def _library_v2_live_artist_stats(spotify_id):
+    """On-demand single-artist Spotify lookup for the settings modal's
+    current-match identity card (§52.5/§56.2) — same pattern the legacy
+    ``/api/watchlist/artist/<id>/config`` endpoint already uses: one call per
+    load, gated on auth + the global rate-limit flag, ``None`` on any
+    failure so the identity card just omits the stat row."""
+    if not spotify_client or not spotify_client.is_authenticated() or _spotify_rate_limited():
+        return None
+    try:
+        from core.api_call_tracker import api_call_tracker
+        api_call_tracker.record_call('spotify', endpoint='artist')
+        artist_data = spotify_client.sp.artist(spotify_id)
+    except Exception as e:
+        logger.debug(f"live artist stats fetch failed for {spotify_id}: {e}")
+        return None
+    if not artist_data:
+        return None
+    images = artist_data.get('images') or []
+    return {
+        'name': artist_data.get('name') or None,
+        'image_url': images[0].get('url') if images and isinstance(images[0], dict) else None,
+        'followers': artist_data.get('followers', {}).get('total', 0),
+        'popularity': artist_data.get('popularity', 0),
+        'genres': artist_data.get('genres') or [],
+    }
+
+
+def _library_v2_configured_match_services() -> set:
+    """Which match_status.SERVICES ids are actually configured on this
+    instance right now (deep-dive A8) — reuses the exact 'configured' flags
+    the Settings enrichment-status cards already show, so the lib2 match
+    chips never drift from what Enrich/Settings consider usable. A service
+    absent from ``_get_enrichment_status()`` (worker not running, or gated
+    behind an experimental flag) is correctly treated as not configured."""
+    from core.library2.match_status import SERVICES as _lib2_match_services
+    try:
+        status = _get_enrichment_status()
+    except Exception:
+        return set()
+    configured = set()
+    for service, _label, _id_cols in _lib2_match_services:
+        key = _LIB2_MATCH_SERVICE_ENRICHMENT_KEYS.get(service, service)
+        entry = status.get(key)
+        if entry and entry.get("configured"):
+            configured.add(service)
+    # MusicBrainz has no credentials to configure and no longer needs its
+    # worker to answer a search, so it is available whenever the app is.
+    # _get_enrichment_status() reports only services that HAVE a worker object,
+    # so a failed worker init used to drop MusicBrainz out of every enrich walk
+    # — silently, since the walk swallows per-provider failures. A missing MBID
+    # is what leaves the AcoustID check without an artist's alternate
+    # spellings, so this is the one service that must not go missing quietly.
+    configured.add("musicbrainz")
+    return configured
+
+
+def _acquisition_runtime_evidence():
+    """Take short, lock-protected copies before any client or DB I/O."""
+    with tasks_lock:
+        runtime_tasks = {
+            str(task_id): dict(task)
+            for task_id, task in download_tasks.items()
+            if isinstance(task, dict)
+        }
+    with matched_context_lock:
+        matched_contexts = [
+            dict(context)
+            for context in matched_downloads_context.values()
+            if isinstance(context, dict)
+        ]
+    from api.quarantine import _get_quarantine_dir
+    from core.imports.quarantine import (
+        get_quarantine_entry_context,
+        list_quarantine_entries,
+    )
+    quarantine_entries = []
+    for entry in list_quarantine_entries(_get_quarantine_dir()):
+        item = dict(entry)
+        item["context"] = get_quarantine_entry_context(
+            _get_quarantine_dir(), str(entry.get("id") or ""),
+        )
+        quarantine_entries.append(item)
+    return runtime_tasks, matched_contexts, quarantine_entries
+
+
+def _acquisition_client_observations():
+    if download_orchestrator is None:
+        return {}
+    try:
+        # dd28-17: this runs inside the Usenet monitor's cycle lock via
+        # persistent_reconciler_runner, so an unbounded wait on slskd would
+        # freeze Usenet reconciliation and the import pipeline too.
+        from core.acquisition.client_monitor import CLIENT_CALL_TIMEOUT_S
+        statuses = run_async(
+            download_orchestrator.get_all_downloads(),
+            timeout=CLIENT_CALL_TIMEOUT_S,
+        ) or []
+    except Exception as exc:  # external evidence is optional, never inferred
+        logger.warning("Persistent acquisition client snapshot failed: %s", exc)
+        return {}
+    observations = {}
+    for status in statuses:
+        download_id = str(getattr(status, "id", "") or "").strip()
+        if not download_id:
+            continue
+        observations[download_id] = {
+            "state": getattr(status, "state", None),
+            "file_path": getattr(status, "file_path", None),
+            "filename": getattr(status, "filename", None),
+        }
+    return observations
+
+
+def _run_persistent_acquisition_reconciliation(*, dry_run=True):
+    """Reconcile restart-lost legacy grabs from independently observed facts."""
+    from core.acquisition import ensure_acquisition_schema
+    from core.acquisition.reconciler import reconcile_persistent_grabs
+
+    runtime_tasks, matched_contexts, quarantine_entries = (
+        _acquisition_runtime_evidence()
+    )
+    client_observations = _acquisition_client_observations()
+    conn = get_database()._get_connection()
+    try:
+        ensure_acquisition_schema(conn)
+        report = reconcile_persistent_grabs(
+            conn,
+            runtime_tasks=runtime_tasks,
+            matched_contexts=matched_contexts,
+            client_observations=client_observations,
+            quarantine_entries=quarantine_entries,
+            dry_run=bool(dry_run),
+            evidence_ttl_seconds=config_manager.get(
+                "acquisition.reconciliation_evidence_ttl_seconds", 24 * 60 * 60,
+            ),
+        )
+        if dry_run:
+            conn.rollback()
+        else:
+            conn.commit()
+        return report.to_public_dict()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _library_v2_media_server_state():
+    active_server = config_manager.get_active_media_server()
+    connected = False
+    if media_server_engine is not None:
+        try:
+            connected = bool(media_server_engine.is_connected())
+        except Exception as exc:
+            logger.debug("Integrity report media-server probe failed: %s", exc)
+    return {
+        "available": media_server_engine is not None,
+        "active_server": active_server,
+        "connected": connected,
+        # The cross-server contract has no uniform full track-path read. The
+        # scoped mapping table is the comparable recognition index; file paths
+        # themselves remain local Library-v2 ownership.
+        "path_projection": "tracks.file_path",
+    }
+
+
+def _run_library_v2_integrity_report(*, max_findings=1000):
+    """One read-only cross-index snapshot; no schema ensure or repair writes."""
+    from api.quarantine import _get_quarantine_dir
+    from core.acquisition.reconciler import reconcile_persistent_grabs
+    from core.library2.integrity_reconciler import build_integrity_report
+
+    runtime_tasks, matched_contexts, quarantine_entries = (
+        _acquisition_runtime_evidence()
+    )
+    client_observations = _acquisition_client_observations()
+    conn = get_database()._get_connection()
+    try:
+        has_acquisition = all(
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone() is not None
+            for table in ("acquisition_requests", "acquisition_grabs")
+        )
+        acquisition_report = None
+        if has_acquisition:
+            acquisition_report = reconcile_persistent_grabs(
+                conn,
+                runtime_tasks=runtime_tasks,
+                matched_contexts=matched_contexts,
+                client_observations=client_observations,
+                quarantine_entries=quarantine_entries,
+                dry_run=True,
+                evidence_ttl_seconds=config_manager.get(
+                    "acquisition.reconciliation_evidence_ttl_seconds",
+                    24 * 60 * 60,
+                ),
+            ).to_public_dict()
+        report = build_integrity_report(
+            conn,
+            runtime_tasks=runtime_tasks,
+            matched_contexts=matched_contexts,
+            client_observations=client_observations,
+            quarantine_entries=quarantine_entries,
+            quarantine_dir=_get_quarantine_dir(),
+            acquisition_report=acquisition_report,
+            media_server=_library_v2_media_server_state(),
+            config_manager=config_manager,
+            max_findings=max_findings,
+        )
+        # A read endpoint owns no commit boundary, even if a future path helper
+        # accidentally begins a transaction.
+        conn.rollback()
+        return report.to_public_dict()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _selected_library_owner():
+    """The directory selected in this request, or None for the shared library.
+
+    Read while a request (and therefore a session) still exists, and stamped on
+    the download batch: by the time the file is organised and linked, the work
+    is on a pool thread where the session is gone.
+    """
+    try:
+        from core.library_scope import owner_for_new_file
+        return owner_for_new_file(get_current_profile_id())
+    except Exception:  # noqa: BLE001 - no scope, shared library
+        return None
+
+
+def _library_v2_profile_page_allowed(page_id):
+    """Apply the persisted profile page ACL to Library v2 API reads.
+
+    Library v2 intentionally shares the legacy ``library`` permission instead
+    of introducing a second checkbox during the cutover.
+    """
+    profile_id = get_current_profile_id()
+    if profile_id == 1:
+        return True
+    profile = get_database().get_profile(profile_id)
+    if not profile:
+        return False
+    allowed_pages = profile.get('allowed_pages')
+    return allowed_pages is None or page_id in allowed_pages
+
+
+_register_library_v2_routes(
+    app,
+    get_database=get_database,
+    config_get=lambda key, default=None: config_manager.get(key, default),
+    config_manager=config_manager,
+    profile_id_getter=get_current_profile_id,
+    profile_page_allowed_getter=_library_v2_profile_page_allowed,
+    acquisition_submission_adapter_getter=_library_v2_submission_adapter,
+    run_enrichment=_run_single_enrichment,
+    scoped_wishlist_search_dispatcher=_library_v2_scoped_wishlist_search,
+    scoped_track_search_dispatcher=_library_v2_scoped_direct_search,
+    configured_match_services_getter=_library_v2_configured_match_services,
+    live_artist_stats_getter=_library_v2_live_artist_stats,
+    make_context_key=_make_context_key,
+    get_cached_transfer_data=get_cached_transfer_data,
+    acquisition_reconciliation_runner=(
+        _run_persistent_acquisition_reconciliation
+    ),
+    integrity_report_runner=_run_library_v2_integrity_report,
+)
 
 
 def _emit_rate_monitor_loop():
@@ -21704,6 +22614,9 @@ def _emit_live_log_loop():
     while not globals().get('IS_SHUTTING_DOWN', False):
         socketio.sleep(0.5)
         try:
+            with _log_live_sids_lock:
+                if not _log_live_sids:
+                    continue
             # Read which source clients want (stored by subscribe handler)
             source = getattr(_emit_live_log_loop, '_source', 'app')
             log_path = log_map.get(source, log_map['app'])
@@ -21747,11 +22660,15 @@ def handle_logs_subscribe(data):
     source = data.get('source', 'app')
     _emit_live_log_loop._source = source
     join_room('logs:live')
+    with _log_live_sids_lock:
+        _log_live_sids.add(request.sid)
 
 
 @socketio.on('logs:unsubscribe')
 def handle_logs_unsubscribe(data):
     leave_room('logs:live')
+    with _log_live_sids_lock:
+        _log_live_sids.discard(request.sid)
 
 
 def _playlist_room_allowed(raw_id, spid, is_admin) -> bool:
@@ -21960,9 +22877,12 @@ def _emit_discovery_progress_loop():
                 logger.debug(f"Error in {platform_name} discovery loop: {e}")
 
 def _emit_scan_status_loop():
-    """Push watchlist and media scan status every 2 seconds."""
+    """Push watchlist and media scan status every 2 seconds.
+    Skipped entirely while no client is connected."""
     while not globals().get('IS_SHUTTING_DOWN', False):
         socketio.sleep(2)
+        if not _has_connected_clients():
+            continue
         # Watchlist scan
         try:
             state = watchlist_scan_state.copy()
@@ -22144,16 +23064,95 @@ def start_runtime_services():
             # Sweep must not crash startup — log and continue.
             logger.warning("[Startup] Album-bundle staging sweep failed: %s", _sweep_err)
 
-        # Start simple background monitor when server starts
-        logger.info("Starting simple background monitor...")
-        start_simple_background_monitor()
-        logger.info("Simple background monitor started (includes automatic search cleanup)")
+        # Which library every file is in follows from its folder (#1199): bring
+        # the folder table in line with the configuration before anything
+        # imports or reads a scoped page.
+        try:
+            from core.library2.library_roots import sync_library_roots
+            sync_library_roots(get_database())
+        except Exception as _roots_err:
+            logger.warning("[Startup] Library folder sync failed: %s", _roots_err)
+
+        # Atomic-album staging reconciliation (#1289). A batch interrupted
+        # mid-album leaves finished, tagged audio under
+        # <library>/.soulsync_atomic_staging/<batch id>/, and the only thing
+        # that knew what that directory was is download_batches — a dict that
+        # died with the process. Nothing looked at it afterwards: the dot prefix
+        # hides it from media servers and both SoulSync's scanner and the repair
+        # jobs prune it on purpose, so the tracks were invisible forever.
+        # download_batches is empty here (no batch survives a restart), so every
+        # tree on disk is an orphan by definition, and this runs before any new
+        # batch can claim a staging directory.
+        try:
+            from core.downloads.atomic_recovery import recover_orphan_staging
+            from core.imports.paths import library_root_for_profile, shared_transfer_root
+            _libraries = [shared_transfer_root()]
+            try:
+                for _profile in (get_database().get_all_profiles() or []):
+                    _own = library_root_for_profile(_profile.get('id'), announce=False)
+                    if _own:
+                        _libraries.append(_own)
+            except Exception as _lib_err:
+                logger.debug("[Startup] Could not enumerate own libraries: %s", _lib_err)
+            _recovery = recover_orphan_staging(
+                _libraries,
+                live_batch_ids=set(download_batches.keys()),
+                enabled=bool(config_manager.get('album_downloads.atomic_recover_orphans', True)),
+            )
+            if _recovery.get('scanned'):
+                logger.warning(
+                    "[Startup] Atomic staging reconciliation: %d tree(s) scanned, "
+                    "%d album(s) recovered (%d file(s)), %d file(s) superseded by the "
+                    "library and moved to the recycle bin, %d failed, %d empty, "
+                    "%d reported, %d wishlist entries cleared",
+                    _recovery['scanned'], _recovery['published'], _recovery['files'],
+                    _recovery['superseded'], _recovery['failed'], _recovery['empty'],
+                    _recovery['reported'], _recovery['wishlist_cleared'])
+        except Exception as _recover_err:
+            # Recovery must not crash startup — the files are still on disk.
+            logger.warning("[Startup] Atomic staging reconciliation failed: %s", _recover_err)
+
+        # Establish the barrier before any runtime service that can mutate the
+        # music catalogue. It treats an unclaimed-but-required upgrade as
+        # active too, closing the old startup race before try_claim().
+        try:
+            from core.library2.migration_gate import (
+                MigrationPauseSupervisor, defer_or_call,
+            )
+            library_v2_migration_gate = MigrationPauseSupervisor(
+                get_database(), _enrichment_workers, automation_engine,
+            ).start()
+            library_v2_migration_gate.tick()
+        except Exception as _lib2_gate_err:
+            logger.debug(f"could not start lib2 migration pause supervisor: {_lib2_gate_err}")
+
+        defer_or_call(start_simple_background_monitor, get_database(), "download monitor")
+        if usenet_acquisition_monitor is not None:
+            defer_or_call(usenet_acquisition_monitor.start, get_database(), "acquisition monitor")
+
+        # Existing-installation bootstrap: import legacy -> lib2_* on its own the
+        # native catalogue bootstrap, no UI click required (§78).
+        try:
+            start_library_v2_bootstrap_autostart()
+        except Exception as _lib2_bootstrap_err:
+            logger.debug(f"could not start lib2 bootstrap import autostart: {_lib2_bootstrap_err}")
+
+        # Name the holder when SQLite's single write lock gets stuck. Without
+        # this the log only ever shows victims ("database is locked" from
+        # notifications, automations, repair jobs, UI preferences) and the
+        # thread actually holding the lock stays anonymous. Silent on a healthy
+        # installation; see core/db_lock_watchdog.py.
+        try:
+            from core.db_lock_watchdog import start_watchdog as _start_lock_watchdog
+            _start_lock_watchdog(get_database())
+        except Exception as _lock_watchdog_err:
+            logger.debug(f"could not start db lock watchdog: {_lock_watchdog_err}")
 
         # Wishlist/watchlist timers are now managed by AutomationEngine system automations
 
         # Pre-build import suggestions cache in background
         logger.info("Pre-building import suggestions cache...")
-        start_import_suggestions_cache()
+        defer_or_call(start_import_suggestions_cache, get_database(), "import suggestions cache")
 
         # Initialize app start time for uptime tracking
         app.start_time = time.time()
@@ -22210,10 +23209,12 @@ def start_runtime_services():
         threading.Thread(target=_growth_triggered_gc, daemon=True, name='gc-sweeper').start()
         logger.info("GC sweeper started (collect + malloc_trim on +200MB growth, backstop 120s)")
 
-        # Register action handlers and start automation engine
+        # Register action handlers; the engine itself starts only after the
+        # exclusive Library-v2 upgrade barrier has cleared.
         _register_automation_handlers()
         if automation_engine:
-            try:
+            def _start_automation_after_upgrade():
+                automation_engine.resume_after_migration()
                 logger.info("Starting automation engine...")
                 automation_engine.start()
                 logger.info("Automation engine started")
@@ -22221,6 +23222,9 @@ def start_runtime_services():
                     automation_engine.emit('app_started', {})
                 except Exception as e:
                     logger.debug("app_started emit failed: %s", e)
+            try:
+                defer_or_call(
+                    _start_automation_after_upgrade, get_database(), "automation engine")
             except AttributeError as e:
                 logger.error(f"Automation engine failed to start: {e}")
                 logger.info("   If using Docker, check that your volume mount is /app/data (not /app/database)")

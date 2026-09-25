@@ -8,7 +8,13 @@ flag mirrored from web_server's own flag in ``_shutdown_runtime_components``.
 import threading
 import time
 
+from core.downloads.observed_speed import ObservedSpeedTracker
+from core.downloads.peer_observation import observe_peer
 from core.settings import config_manager
+from core.downloads.source_policy import (
+    RELEASE_SOURCE_NAMES as _RELEASE_SOURCE_NAMES,
+    STREAMING_SOURCE_NAMES as _STREAMING_SOURCE_NAMES,
+)
 from core.runtime_state import (
     download_batches,
     download_tasks,
@@ -42,7 +48,6 @@ missing_download_executor = None
 # album bundles, same fix. Falls back to the shared pool when unwired.
 post_processing_executor = None
 download_orchestrator = None
-_RELEASE_SOURCE_NAMES = frozenset(('torrent', 'usenet'))
 
 # Hard ceiling on automatic next-candidate retries after a download was
 # quarantined (AcoustID mismatch / integrity / duration). The natural
@@ -62,16 +67,6 @@ MAX_QUARANTINE_RETRIES = 5
 # one 'soulseek' bucket), but this ceiling caps the TOTAL retries across every
 # source so a misbehaving source-resolution can never loop forever.
 MAX_TOTAL_QUARANTINE_RETRIES = 100
-
-# Streaming plugins report their source name as the download's "username"
-# (see download_orchestrator._streaming_sources). Soulseek uses the peer name
-# instead, so anything not in this set is bucketed under 'soulseek' for the
-# per-source retry budget.
-_STREAMING_SOURCE_NAMES = frozenset((
-    'youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon',
-    'torrent', 'usenet',
-))
-
 
 def _resolve_download_source(username):
     """Map a download's username to its logical source for per-source budgeting.
@@ -113,6 +108,62 @@ def _cancel_on_giveup(task, deferred_ops, trigger):
         )
 
 
+def _replace_slow_download(task_id, batch_id, download_id, username, filename,
+                           source_was_used):
+    """Only restart a slow task after slskd confirms the old transfer stopped."""
+    try:
+        cancelled = bool(run_async(download_orchestrator.cancel_download(
+            download_id, username, remove=True,
+        )))
+    except Exception as exc:
+        logger.warning("[Observed Speed] Could not cancel %s: %s", download_id, exc)
+        cancelled = False
+
+    if cancelled:
+        # slskd reports every finished transfer as "Completed, <outcome>";
+        # anything else is still holding the peer's slot.
+        try:
+            for _ in range(3):
+                rows = run_async(download_orchestrator.get_all_downloads())
+                still_active = any(
+                    row.username == username and row.id == download_id
+                    and 'Completed' not in (row.state or '')
+                    for row in rows
+                )
+                if not still_active:
+                    break
+                time.sleep(1)
+            else:
+                cancelled = False
+        except Exception as exc:
+            logger.warning("[Observed Speed] Could not confirm cancellation of %s: %s",
+                           download_id, exc)
+            cancelled = False
+
+    context_key = _make_context_key(username, filename)
+    with tasks_lock:
+        task = download_tasks.get(task_id)
+        if not task or task.get('status') != 'searching' or task.get('retry_trigger') != 'observed_speed':
+            return
+        if not cancelled:
+            task.update(download_id=download_id, username=username, filename=filename,
+                        status='downloading', _observed_speed_exempt=True)
+            task.pop('_slow_fallback_source_key', None)
+            task.pop('_slow_fallback_speed_bps', None)
+            task.pop('retry_info', None)
+            task.pop('retry_trigger', None)
+            if not source_was_used:
+                task.get('used_sources', set()).discard(f"{username}_{filename}")
+            logger.warning("[Observed Speed] Cancellation unconfirmed for %s; keeping original transfer",
+                           download_id)
+            return
+
+    _orphaned_download_keys.add(context_key)
+    with matched_context_lock:
+        matched_downloads_context.pop(context_key, None)
+    missing_download_executor.submit(_download_track_worker, task_id, batch_id)
+
+
 def _remaining_fallback_sources(exhausted):
     """Sources in the configured hybrid chain that haven't exhausted their
     per-source budget yet.
@@ -132,8 +183,98 @@ def _remaining_fallback_sources(exhausted):
     return [s for s in chain if str(s).lower() not in blocked]
 
 
+def _maybe_hybrid_fallback_on_giveup(task, task_id, current_time, deferred_ops, trigger_name, description):
+    """If the current source has failed its retries, check whether another
+    source is configured in the hybrid chain. If so, mark the failed source
+    as exhausted and re-queue the task for a fresh search with the remaining
+    sources (gzetk report: Soulseek failure never triggered YouTube fallback).
+
+    Returns True if a cross-source retry was dispatched (caller should not mark failed).
+    Returns False if no fallback source is available (caller proceeds to mark failed).
+    """
+    ti = task.get('track_info') if isinstance(task.get('track_info'), dict) else {}
+    username = task.get('username') or ti.get('username', '')
+    filename = task.get('filename') or ti.get('filename', '')
+    failed_source = _resolve_download_source(username)
+    exhausted_now = set(task.get('exhausted_download_sources') or ())
+    exhausted_now.add(failed_source)
+    remaining = _remaining_fallback_sources(exhausted_now)
+    if not remaining:
+        return False
+
+    track_label = ti.get('name') or task.get('name', 'Unknown')
+    logger.warning(
+        f"[Hybrid Retry] {description} for \"{track_label}\" "
+        f"— marking '{failed_source}' exhausted and trying next source(s): "
+        f"{remaining}"
+    )
+    task['exhausted_download_sources'] = exhausted_now
+
+    # Mark the failed candidate as used so it is never re-picked
+    if username and filename:
+        used_sources = set(task.get('used_sources') or ())
+        used_sources.add(f"{username}_{filename}")
+        task['used_sources'] = used_sources
+
+    # Cancel the remote transfer so it doesn't leak or tie up slots
+    _cancel_on_giveup(task, deferred_ops, f'{trigger_name}_hybrid_fallback')
+    task.pop('download_id', None)
+    task.pop('username', None)
+    task.pop('filename', None)
+    task['error_retry_count'] = 0
+    task['stuck_retry_count'] = 0
+    task['status'] = 'searching'
+    task['status_change_time'] = current_time
+    task.pop('queued_start_time', None)
+    task.pop('downloading_start_time', None)
+    task.pop('search_live', None)
+    batch_id = task.get('batch_id')
+    if task_id:
+        deferred_ops.append(('restart_worker', task_id, batch_id))
+    return True
+
+
 def _download_id_key(download_id):
     return f"download_id::{download_id}" if download_id else None
+
+
+def _acquisition_task_ref(task):
+    """(import_id, track_id) for acquisition-dispatched tasks, else None."""
+    try:
+        from core.acquisition.retry_state import acquisition_task_ref
+        return acquisition_task_ref(task.get('track_info'))
+    except Exception:
+        return None
+
+
+def _write_acquisition_retry_journal(action):
+    """Persist a retry-journal action captured under tasks_lock.
+
+    Runs strictly OUTSIDE tasks_lock (SQLite I/O must never happen while the
+    global task lock is held) and fails open — journaling must never break or
+    delay the retry itself. ``action`` is ``('snapshot'|'close', kwargs)`` or
+    None for ordinary (non-acquisition) tasks.
+    """
+    if not action:
+        return
+    try:
+        from core.acquisition import retry_state
+        from database.music_database import get_database
+        conn = get_database()._get_connection()
+        try:
+            kind, kwargs = action
+            if kind == 'snapshot':
+                retry_state.journal_retry_snapshot(conn, **kwargs)
+            else:
+                retry_state.close_retry_state(conn, **kwargs)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning(f"[Retry] Acquisition retry journal update failed: {exc}")
 
 
 def requeue_quarantined_task_for_retry(task_id, batch_id, trigger):
@@ -164,17 +305,42 @@ def requeue_quarantined_task_for_retry(task_id, batch_id, trigger):
     if missing_download_executor is None or _download_track_worker is None:
         return False
 
+    queued, attempt_desc, journal_action = _requeue_decide_and_mark(
+        task_id, trigger)
+    _write_acquisition_retry_journal(journal_action)
+    if not queued:
+        return False
+
+    logger.info(
+        f"[Retry:{trigger}] Re-queuing task {task_id} for next-best candidate "
+        f"(attempt {attempt_desc})"
+    )
+    missing_download_executor.submit(_download_track_worker, task_id, batch_id)
+    return True
+
+
+def _requeue_decide_and_mark(task_id, trigger):
+    """The locked half of ``requeue_quarantined_task_for_retry``.
+
+    Decides whether a retry is allowed and mutates the task under tasks_lock
+    exactly as before. Returns ``(queued, attempt_desc, journal_action)``; the
+    journal action is deferred to the caller so persistent-journal I/O for
+    acquisition tasks happens outside the lock. Deny reasons that terminate an
+    acquisition walk (cancelled, budget exhausted) close its journal row; a
+    queued retry snapshots the walk state so a restart can resume it.
+    """
     with tasks_lock:
         task = download_tasks.get(task_id)
         if not task:
-            return False
+            return False, None, None
+        acq_ref = _acquisition_task_ref(task)
         # The user explicitly picked this candidate via the candidates modal —
         # honour their choice rather than silently swapping in another file.
         # (Matches the monitor's transfer-retry guards.)
         if task.get('_user_manual_pick'):
-            return False
+            return False, None, None
         if task.get('status') == 'cancelled':
-            return False
+            return False, None, _close_action(acq_ref, task_id, 'cancelled')
 
         username = task.get('username')
         filename = task.get('filename')
@@ -183,7 +349,7 @@ def requeue_quarantined_task_for_retry(task_id, batch_id, trigger):
         # bad source as used, so a re-run could re-pick the same file and loop.
         # Bail and let the caller fail it normally.
         if not username or not filename:
-            return False
+            return False, None, None
 
         total_count = task.get('quarantine_retry_count', 0)
 
@@ -230,14 +396,21 @@ def requeue_quarantined_task_for_retry(task_id, batch_id, trigger):
                         f"budget for source '{source}' ({source_count}/{budget}) "
                         f"and no fallback source remains — giving up, marking failed"
                     )
-                    return False
+                    return False, None, _close_action(
+                        acq_ref, task_id, 'failed',
+                        error=f"retry budget exhausted for source '{source}' "
+                              f"with no fallback remaining",
+                    )
                 if total_count >= MAX_TOTAL_QUARANTINE_RETRIES:
                     logger.warning(
                         f"[Retry:{trigger}] Task {task_id} hit the absolute retry "
                         f"ceiling ({MAX_TOTAL_QUARANTINE_RETRIES}) — giving up, "
                         f"marking failed"
                     )
-                    return False
+                    return False, None, _close_action(
+                        acq_ref, task_id, 'failed',
+                        error='absolute quarantine-retry ceiling reached',
+                    )
                 task['exhausted_download_sources'] = exhausted
                 # Don't push this source's counter past its budget — it's done.
                 # The next source starts spending its own fresh budget when its
@@ -253,7 +426,10 @@ def requeue_quarantined_task_for_retry(task_id, batch_id, trigger):
                         f"ceiling ({MAX_TOTAL_QUARANTINE_RETRIES}) — giving up, "
                         f"marking failed"
                     )
-                    return False
+                    return False, None, _close_action(
+                        acq_ref, task_id, 'failed',
+                        error='absolute quarantine-retry ceiling reached',
+                    )
                 counts[source] = source_count + 1
                 task['quarantine_retry_counts_by_source'] = counts
                 attempt_desc = f"source '{source}' {source_count + 1}/{budget}"
@@ -264,7 +440,10 @@ def requeue_quarantined_task_for_retry(task_id, batch_id, trigger):
                     f"[Retry:{trigger}] Task {task_id} hit the quarantine-retry cap "
                     f"({MAX_QUARANTINE_RETRIES}) — giving up, marking failed"
                 )
-                return False
+                return False, None, _close_action(
+                    acq_ref, task_id, 'failed',
+                    error='quarantine-retry cap reached',
+                )
             attempt_desc = f"{total_count + 1}/{MAX_QUARANTINE_RETRIES}"
 
         # Mark the quarantined source as used so the re-run won't pick it again.
@@ -293,12 +472,42 @@ def requeue_quarantined_task_for_retry(task_id, batch_id, trigger):
         task['retry_info'] = attempt_desc
         task['retry_trigger'] = trigger
 
-    logger.info(
-        f"[Retry:{trigger}] Re-queuing task {task_id} for next-best candidate "
-        f"(attempt {attempt_desc})"
-    )
-    missing_download_executor.submit(_download_track_worker, task_id, batch_id)
-    return True
+        journal_action = None
+        if acq_ref:
+            # Copy the walk state under the lock; the redaction and DB write
+            # happen outside it. This snapshot (taken BEFORE the worker is
+            # resubmitted) is what lets a restart continue with the next
+            # candidate instead of re-downloading the quarantined source.
+            journal_action = ('snapshot', {
+                'task_id': str(task_id),
+                'import_id': acq_ref[0],
+                'track_id': acq_ref[1],
+                'candidates': list(task.get('cached_candidates') or ()),
+                'used_sources': set(task.get('used_sources') or ()),
+                'exhausted_sources': set(
+                    task.get('exhausted_download_sources') or ()),
+                'retry_counts': dict(
+                    task.get('quarantine_retry_counts_by_source') or {}),
+                'retry_count': int(task.get('quarantine_retry_count') or 0),
+                'query_count': int(task.get('query_count') or 0),
+                'last_progress': (
+                    f"requeued after {trigger} quarantine "
+                    f"(attempt {attempt_desc})"
+                ),
+            })
+
+    return True, attempt_desc, journal_action
+
+
+def _close_action(acq_ref, task_id, status, error=None):
+    """Journal close action for a denied retry; None for ordinary tasks."""
+    if not acq_ref:
+        return None
+    return ('close', {
+        'task_id': str(task_id),
+        'status': status,
+        'error': error,
+    })
 
 
 def _is_release_task(task):
@@ -488,6 +697,12 @@ class WebUIDownloadMonitor:
                         if has_completion and not has_error and (
                             task['status'] == 'downloading' or release_recoverable
                         ):
+                            tracker = task.pop('_observed_speed_tracker', None)
+                            if (isinstance(tracker, ObservedSpeedTracker)
+                                    and _resolve_download_source(task.get('username')) == 'soulseek'):
+                                speed_bps, sample_seconds = tracker.window_speed()
+                                if speed_bps:
+                                    observe_peer(task.get('username'), speed_bps, sample_seconds)
                             task.pop('_incomplete_warned', None)
                             # CRITICAL FIX: Transition to 'post_processing' HERE so downloads
                             # don't depend on browser polling to trigger post-processing.
@@ -536,6 +751,8 @@ class WebUIDownloadMonitor:
                     logger.debug(f"[Deferred] Restarting worker for task {task_id}")
                     missing_download_executor.submit(_download_track_worker, task_id, batch_id)
                     logger.debug(f"[Deferred] Successfully restarted worker for task {task_id}")
+                elif op[0] == 'replace_slow_download':
+                    _replace_slow_download(*op[1:])
             except Exception as e:
                 logger.error(f"[Deferred] Error executing deferred operation {op[0]}: {e}")
 
@@ -725,6 +942,11 @@ class WebUIDownloadMonitor:
                 elif retry_count < 3:
                     return False
                 else:
+                    if _maybe_hybrid_fallback_on_giveup(
+                        task, task_id, current_time, deferred_ops, 'not_in_transfers',
+                        'Download disappeared from transfer list 3 times'
+                    ):
+                        return False
                     track_label = task.get('track_info', {}).get('name', 'Unknown')
                     tried_sources = task.get('used_sources', set())
                     sources_str = f' (tried {len(tried_sources)} source{"s" if len(tried_sources) != 1 else ""})' if tried_sources else ''
@@ -803,7 +1025,13 @@ class WebUIDownloadMonitor:
                 # Wait a bit before next error retry
                 return False
             else:
-                # Too many error retries, mark as failed
+                # Too many error retries on this source.
+                if _maybe_hybrid_fallback_on_giveup(
+                    task, task_id, current_time, deferred_ops, 'errored_state',
+                    f'Transfer errored {retry_count} times'
+                ):
+                    return False
+
                 track_label = task.get('track_info', {}).get('name', 'Unknown')
                 tried_sources = task.get('used_sources', set())
                 sources_str = f' (tried {len(tried_sources)} source{"s" if len(tried_sources) != 1 else ""})' if tried_sources else ''
@@ -816,7 +1044,16 @@ class WebUIDownloadMonitor:
                 is_tidal = any(s.startswith('tidal_') for s in tried_sources)
                 if is_tidal:
                     from core.quality.source_map import quality_tier_for_source
-                    tidal_quality = quality_tier_for_source('tidal', default='lossless')
+                    _task_track_info = task.get('track_info') or {}
+                    _task_quality_profile_id = (
+                        _task_track_info.get('quality_profile_id')
+                        if isinstance(_task_track_info, dict) else None
+                    )
+                    tidal_quality = quality_tier_for_source(
+                        'tidal',
+                        default='lossless',
+                        profile_id=_task_quality_profile_id,
+                    )
                     allow_fb = config_manager.get('tidal_download.allow_fallback', True)
                     if tidal_quality == 'hires' and not allow_fb:
                         task['error_message'] = (
@@ -838,8 +1075,12 @@ class WebUIDownloadMonitor:
                     return True  # Signal that we need to call completion outside the lock
                 return False
 
+        if self._retry_slow_soulseek_transfer(
+                task_id, task, live_info, state_str, current_time, deferred_ops):
+            return False
+
         # Check for queued timeout (90 seconds like GUI)
-        elif 'Queued' in state_str or task['status'] == 'queued':
+        if 'Queued' in state_str or task['status'] == 'queued':
             if 'queued_start_time' not in task:
                 task['queued_start_time'] = current_time
                 return False
@@ -911,6 +1152,12 @@ class WebUIDownloadMonitor:
                         return False
                     else:
                         # Too many retries, mark as failed
+                        if _maybe_hybrid_fallback_on_giveup(
+                            task, task_id, current_time, deferred_ops, 'queued_state',
+                            'Download stayed queued too long 3 times'
+                        ):
+                            return False
+
                         track_label = task.get('track_info', {}).get('name', 'Unknown')
                         tried_sources = task.get('used_sources', set())
                         sources_str = f' (tried {len(tried_sources)} source{"s" if len(tried_sources) != 1 else ""})' if tried_sources else ''
@@ -1000,6 +1247,12 @@ class WebUIDownloadMonitor:
                         # Wait longer before next retry
                         return False
                     else:
+                        if _maybe_hybrid_fallback_on_giveup(
+                            task, task_id, current_time, deferred_ops, 'zero_progress',
+                            'Download stuck at 0% three times'
+                        ):
+                            return False
+
                         track_label = task.get('track_info', {}).get('name', 'Unknown')
                         tried_sources = task.get('used_sources', set())
                         sources_str = f' (tried {len(tried_sources)} source{"s" if len(tried_sources) != 1 else ""})' if tried_sources else ''
@@ -1103,6 +1356,12 @@ class WebUIDownloadMonitor:
                             deferred_ops.append(('restart_worker', task_id, batch_id))
                         return False
                     elif retry_count >= 3:
+                        if _maybe_hybrid_fallback_on_giveup(
+                            task, task_id, current_time, deferred_ops, 'unknown_state',
+                            f'Download stuck in "{state_str}" state 3 times'
+                        ):
+                            return False
+
                         track_label = task.get('track_info', {}).get('name', 'Unknown')
                         tried_sources = task.get('used_sources', set())
                         sources_str = f' (tried {len(tried_sources)} source{"s" if len(tried_sources) != 1 else ""})' if tried_sources else ''
@@ -1119,6 +1378,110 @@ class WebUIDownloadMonitor:
                         return False
 
         return False
+
+    def _retry_slow_soulseek_transfer(
+            self, task_id, task, live_info, state_str, current_time, deferred_ops):
+        """Replace a sustained crawling Soulseek transfer with its next candidate.
+
+        This runs under ``tasks_lock``. Cancellation, context cleanup and worker
+        submission are deferred in the same way as the existing timeout paths.
+        """
+        try:
+            minimum_kbps = float(config_manager.get(
+                'soulseek.min_observed_download_speed_kbps', 250) or 0)
+        except (TypeError, ValueError):
+            minimum_kbps = 250.0
+
+        state_str = str(state_str or '')
+        is_active = 'InProgress' in state_str
+        if (not is_active
+                or _resolve_download_source(task.get('username')) != 'soulseek'
+                or task.get('_user_manual_pick')):
+            # A transfer that just finished keeps its samples: the completion
+            # branch in _check_all_downloads runs AFTER this and records the
+            # peer's throughput from them. Everything else (queued, errored,
+            # non-Soulseek) starts over.
+            if 'Completed' not in state_str and 'Succeeded' not in state_str:
+                task.pop('_observed_speed_tracker', None)
+            return False
+
+        retry_enabled = (
+            config_manager.get('soulseek.observed_speed_fallback_enabled', False)
+            and minimum_kbps > 0
+            and not task.get('_observed_speed_exempt')
+        )
+
+        tracker = task.get('_observed_speed_tracker')
+        if not isinstance(tracker, ObservedSpeedTracker):
+            tracker = ObservedSpeedTracker()
+            task['_observed_speed_tracker'] = tracker
+
+        average_bps, should_retry = tracker.observe(
+            current_time,
+            live_info.get('bytesTransferred', 0),
+            minimum_kbps * 1000 if retry_enabled else 0,
+        )
+        if not retry_enabled or not should_retry:
+            return False
+
+        username = task.get('username')
+        filename = task.get('filename')
+        download_id = task.get('download_id')
+        source_key = f"{username}_{filename}" if username and filename else None
+        candidate_count = int(task.get('candidate_count', 0) or 0)
+        candidate_index = int(task.get('current_candidate_index', 0) or 0)
+        observe_peer(username, average_bps or 0, tracker.window_speed()[1])
+
+        # There is no known alternative left in this candidate set. Keep the
+        # accepted transfer and exempt it from further speed checks rather than
+        # turning a slow possible download into a guaranteed missing track.
+        if not source_key or candidate_count <= 1 or candidate_index >= candidate_count - 1:
+            task['_observed_speed_exempt'] = True
+            task.pop('_observed_speed_tracker', None)
+            task.pop('_slow_fallback_source_key', None)
+            task.pop('_slow_fallback_speed_bps', None)
+            logger.warning(
+                "[Observed Speed] Task %s remains below %.0f KB/s (%.0f KB/s "
+                "observed), but no candidate remains — allowing it to continue",
+                task_id, minimum_kbps, (average_bps or 0) / 1000,
+            )
+            return True
+
+        previous_fallback_speed = float(task.get('_slow_fallback_speed_bps', -1) or -1)
+        if (average_bps or 0) >= previous_fallback_speed:
+            task['_slow_fallback_source_key'] = source_key
+            task['_slow_fallback_speed_bps'] = average_bps or 0
+
+        if not download_id or not task.get('batch_id'):
+            task['_observed_speed_exempt'] = True
+            task.pop('_observed_speed_tracker', None)
+            return True
+
+        used_sources = task.get('used_sources', set())
+        source_was_used = source_key in used_sources
+        used_sources.add(source_key)
+        task['used_sources'] = used_sources
+
+        task.pop('download_id', None)
+        task.pop('username', None)
+        task.pop('filename', None)
+        task.pop('_observed_speed_tracker', None)
+        task['status'] = 'searching'
+        task['status_change_time'] = current_time
+        task['retry_info'] = 'observed speed below minimum — trying next candidate'
+        task['retry_trigger'] = 'observed_speed'
+        task.pop('queued_start_time', None)
+        task.pop('downloading_start_time', None)
+
+        batch_id = task.get('batch_id')
+        deferred_ops.append(('replace_slow_download', task_id, batch_id, download_id,
+                             username, filename, source_was_used))
+        logger.warning(
+            "[Observed Speed] Task %s averaged %.0f KB/s below the %.0f KB/s "
+            "minimum — trying the next candidate",
+            task_id, (average_bps or 0) / 1000, minimum_kbps,
+        )
+        return True
     
     
     def _validate_worker_counts(self):

@@ -97,6 +97,19 @@ def register_routes(bp):
                 user_initiated=True,
             )
             if outcome["applied"]:
+                # dd28-12: mirror the intent BACK into lib2. Without this the
+                # hourly reconciler saw a wishlisted track with no lib2 rule
+                # making it wanted, pruned it, and the entry vanished within
+                # the hour — so failed downloads silently stopped retrying.
+                from core.settings import config_manager
+                from core.library2.monitor_sync import sync_wishlist_addition
+                sync_wishlist_addition(
+                    db, config_manager,
+                    [{"track_data": track_data,
+                      "source_info": {"lib2_track_id": (track_data or {}).get("lib2_track_id")}
+                      if isinstance(track_data, dict) else {}}],
+                    profile_id=profile_id,
+                )
                 # Read back by the key that was actually written: a second album
                 # for the same track is stored as ``<id>::<album>``, so looking
                 # the bare id up again returns the OTHER album's row (R2-09).
@@ -137,8 +150,22 @@ def register_routes(bp):
         try:
             from database.music_database import get_database
             db = get_database()
+            descriptors = [
+                row for row in db.get_wishlist_tracks(profile_id=profile_id)
+                if (
+                    str(row.get("spotify_track_id") or "") == str(track_id)
+                    if "::" in str(track_id)
+                    else str(row.get("spotify_track_id") or "").split("::", 1)[0]
+                    == str(track_id).split("::", 1)[0]
+                )
+            ]
             ok = db.remove_from_wishlist(track_id, profile_id=profile_id)
             if ok:
+                from core.settings import config_manager
+                from core.library2.monitor_sync import sync_wishlist_removal
+                sync_wishlist_removal(
+                    db, config_manager, descriptors, profile_id=profile_id,
+                )
                 return api_success({"message": "Track removed from wishlist."})
             return api_error("NOT_FOUND", "Track not found in wishlist.", 404)
         except Exception as e:
@@ -147,16 +174,28 @@ def register_routes(bp):
     @bp.route("/wishlist/process", methods=["POST"])
     @require_api_key
     def process_wishlist():
-        """Trigger wishlist download processing."""
-        try:
-            from web_server import is_wishlist_actually_processing
-            if is_wishlist_actually_processing():
-                return api_error("CONFLICT", "Wishlist processing is already running.", 409)
+        """Trigger wishlist download processing.
 
-            from web_server import start_wishlist_missing_downloads
-            start_wishlist_missing_downloads()
+        Goes through the same helper the app's own /api/wishlist/process
+        uses. It used to import two names from web_server; the decomposition
+        moved them and every call answered 501 (#1259, Wavio).
+        """
+        try:
+            from api import wishlist_routes as internal
+            from core.wishlist.routes import process_wishlist_api
+
+            if internal._process_wishlist_automatically is None:
+                return api_error("NOT_AVAILABLE", "Wishlist processing is not wired up yet.", 503)
+
+            runtime = internal._build_wishlist_route_runtime()
+            payload, status = process_wishlist_api(
+                runtime,
+                start_processing=lambda: internal._process_wishlist_automatically(),
+            )
+            if status == 409:
+                return api_error("CONFLICT", "Wishlist processing is already running.", 409)
+            if status != 200:
+                return api_error("WISHLIST_ERROR", payload.get("error", "Could not start processing."), status)
             return api_success({"message": "Wishlist processing started."})
-        except ImportError:
-            return api_error("NOT_AVAILABLE", "Wishlist processing function not available.", 501)
         except Exception as e:
             return api_error("WISHLIST_ERROR", str(e), 500)

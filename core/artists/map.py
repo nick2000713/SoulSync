@@ -448,7 +448,7 @@ def get_artist_map_genres():
                  deezer_id=r['deezer_artist_id'], discogs_id=r['discogs_artist_id'], source='watchlist')
 
         # 4. Library artists
-        cursor.execute("SELECT name, thumb_url, genres FROM artists")
+        cursor.execute("SELECT name, image_url AS thumb_url, genres FROM lib2_artists")
         for r in cursor.fetchall():
             genres = []
             if r['genres']:
@@ -676,7 +676,12 @@ def get_artist_map_explore():
                     if wr[col]:
                         center_ids[k] = str(wr[col])
             else:
-                cursor.execute("SELECT name, thumb_url FROM artists WHERE name = ? COLLATE NOCASE LIMIT 1", (artist_name,))
+                from core.library2.importer import normalize_name
+                # `name_key` is the stored fold. COLLATE NOCASE is ASCII-only,
+                # so "BJÖRK" never found the library's "Björk".
+                cursor.execute(
+                    "SELECT name, image_url AS thumb_url FROM lib2_artists"
+                    " WHERE name_key = ? LIMIT 1", (normalize_name(artist_name),))
                 lr = cursor.fetchone()
                 if lr:
                     artist_found = True
@@ -782,7 +787,10 @@ def get_artist_map_explore():
                     similar = scanner._fetch_similar_artists_from_musicmap(center_name, limit=15)
                     if similar:
                         source_artist_id = center_ids.get('spotify_id') or center_ids.get('itunes_id') or center_name
-                        # Store in DB for future use
+                        # Store in DB for future use. CACHE ONLY: looking an artist up
+                        # is not a preference, so these rows never seed the discovery
+                        # pool — get_top_similar_artists keeps only the edges whose
+                        # source is a library or watchlist artist (#1284).
                         for rank, sa in enumerate(similar, 1):
                             try:
                                 database.add_or_update_similar_artist(

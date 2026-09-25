@@ -1,5 +1,5 @@
 import { createMemoryHistory } from '@tanstack/react-router';
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -11,7 +11,7 @@ import { HttpResponse, http, server } from '@/test/msw';
 import { createTestQueryClient } from '@/test/query-client';
 import { createShellBridge } from '@/test/shell-bridge';
 
-import { AppRouterProvider, createAppRouter } from './router';
+import { AppRouterProvider, createAppRouter, DefaultErrorComponent, errorReport } from './router';
 
 describe('createAppRouter', () => {
   beforeEach(() => {
@@ -69,6 +69,21 @@ describe('createAppRouter', () => {
     expect(shouldRestore({ location: { pathname: '/artist-detail/library/42' } })).toBe(false);
     expect(router.options.defaultErrorComponent).toBeDefined();
     expect(router.options.defaultNotFoundComponent).toBeDefined();
+  });
+
+  it('loads a prefixed deep link without changing logical route IDs', async () => {
+    const meta = document.createElement('meta');
+    meta.name = 'soulsync-url-base'; meta.content = '/soulsync'; document.head.append(meta);
+    window.SoulSyncWebShellBridge = createShellBridge();
+    const queryClient = createTestQueryClient();
+    const history = createMemoryHistory({ initialEntries: ['/soulsync/issues'] });
+    const router = createAppRouter({ history, queryClient });
+    try {
+      render(<AppRouterProvider router={router} queryClient={queryClient} />);
+      await waitFor(() => expect(screen.getByTestId('issues-board')).toBeInTheDocument());
+      expect(window.SoulSyncWebShellBridge?.showReactHost).toHaveBeenCalledWith('issues');
+      expect(history.location.pathname).toBe('/soulsync/issues');
+    } finally { meta.remove(); }
   });
 
   it('renders migrated React routes directly and updates shell chrome', async () => {
@@ -161,5 +176,50 @@ describe('createAppRouter', () => {
     });
 
     expect(history.location.pathname).toBe('/settings');
+  });
+});
+
+/**
+ * The route error boundary.
+ *
+ * It said "Something went wrong. Please refresh." and nothing else, while the
+ * console is muted by default — so a user hitting it had nothing to report and
+ * we had nothing to act on.
+ */
+describe('the error boundary', () => {
+  it('shows the message and stack of a real error', () => {
+    const boom = new Error("Cannot read properties of undefined (reading 'map')");
+    render(<DefaultErrorComponent error={boom} />);
+    expect(screen.getByRole('alert')).toBeInTheDocument();
+    expect(screen.getByText(/reading 'map'/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Copy error' })).toBeInTheDocument();
+  });
+
+  it('copies exactly what the report needs', () => {
+    const writeText = vi.fn();
+    Object.assign(navigator, { clipboard: { writeText } });
+    render(<DefaultErrorComponent error={new Error('kaboom')} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Copy error' }));
+    expect(writeText).toHaveBeenCalledWith(expect.stringContaining('kaboom'));
+  });
+
+  it('falls back to the old copy when there is no error to show', () => {
+    render(<DefaultErrorComponent />);
+    expect(screen.getByText('Please refresh the page and try again.')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Copy error' })).toBeNull();
+  });
+
+  it('reports strings and thrown non-errors too', () => {
+    expect(errorReport('plain string')).toBe('plain string');
+    expect(errorReport({ status: 500 })).toContain('500');
+    expect(errorReport(null)).toBeNull();
+  });
+
+  it('trims a runaway stack instead of dumping the whole thing', () => {
+    const err = new Error('deep');
+    err.stack = ['Error: deep', ...Array.from({ length: 80 }, (_, i) => `  at frame${i}`)].join(
+      '\n',
+    );
+    expect(errorReport(err)!.split('\n')).toHaveLength(12);
   });
 });

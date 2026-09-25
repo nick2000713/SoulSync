@@ -173,6 +173,106 @@ def file_of(payload) -> dict | None:
     return out
 
 
+# An overlay template shared into the room. The definition rides in its OWN
+# envelope key rather than in the protocol object, because protocol_of allows a
+# single level of nesting and a template is layers-of-objects — it would be
+# rejected outright. Same arrangement file cards ('f') and reactions ('re')
+# already use.
+#
+# Everything here is REMOTE input from a public chat room, so the caps are the
+# point. A definition is a drawing instruction that another install will render:
+# it must be bounded in every dimension a renderer could be hurt by.
+OVERLAY_MAX_LAYERS = 60
+OVERLAY_MAX_JSON = 12000       # serialized definition ceiling
+OVERLAY_MAX_NAME = 120
+OVERLAY_MAX_KEYS = 40          # per object
+OVERLAY_MAX_STR = 512
+OVERLAY_MAX_DEPTH = 4          # layer > bg/shadow > value is 3; one spare
+
+
+def _overlay_value_ok(v, depth: int) -> bool:
+    """One value inside a template definition, recursively bounded."""
+    if isinstance(v, str):
+        return len(v) <= OVERLAY_MAX_STR
+    if isinstance(v, bool) or v is None:
+        return True
+    if isinstance(v, (int, float)):
+        # NaN and infinity survive json round-trips in some encoders and turn
+        # into a renderer dividing by nothing.
+        return v == v and abs(v) < 1e9 if isinstance(v, float) else abs(v) < 10 ** 12
+    if depth <= 0:
+        return False
+    if isinstance(v, list):
+        return len(v) <= OVERLAY_MAX_LAYERS and all(
+            _overlay_value_ok(x, depth - 1) for x in v)
+    if isinstance(v, dict):
+        return len(v) <= OVERLAY_MAX_KEYS and all(
+            isinstance(k, str) and len(k) <= 64 and _overlay_value_ok(x, depth - 1)
+            for k, x in v.items())
+    return False
+
+
+def overlay_of(payload) -> dict | None:
+    """A shared overlay template from a decoded envelope ({'n' name, 'd'
+    definition}), or None.
+
+    Refuses anything that is not a renderable template: a definition needs a
+    layers LIST, because a template with no layers paints nothing and a card
+    offering one is a card that wastes a click. Bounded in every direction —
+    layer count, serialized size, nesting depth, key count, string length,
+    number magnitude — since this arrives from a public room and will be handed
+    to a poster renderer.
+    """
+    o = (payload or {}).get("o") if isinstance(payload, dict) else None
+    if not isinstance(o, dict):
+        return None
+    name = " ".join(str(o.get("n") or "").split())[:OVERLAY_MAX_NAME]
+    d = o.get("d")
+    if not name or not isinstance(d, dict):
+        return None
+    layers = d.get("layers")
+    if not isinstance(layers, list) or not layers or len(layers) > OVERLAY_MAX_LAYERS:
+        return None
+    if not all(isinstance(x, dict) for x in layers):
+        return None
+    if not _overlay_value_ok(d, OVERLAY_MAX_DEPTH):
+        return None
+    try:
+        if len(json.dumps(d, separators=(",", ":"))) > OVERLAY_MAX_JSON:
+            return None
+    except (TypeError, ValueError):
+        return None
+    return {"n": name, "d": d}
+
+
+def overlay_assets(definition) -> list:
+    """Every ``asset://`` image a definition depends on, deduped, in order.
+
+    These are the pieces that do NOT travel. An uploaded image lives on the
+    SENDER's install; the ref is content-addressed (sha1 of the bytes), so the
+    name identifies exactly which file is missing and a recipient who already
+    has those bytes resolves it for free. Naming them is what lets an import say
+    "this needs two images you do not have" instead of quietly rendering a
+    template with holes in it.
+    """
+    out, seen = [], set()
+
+    def walk(v, depth=OVERLAY_MAX_DEPTH):
+        if isinstance(v, str):
+            if v.startswith("asset://") and v not in seen:
+                seen.add(v)
+                out.append(v)
+        elif depth > 0 and isinstance(v, list):
+            for x in v:
+                walk(x, depth - 1)
+        elif depth > 0 and isinstance(v, dict):
+            for x in v.values():
+                walk(x, depth - 1)
+
+    walk(definition)
+    return out
+
+
 def edit_of(payload) -> str | None:
     """The validated edit-target key from a decoded envelope, or None. An
     edit is a normal envelope whose 'ed' names one of the SENDER's own
@@ -203,3 +303,85 @@ def reply_of(payload) -> dict | None:
     if not u:
         return None
     return {"u": u, "x": x}
+
+
+def np_of(payload) -> dict | None:
+    """The validated Now Playing card metadata from an envelope ({'np': {...}}
+    or decoded dict with 'np'), or None.
+    Carries bounded metadata so receivers can render rich card + actions.
+    """
+    np = (payload or {}).get("np") if isinstance(payload, dict) else None
+    if not isinstance(np, dict):
+        return None
+    t = str(np.get("t") or "").strip()[:200]
+    a = str(np.get("a") or "").strip()[:160]
+    if not t or not a:
+        return None
+    out = {"t": t, "a": a}
+    al = str(np.get("al") or "").strip()[:160]
+    if al:
+        out["al"] = al
+    src = str(np.get("src") or "").strip()[:32]
+    if src:
+        out["src"] = src
+    tid = str(np.get("id") or "").strip()[:120]
+    if tid:
+        out["id"] = tid
+    img = str(np.get("img") or "").strip()[:1000]
+    if img and (img.startswith("https://") or img.startswith("http://") or img.startswith("/api/")):
+        out["img"] = img
+    try:
+        dur = int(np.get("dur") or 0)
+        if 0 < dur < 10**7:
+            out["dur"] = dur
+    except (TypeError, ValueError):
+        pass
+    try:
+        br = int(np.get("br") or 0)
+        if 0 < br < 20000:
+            out["br"] = br
+    except (TypeError, ValueError):
+        pass
+    return out
+
+
+def want_of(payload) -> dict | None:
+    """The validated Wanted / ISO card metadata from an envelope ({'want': {...}}
+    or decoded dict with 'want'), or None.
+    """
+    w = (payload or {}).get("want") if isinstance(payload, dict) else None
+    if not isinstance(w, dict):
+        return None
+    t = str(w.get("t") or "").strip()[:200]
+    a = str(w.get("a") or "").strip()[:160]
+    if not t or not a:
+        return None
+    out = {"t": t, "a": a}
+    ty = str(w.get("ty") or "album").strip().lower()[:16]
+    if ty in ("track", "album", "ep", "single"):
+        out["ty"] = ty
+    else:
+        out["ty"] = "album"
+    al = str(w.get("al") or "").strip()[:160]
+    if al:
+        out["al"] = al
+    src = str(w.get("src") or "").strip()[:32]
+    if src:
+        out["src"] = src
+    wid = str(w.get("id") or "").strip()[:120]
+    if wid:
+        out["id"] = wid
+    img = str(w.get("img") or "").strip()[:1000]
+    if img and (img.startswith("https://") or img.startswith("http://") or img.startswith("/api/")):
+        out["img"] = img
+    y = str(w.get("y") or "").strip()[:10]
+    if y:
+        out["y"] = y
+    try:
+        dur = int(w.get("dur") or 0)
+        if 0 < dur < 10**7:
+            out["dur"] = dur
+    except (TypeError, ValueError):
+        pass
+    return out
+

@@ -1,6 +1,6 @@
 import requests
 import time
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
 import json
 from utils.logging_config import get_logger
@@ -27,6 +27,25 @@ def _as_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _primary_image_url(item_id: Optional[str], item: Dict[str, Any]) -> Optional[str]:
+    """the item's primary image url, or None when jellyfin says it has none.
+
+    jellyfin lists an item's images in ImageTags; an artist without a photo
+    has no 'Primary' entry, and /Items/<id>/Images/Primary answers 404 for
+    it. storing that url anyway (#1253) gave the artist a "photo" that never
+    loads, and every enrichment worker only backfills a photo into an EMPTY
+    thumb_url, so the phantom kept the real one out for good. an item whose
+    dto carries no ImageTags at all (an older server, a lean request) keeps
+    the old behaviour: we can't tell, so we don't guess.
+    """
+    if not item_id:
+        return None
+    tags = item.get('ImageTags')
+    if isinstance(tags, dict) and not tags.get('Primary'):
+        return None
+    return f"/Items/{item_id}/Images/Primary"
 
 
 class JellyfinArtist:
@@ -59,16 +78,17 @@ class JellyfinArtist:
             return None
 
     def _get_artist_image_url(self) -> Optional[str]:
-        """Generate Jellyfin artist image URL"""
-        if not self.ratingKey:
-            return None
-
-        # Jellyfin primary image URL format
-        return f"/Items/{self.ratingKey}/Images/Primary"
+        """Generate Jellyfin artist image URL, or None when the artist has no image."""
+        return _primary_image_url(self.ratingKey, self._data)
     
     def albums(self) -> List['JellyfinAlbum']:
         """Get all albums for this artist"""
         return self._client.get_albums_for_artist(self.ratingKey)
+
+    def albums_verified(self):
+        """(albums, ok): ok is False when the server gave no answer, which
+        albums() folds into an empty list. the deep scan reads this one."""
+        return self._client.get_albums_for_artist_verified(self.ratingKey)
 
 class JellyfinAlbum:
     """Wrapper class to mimic Plex album object interface"""
@@ -88,9 +108,7 @@ class JellyfinAlbum:
 
     def _get_album_image_url(self) -> Optional[str]:
         """Jellyfin/Emby album primary image URL (same shape as the artist one)."""
-        if not self.ratingKey:
-            return None
-        return f"/Items/{self.ratingKey}/Images/Primary"
+        return _primary_image_url(self.ratingKey, self._data)
 
     def _parse_date(self, date_str: Optional[str]) -> Optional[datetime]:
         if not date_str:
@@ -109,6 +127,10 @@ class JellyfinAlbum:
     def tracks(self) -> List['JellyfinTrack']:
         """Get all tracks for this album"""
         return self._client.get_tracks_for_album(self.ratingKey)
+
+    def tracks_verified(self):
+        """(tracks, ok): ok is False when the server gave no answer."""
+        return self._client.get_tracks_for_album_verified(self.ratingKey)
 
 class JellyfinTrack:
     """Wrapper class to mimic Plex track object interface"""
@@ -163,6 +185,24 @@ from core.media_server.contract import MediaServerClient
 
 
 class JellyfinClient(MediaServerClient):
+    # Sent alongside X-Emby-Token on every request.
+    #
+    # X-Emby-Token is the Emby-compatibility header Jellyfin has accepted
+    # for years and newer servers no longer honour (#1232: Jellyfin 12
+    # refuses every request, so the connection test reports nothing more
+    # useful than "check your URL and API key").
+    #
+    # BOTH are sent rather than swapping: a server that wants the old one
+    # ignores an extra Authorization header, and a server that wants the new
+    # one ignores the old. That keeps every 10.x install working untouched.
+    CLIENT_NAME = "SoulSync"
+    DEVICE_NAME = "SoulSync"
+    DEVICE_ID = "soulsync"
+
+    def _auth_header(self) -> str:
+        """The modern Authorization value Jellyfin expects."""
+        return jellyfin_auth_headers(self.api_key)["Authorization"]
+
     def __init__(self):
         self.base_url: Optional[str] = None
         self.api_key: Optional[str] = None
@@ -170,6 +210,9 @@ class JellyfinClient(MediaServerClient):
         self.music_library_id: Optional[str] = None
         self._connection_attempted = False
         self._is_connecting = False
+        # Why the last request failed, in the server's own words, so the
+        # connection test can say something better than "check your URL".
+        self.last_error: str = ""
         
         # Performance optimization: comprehensive caches
         self._album_cache = {}
@@ -200,15 +243,31 @@ class JellyfinClient(MediaServerClient):
         self.clear_cache()
         logger.info("Jellyfin client config reset — will reconnect with new settings")
 
+    # a failed connection attempt used to latch: after the first try,
+    # ensure_connection only ever reported what that try left behind, so a
+    # jellyfin that was still starting when soulsync came up, or one blip,
+    # read as disconnected until someone pressed Test in the sidebar (which
+    # calls reload_config). navidrome's client already re-attempts after a
+    # throttle; this is the same rule.
+    _RECONNECT_THROTTLE_S = 20.0
+
     def ensure_connection(self) -> bool:
-        """Ensure connection to Jellyfin server with lazy initialization."""
-        if self._connection_attempted:
-            return self.base_url is not None and self.api_key is not None
-        
+        """Ensure connection to Jellyfin server with lazy initialization.
+
+        connected -> True at once. a failed attempt is retried once the
+        throttle has passed instead of being remembered for good."""
+        if self.base_url is not None and self.api_key is not None:
+            return True
+
         if self._is_connecting:
             return False
-        
+
+        if self._connection_attempted and \
+                (time.monotonic() - getattr(self, '_last_connect_attempt', 0.0)) < self._RECONNECT_THROTTLE_S:
+            return False
+
         self._is_connecting = True
+        self._last_connect_attempt = time.monotonic()
         try:
             self._setup_client()
             return self.base_url is not None and self.api_key is not None
@@ -399,37 +458,46 @@ class JellyfinClient(MediaServerClient):
             logger.error(f"Error setting music library: {e}")
             return False
 
+    # the users list is one request per user (their views) and personal
+    # settings waits on it every open: 15 s on a server with a few users.
+    # the views are asked for in parallel and the answer kept for a while.
+    _USERS_CACHE_TTL_S = 600
+    _USERS_VIEW_WORKERS = 8
+
     def get_available_users(self) -> List[Dict[str, str]]:
         """Get list of users that have music libraries"""
         if not self.ensure_connection():
             return []
+
+        cached = getattr(self, '_users_cache', None)
+        if cached and (time.monotonic() - cached[0]) < self._USERS_CACHE_TTL_S:
+            return list(cached[1])
 
         try:
             users_response = self._make_request('/Users')
             if not users_response:
                 return []
 
-            users_with_music = []
-            for user in users_response:
+            def _has_music(user):
                 candidate_id = user['Id']
                 candidate_name = user.get('Name', 'Unknown')
-
                 try:
                     views_response = self._make_request(f'/Users/{candidate_id}/Views')
-                    if views_response:
-                        for view in views_response.get('Items', []):
-                            collection_type = (view.get('CollectionType') or '').lower()
-                            if collection_type == 'music':
-                                users_with_music.append({
-                                    'id': candidate_id,
-                                    'name': candidate_name
-                                })
-                                break
+                    for view in (views_response or {}).get('Items', []):
+                        if (view.get('CollectionType') or '').lower() == 'music':
+                            return {'id': candidate_id, 'name': candidate_name}
                 except Exception as e:
                     logger.debug(f"Skipping user {candidate_name} during enumeration: {e}")
-                    continue
+                return None
+
+            from concurrent.futures import ThreadPoolExecutor
+            users = [u for u in users_response if u.get('Id')]
+            with ThreadPoolExecutor(max_workers=min(self._USERS_VIEW_WORKERS, max(1, len(users)))) as pool:
+                found = list(pool.map(_has_music, users))
+            users_with_music = [u for u in found if u]
 
             logger.debug(f"Found {len(users_with_music)} users with music libraries")
+            self._users_cache = (time.monotonic(), list(users_with_music))
             return users_with_music
         except Exception as e:
             logger.error(f"Error getting available users: {e}")
@@ -487,7 +555,7 @@ class JellyfinClient(MediaServerClient):
 
         url = f"{self.base_url}{endpoint}"
         headers = {
-            'X-Emby-Token': self.api_key,
+            'X-Emby-Token': self.api_key, 'Authorization': self._auth_header(),
             'Content-Type': 'application/json'
         }
 
@@ -506,7 +574,21 @@ class JellyfinClient(MediaServerClient):
             response = requests.get(url, headers=headers, params=params, timeout=timeout)
             response.raise_for_status()
             return response.json()
+        except requests.exceptions.HTTPError as e:
+            # Keep the status and the server's own words. "Check your URL and
+            # API key" is the same message for a 401, a 404 and a 502, which
+            # is why a Jellyfin 12 rejection looked like a typo (#1232).
+            status = getattr(e.response, 'status_code', '?')
+            detail = ''
+            try:
+                detail = (e.response.text or '')[:200].strip()
+            except Exception:  # noqa: BLE001 - diagnostics must not throw
+                detail = ''
+            self.last_error = f"HTTP {status} from {endpoint}" + (f": {detail}" if detail else "")
+            logger.error(f"Jellyfin API request failed: {self.last_error}")
+            return None
         except requests.exceptions.RequestException as e:
+            self.last_error = f"{type(e).__name__}: {e}"
             logger.error(f"Jellyfin API request failed: {e}")
             return None
         except json.JSONDecodeError as e:
@@ -549,12 +631,22 @@ class JellyfinClient(MediaServerClient):
             # Page in modest chunks so progress is reported every page — a single
             # huge silent request used to trip the 300s no-progress watchdog on
             # slow servers even though it was alive (see bulk_paginate docstring).
+            tracks_outcome: Dict[str, Any] = {}
             all_tracks = paginate_all_items(
                 _fetch_tracks_page,
                 report_progress=self._progress_callback,
                 label="tracks",
                 on_retry_wait=lambda: time.sleep(5),
+                outcome=tracks_outcome,
             )
+            if not tracks_outcome.get('complete', True):
+                # a prefix of the library is not a cache: an album cut in half
+                # by the failure would read as an album with half its tracks,
+                # and the deep scan deletes what it does not see. per-album
+                # fetches are slower and answer for themselves.
+                logger.warning("Jellyfin bulk track fetch was abandoned after %d tracks; not caching it, "
+                               "albums will be fetched one at a time", len(all_tracks))
+                all_tracks = []
 
             # Group tracks by album ID for instant lookup
             self._track_cache = {}
@@ -586,12 +678,20 @@ class JellyfinClient(MediaServerClient):
                 response = self._make_request(f'/Users/{self.user_id}/Items', params)
                 return response.get('Items', []) if response else None  # None = failed page
 
+            albums_outcome: Dict[str, Any] = {}
             all_albums = paginate_all_items(
                 _fetch_albums_page,
                 report_progress=self._progress_callback,
                 label="albums",
                 on_retry_wait=lambda: time.sleep(5),
+                outcome=albums_outcome,
             )
+            if not albums_outcome.get('complete', True):
+                # same rule: an artist whose later albums fell past the failure
+                # would read as an artist missing those albums
+                logger.warning("Jellyfin bulk album fetch was abandoned after %d albums; not caching it, "
+                               "artists will be fetched one at a time", len(all_albums))
+                all_albums = []
 
             # Group albums by artist ID for instant lookup
             self._album_cache = {}
@@ -673,7 +773,10 @@ class JellyfinClient(MediaServerClient):
     
     def is_connected(self) -> bool:
         """Check if connected to Jellyfin server"""
-        if not self._connection_attempted:
+        # not connected -> let ensure_connection decide whether it is time to
+        # try again (it throttles). it used to ask only when NO attempt had
+        # been made, so a failed first attempt was never retried from here
+        if self.base_url is None or self.api_key is None:
             if not self._is_connecting:
                 self.ensure_connection()
         return (self.base_url is not None and 
@@ -681,6 +784,10 @@ class JellyfinClient(MediaServerClient):
                 self.user_id is not None and 
                 self.music_library_id is not None)
     
+    def as_user(self, user_id: str, library_id: Optional[str] = None) -> 'JellyfinUserView':
+        """this client, acting as one jellyfin user (see JellyfinUserView)."""
+        return JellyfinUserView(self, user_id, library_id)
+
     def get_all_artists(self) -> List[JellyfinArtist]:
         """Get all artists from the music library - matches Plex interface"""
         # last_fetch_failed lets callers tell "library is genuinely empty"
@@ -746,6 +853,36 @@ class JellyfinClient(MediaServerClient):
             logger.error(f"Error getting artist IDs from Jellyfin: {e}")
             return set()
 
+    def get_artist_ids_without_image(self) -> Optional[set]:
+        """ids of album artists the server has no primary image for, or None
+        when the answer can't be trusted (not connected, request failed).
+
+        the phantom-url sweep (#1253) runs on this after every scan. one
+        request, the same lightweight AlbumArtists call removal detection
+        makes; ImageTags rides along in the dto by default.
+        """
+        if not self.ensure_connection() or not self.music_library_id:
+            return None
+        try:
+            params = {
+                'ParentId': self.music_library_id,
+                'Recursive': True,
+                'Fields': '',
+                'EnableTotalRecordCount': False
+            }
+            response = self._make_request('/Artists/AlbumArtists', params)
+            if not response:
+                return None
+            without = set()
+            for item in response.get('Items', []):
+                item_id = item.get('Id')
+                if item_id and _primary_image_url(item_id, item) is None:
+                    without.add(item_id)
+            return without
+        except Exception as e:
+            logger.error(f"Error getting artist image tags from Jellyfin: {e}")
+            return None
+
     def get_all_album_ids(self) -> set:
         """Get all album IDs from Jellyfin (lightweight, paginated, for removal detection).
         Does NOT trigger _populate_aggressive_cache()."""
@@ -783,82 +920,123 @@ class JellyfinClient(MediaServerClient):
             logger.error(f"Error getting album IDs from Jellyfin: {e}")
             return set()
 
+    # page size for the per-artist / per-album listings. these used to be a
+    # single request with Limit 200 / 100 and no second page, so a Various
+    # Artists with 300 albums, or a box set with 120 tracks, listed short and
+    # the deep scan deleted the rest as stale.
+    _ITEM_PAGE_SIZE = 200
+
+    def _fetch_all_items(self, params: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+        """every item for a /Users/<id>/Items query, paged until the server
+        says it is done. None when any page got no answer: a prefix is not a
+        listing."""
+        items: List[Dict[str, Any]] = []
+        start = 0
+        limit = self._ITEM_PAGE_SIZE
+        while True:
+            page_params = dict(params)
+            page_params['StartIndex'] = start
+            page_params['Limit'] = limit
+            response = self._make_request(f'/Users/{self.user_id}/Items', page_params)
+            if not response:
+                return None
+            page = response.get('Items', []) or []
+            items.extend(page)
+            total = response.get('TotalRecordCount')
+            if len(page) < limit:
+                break
+            if isinstance(total, int) and len(items) >= total:
+                break
+            start += limit
+        return items
+
     def get_albums_for_artist(self, artist_id: str) -> List[JellyfinAlbum]:
         """Get all albums for a specific artist"""
+        return self.get_albums_for_artist_verified(artist_id)[0]
+
+    def get_albums_for_artist_verified(self, artist_id: str) -> Tuple[List[JellyfinAlbum], bool]:
+        """(albums, ok). ok is False when the request got no usable answer:
+        not connected, a page failed, an exception. an empty list with ok
+        True is an artist with no albums. the deep scan must tell the two
+        apart, it deletes what it does not see."""
+        from core.library_scope import native_jellyfin_artist_id
+        artist_id = native_jellyfin_artist_id(artist_id)
         # Use cache if available
         if artist_id in self._album_cache:
-            return self._album_cache[artist_id]
-            
+            return self._album_cache[artist_id], True
+
         if not self.ensure_connection():
-            return []
-            
+            return [], False
+
         try:
-            # Use smaller, faster API call
             params = {
                 'ArtistIds': artist_id,
                 'IncludeItemTypes': 'MusicAlbum',
                 'Recursive': True,
                 'SortBy': 'ProductionYear,SortName',
                 'SortOrder': 'Ascending',
-                'Limit': 200  # Reasonable limit for most artists
             }
-            
-            response = self._make_request(f'/Users/{self.user_id}/Items', params)
-            if not response:
-                return []
-            
-            albums = []
-            for item in response.get('Items', []):
-                albums.append(JellyfinAlbum(item, self))
-            
+            # an artist is one item across every library on the server, so
+            # without the library this answered with their albums from all
+            # of them: a second music library's albums (a profile's own,
+            # #1199) landed in the shared scan through this fallback
+            if self.music_library_id:
+                params['ParentId'] = self.music_library_id
+            items = self._fetch_all_items(params)
+            if items is None:
+                return [], False
+
+            albums = [JellyfinAlbum(item, self) for item in items]
+
             # Cache the result
             self._album_cache[artist_id] = albums
-            
-            return albums
-            
+
+            return albums, True
+
         except Exception as e:
             logger.error(f"Error getting albums for artist {artist_id}: {e}")
-            return []
-    
+            return [], False
+
     def get_tracks_for_album(self, album_id: str) -> List[JellyfinTrack]:
         """Get all tracks for a specific album"""
+        return self.get_tracks_for_album_verified(album_id)[0]
+
+    def get_tracks_for_album_verified(self, album_id: str) -> Tuple[List[JellyfinTrack], bool]:
+        """(tracks, ok). same contract as get_albums_for_artist_verified."""
         # Use cache if available
         if album_id in self._track_cache:
-            return self._track_cache[album_id]
-            
+            return self._track_cache[album_id], True
+
         if not self.ensure_connection():
-            return []
-            
+            return [], False
+
         try:
-            # Most albums have < 30 tracks, so this is reasonable
             params = {
                 'ParentId': album_id,
                 'IncludeItemTypes': 'Audio',
                 'Fields': 'Path,MediaSources',
                 'SortBy': 'IndexNumber',
                 'SortOrder': 'Ascending',
-                'Limit': 100  # Most albums won't hit this limit
             }
-            
-            response = self._make_request(f'/Users/{self.user_id}/Items', params)
-            if not response:
-                return []
-            
-            tracks = []
-            for item in response.get('Items', []):
-                tracks.append(JellyfinTrack(item, self))
-            
+            items = self._fetch_all_items(params)
+            if items is None:
+                return [], False
+
+            tracks = [JellyfinTrack(item, self) for item in items]
+
             # Cache the result
             self._track_cache[album_id] = tracks
-            
-            return tracks
-            
+
+            return tracks, True
+
         except Exception as e:
             logger.error(f"Error getting tracks for album {album_id}: {e}")
-            return []
+            return [], False
     
     def get_artist_by_id(self, artist_id: str) -> Optional[JellyfinArtist]:
         """Get a specific artist by ID"""
+        from core.library_scope import native_jellyfin_artist_id
+        artist_id = native_jellyfin_artist_id(artist_id)
         # Check cache first
         if artist_id in self._artist_cache:
             return self._artist_cache[artist_id]
@@ -1233,6 +1411,7 @@ class JellyfinClient(MediaServerClient):
 
     def clear_cache(self):
         """Clear all caches to force fresh data on next request"""
+        self._users_cache = None
         self._album_cache.clear()
         self._track_cache.clear()
         self._artist_cache.clear()
@@ -1307,7 +1486,7 @@ class JellyfinClient(MediaServerClient):
         try:
             import requests
             url = f"{self.base_url}/Items/{playlist_id}"
-            response = requests.delete(url, headers={'X-Emby-Token': self.api_key}, timeout=10)
+            response = requests.delete(url, headers={'X-Emby-Token': self.api_key, 'Authorization': self._auth_header()}, timeout=10)
             if response.status_code in [200, 204]:
                 logger.info(f"Deleted Jellyfin playlist {playlist_id}")
                 return True
@@ -1359,7 +1538,7 @@ class JellyfinClient(MediaServerClient):
             import requests
             url = f"{self.base_url}/Playlists"
             headers = {
-                'X-Emby-Token': self.api_key,
+                'X-Emby-Token': self.api_key, 'Authorization': self._auth_header(),
                 'Content-Type': 'application/json'
             }
             data = {
@@ -1423,7 +1602,7 @@ class JellyfinClient(MediaServerClient):
             # Step 1: Create empty playlist
             url = f"{self.base_url}/Playlists"
             headers = {
-                'X-Emby-Token': self.api_key,
+                'X-Emby-Token': self.api_key, 'Authorization': self._auth_header(),
                 'Content-Type': 'application/json'
             }
             # Don't include 'Ids' field for empty playlist - Emby doesn't handle empty arrays
@@ -1477,7 +1656,7 @@ class JellyfinClient(MediaServerClient):
                     'UserId': self.user_id
                 }
 
-                add_response = requests.post(add_url, params=add_params, headers={'X-Emby-Token': self.api_key}, timeout=30)
+                add_response = requests.post(add_url, params=add_params, headers={'X-Emby-Token': self.api_key, 'Authorization': self._auth_header()}, timeout=30)
 
                 if add_response.status_code not in [200, 204]:
                     logger.error(f"Failed to add batch {batch_num} to playlist '{name}': HTTP {add_response.status_code}")
@@ -1521,7 +1700,7 @@ class JellyfinClient(MediaServerClient):
                 if target_playlist:
                     import requests
                     url = f"{self.base_url}/Items/{target_playlist.id}"
-                    headers = {'X-Emby-Token': self.api_key}
+                    headers = {'X-Emby-Token': self.api_key, 'Authorization': self._auth_header()}
                     
                     response = requests.delete(url, headers=headers, timeout=10)
                     if response.status_code in [200, 204]:
@@ -1605,7 +1784,7 @@ class JellyfinClient(MediaServerClient):
                 upload_url = f"{self.base_url}/Items/{playlist_id}/Images/Primary"
                 upload_resp = _req.post(
                     upload_url,
-                    headers={'X-Emby-Token': self.api_key, 'Content-Type': content_type},
+                    headers={'X-Emby-Token': self.api_key, 'Authorization': self._auth_header(), 'Content-Type': content_type},
                     data=img_resp.content,
                     timeout=15
                 )
@@ -1690,7 +1869,7 @@ class JellyfinClient(MediaServerClient):
                 add_params = {'Ids': ','.join(batch), 'UserId': self.user_id}
                 resp = requests.post(
                     add_url, params=add_params,
-                    headers={'X-Emby-Token': self.api_key}, timeout=30,
+                    headers={'X-Emby-Token': self.api_key, 'Authorization': self._auth_header()}, timeout=30,
                 )
                 if resp.status_code in (200, 204):
                     total_added += len(batch)
@@ -1747,7 +1926,7 @@ class JellyfinClient(MediaServerClient):
                     desired_ids.append(tid)
 
             plan = plan_playlist_reconcile(current_ids, desired_ids)
-            hdr = {'X-Emby-Token': self.api_key}
+            hdr = {'X-Emby-Token': self.api_key, 'Authorization': self._auth_header()}
 
             if plan['add']:
                 for i in range(0, len(plan['add']), 100):
@@ -1838,7 +2017,7 @@ class JellyfinClient(MediaServerClient):
                 return False
 
             old_eids = [eid for _tid, eid in entries if eid]
-            hdr = {'X-Emby-Token': self.api_key}
+            hdr = {'X-Emby-Token': self.api_key, 'Authorization': self._auth_header()}
 
             # 1) Append the desired ids in order (new entries; existing copies stay
             #    for now — Jellyfin playlists allow duplicates).
@@ -1897,7 +2076,7 @@ class JellyfinClient(MediaServerClient):
                 import requests
                 url = f"{self.base_url}/Items/{existing_playlist.id}"
                 headers = {
-                    'X-Emby-Token': self.api_key
+                    'X-Emby-Token': self.api_key, 'Authorization': self._auth_header()
                 }
                 
                 response = requests.delete(url, headers=headers, timeout=10)
@@ -1944,7 +2123,7 @@ class JellyfinClient(MediaServerClient):
             import requests
             url = f"{self.base_url}/Items/{target_library_id}/Refresh"
             headers = {
-                'X-Emby-Token': self.api_key,
+                'X-Emby-Token': self.api_key, 'Authorization': self._auth_header(),
                 'Content-Type': 'application/json'
             }
             params = {
@@ -2024,7 +2203,7 @@ class JellyfinClient(MediaServerClient):
             url = f"{self.base_url}/Items/{artist_id}/Images/Primary/0"
 
             headers = {
-                'X-Emby-Token': self.api_key,
+                'X-Emby-Token': self.api_key, 'Authorization': self._auth_header(),
                 'Content-Type': 'image/jpeg'
             }
 
@@ -2055,7 +2234,7 @@ class JellyfinClient(MediaServerClient):
             
             url = f"{self.base_url}/Items/{album_id}/Images/Primary"
             headers = {
-                'X-Emby-Token': self.api_key
+                'X-Emby-Token': self.api_key, 'Authorization': self._auth_header()
             }
             
             # Try multiple approaches to find what works with Jellyfin
@@ -2073,7 +2252,7 @@ class JellyfinClient(MediaServerClient):
             # Method 2: Try with raw data and proper content-type
             try:
                 headers_raw = {
-                    'X-Emby-Token': self.api_key,
+                    'X-Emby-Token': self.api_key, 'Authorization': self._auth_header(),
                     'Content-Type': 'image/jpeg'
                 }
                 response = requests.post(url, data=image_data, headers=headers_raw, timeout=30)
@@ -2157,3 +2336,69 @@ class JellyfinClient(MediaServerClient):
         except Exception as e:
             logger.error(f"Error setting metadata-only mode: {e}")
             return False
+
+
+def jellyfin_auth_headers(api_key) -> dict:
+    """both auth headers jellyfin accepts, for code that talks to the server with
+    bare requests instead of a JellyfinClient (video side, server activity).
+    the #1232 fix only reached the client; every hand-rolled header dict still
+    sent x-emby-token alone and jellyfin 12 answered 401 (#1250). always build
+    headers here so a new call site can't miss one."""
+    token = api_key or ""
+    return {
+        "X-Emby-Token": token,
+        "Authorization": (
+            f'MediaBrowser Client="{JellyfinClient.CLIENT_NAME}", '
+            f'Device="{JellyfinClient.DEVICE_NAME}", '
+            f'DeviceId="{JellyfinClient.DEVICE_ID}", '
+            f'Version="1.0.0", '
+            f'Token="{token}"'
+        ),
+    }
+
+
+class JellyfinUserView(JellyfinClient):
+    """the shared JellyfinClient, acting as one jellyfin user.
+
+    the api key authenticates every call and the user is a parameter
+    (UserId on playlist creation, /Users/<id>/ on reads), so acting as a
+    user means using their id. the sync used to do that by assigning
+    client.user_id on the one shared client, which made every other caller
+    that user too until the next sync overwrote it (#1265). this is a
+    subclass whose user_id (and optionally music library) is its own and
+    whose every other attribute is read from the wrapped client, so every
+    method runs unchanged on it and nothing on the shared client changes.
+    """
+
+    def __init__(self, client: JellyfinClient, user_id: str, library_id: Optional[str] = None):
+        object.__setattr__(self, '_base_client', client)
+        object.__setattr__(self, '_view_user_id', str(user_id) if user_id else None)
+        object.__setattr__(self, '_view_library_id', str(library_id) if library_id else None)
+
+    def __getattr__(self, name):
+        # only reached when the view itself has no such attribute
+        return getattr(object.__getattribute__(self, '_base_client'), name)
+
+    @property
+    def acting_as(self) -> Optional[str]:
+        return self._view_user_id
+
+    @property
+    def user_id(self):
+        return self._view_user_id or object.__getattribute__(self, '_base_client').user_id
+
+    @property
+    def music_library_id(self):
+        return self._view_library_id or object.__getattribute__(self, '_base_client').music_library_id
+
+    def ensure_connection(self) -> bool:
+        # the connection (url, api key, default user) belongs to the shared
+        # client; a reconnect must set it up there, not on this view
+        return object.__getattribute__(self, '_base_client').ensure_connection()
+
+    def clear_cache(self):
+        object.__getattribute__(self, '_base_client').clear_cache()
+
+    def reload_config(self):
+        object.__getattribute__(self, '_base_client').reload_config()
+

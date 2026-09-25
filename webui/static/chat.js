@@ -18,6 +18,7 @@
         rooms: [],               // joined rooms rail [{name, home}]
         canManage: false,        // admin: may join/leave rooms
         canSend: false,
+        connectionError: null,
         configured: null,        // null = unknown yet
         timer: null,
         lastStamp: null,         // newest message timestamp we've rendered
@@ -28,13 +29,14 @@
                                  // state.msgs: that is the ROOM store and a
                                  // DM would read the room's leftovers.
         started: false,
-        ssOnly: false,           // room filter: show only SoulSync-app messages
+        ssOnly: false,           // room filter AND send format: see + speak SoulSync
         protocolLog: [],         // recent machine-coordination events (bounded)
         beaconed: {},            // rooms we've announced ourselves in this session
         isAdmin: false,          // shows the settings cog (from /status)
         newMarker: null,         // frozen last-seen ts for the NEW divider (per room open)
         renderedCount: 0,        // for the new-messages pill delta
         msgs: [],                // room message store: archive pages + live tail (merged)
+        pmMsgs: [],              // active PM conversation store (messages + pending outgoing)
         loadingOlder: false,     // scrollback fetch in flight
         historyDone: false,      // no more archive pages
         selfName: '',            // our slskd username (@mention highlighting)
@@ -75,7 +77,7 @@
         typingTimer: null,       // pending expiry repaint
         pinsOpen: false,         // pin board expanded
         topicEditing: false,     // head shows the topic input (renderHead pauses)
-        pollDismissedAt: null,   // locally-dismissed closed poll (its start ts)
+        pollDismissals: Object.create(null), // fallback when browser storage is unavailable
         trivDismissedAt: null,   // locally-dismissed closed trivia (its ask ts)
         arcade: null,            // {game, sel, promo, flip} when the Arcade view is open
         watch: {                 // movie night (reduced from watch.* on the bus)
@@ -130,20 +132,409 @@
     // EVERYTHING here is remote input wearing a costume: escape FIRST, then
     // apply formatting to the escaped text. Code spans and URLs are pulled out
     // into \u0000-sentinel placeholders before markdown so their contents stay literal.
-    var EMOJI = {
-        smile: '😄', grin: '😁', joy: '😂', wink: '😉', cry: '😢', sob: '😭',
-        heart: '❤️', broken_heart: '💔', fire: '🔥', tada: '🎉', rocket: '🚀',
-        thumbsup: '👍', thumbsdown: '👎', clap: '👏', wave: '👋', pray: '🙏',
-        eyes: '👀', thinking: '🤔', shrug: '🤷', facepalm: '🤦', skull: '💀',
-        notes: '🎵', musical_note: '🎶', headphones: '🎧', guitar: '🎸', cd: '💿',
-        vinyl: '📀', mic: '🎤', speaker: '🔊', movie: '🎬', tv: '📺',
-        popcorn: '🍿', star: '⭐', sparkles: '✨', zap: '⚡', boom: '💥',
-        check: '✅', x: '❌', warning: '⚠️', question: '❓', exclamation: '❗',
-        wave_hand: '👋', beers: '🍻', coffee: '☕', pizza: '🍕', cake: '🎂',
-        sunglasses: '😎', robot: '🤖', ghost: '👻', alien: '👽', crown: '👑',
-        gem: '💎', money: '🤑', hundred: '💯', point_up: '☝️', muscle: '💪',
-        rofl: '🤣', melting: '🫠', salute: '🫡', handshake: '🤝', brain: '🧠',
+    // ── Emoji shortcode map (categorized for the picker) ────────────────
+    // EMOJI_CATS drives the tabbed picker; EMOJI is the flat lookup used by
+    // the :shortcode: renderer — both are built from the same source array.
+    var _EMOJI_DATA = [
+        // ── Smileys & People ──
+        ['smileys', '😀', [
+            ['smile',         '😄'], ['grin',          '😁'], ['joy',           '😂'],
+            ['rofl',          '🤣'], ['wink',          '😉'], ['blush',         '😊'],
+            ['innocent',      '😇'], ['heart_eyes',    '😍'], ['star_struck',   '🤩'],
+            ['kissing_heart', '😘'], ['kissing',       '😗'], ['yum',           '😋'],
+            ['stuck_out_tongue','😛'],['stuck_out_tongue_wink','😜'],['zany',   '🤪'],
+            ['raised_eyebrow','🤨'], ['monocle',       '🧐'], ['nerd',          '🤓'],
+            ['sunglasses',    '😎'], ['disguised',     '🥸'], ['partying',      '🥳'],
+            ['smirk',         '😏'], ['unamused',      '😒'], ['disappointed',  '😞'],
+            ['worried',       '😟'], ['angry',         '😠'], ['rage',          '🤬'],
+            ['cry',           '😢'], ['sob',           '😭'], ['scream',        '😱'],
+            ['flushed',       '😳'], ['pleading',      '🥺'], ['melting',       '🫠'],
+            ['cold_face',     '🥶'], ['hot_face',      '🥵'], ['nauseated',     '🤢'],
+            ['mind_blown',    '🤯'], ['sleeping',      '😴'], ['drool',         '🤤'],
+            ['thinking',      '🤔'], ['shush',         '🤫'], ['zipper_mouth',  '🤐'],
+            ['peeking',       '🫣'], ['salute',        '🫡'], ['dotted_face',   '🫥'],
+            ['skull',         '💀'], ['clown',         '🤡'], ['ghost',         '👻'],
+            ['alien',         '👽'], ['robot',         '🤖'], ['poop',          '💩'],
+            ['money',         '🤑'], ['cowboy',        '🤠'], ['rolling_eyes',  '🙄'],
+            ['grimace',       '😬'], ['relieved',      '😌'], ['shrug',         '🤷'],
+            ['facepalm',      '🤦'], ['hugs',          '🤗'], ['pensive',       '😔'],
+            ['confused',      '😕'], ['upside_down',   '🙃'], ['moai',          '🗿'],
+        ]],
+        // ── Gestures & Body ──
+        ['gestures', '👋', [
+            ['thumbsup',      '👍'], ['thumbsdown',    '👎'], ['clap',          '👏'],
+            ['wave',          '👋'], ['wave_hand',     '👋'], ['pray',          '🙏'],
+            ['handshake',     '🤝'], ['point_up',      '☝️'], ['point_right',   '👉'],
+            ['point_left',    '👈'], ['point_down',    '👇'], ['ok_hand',       '👌'],
+            ['pinch',         '🤌'], ['v',             '✌️'], ['love_you',      '🤟'],
+            ['metal',         '🤘'], ['call_me',       '🤙'], ['crossed',       '🤞'],
+            ['muscle',        '💪'], ['brain',         '🧠'], ['eyes',          '👀'],
+            ['eye',           '👁️'], ['tongue',        '👅'], ['lips',          '👄'],
+            ['palms_up',      '🫴'], ['heart_hands',   '🫶'], ['middle_finger', '🖕'],
+            ['raised_fist',   '✊'], ['fist',          '👊'], ['palm',          '🤚'],
+            ['pinching',      '🤏'], ['writing',       '✍️'], ['nail_polish',   '💅'],
+        ]],
+        // ── Hearts & Emotion ──
+        ['hearts', '❤️', [
+            ['heart',         '❤️'], ['orange_heart',  '🧡'], ['yellow_heart',  '💛'],
+            ['green_heart',   '💚'], ['blue_heart',    '💙'], ['purple_heart',  '💜'],
+            ['black_heart',   '🖤'], ['white_heart',   '🤍'], ['brown_heart',   '🤎'],
+            ['pink_heart',    '🩷'], ['broken_heart',  '💔'], ['heart_fire',    '❤️‍🔥'],
+            ['heart_exclamation','❣️'],['two_hearts',  '💕'], ['revolving_hearts','💞'],
+            ['heartbeat',     '💓'], ['heartpulse',    '💗'], ['sparkling_heart','💖'],
+            ['cupid',         '💘'], ['gift_heart',    '💝'], ['heart_decoration','💟'],
+            ['kiss_mark',     '💋'], ['hundred',       '💯'], ['anger',         '💢'],
+            ['boom',          '💥'], ['dizzy',         '💫'], ['sweat_drops',   '💦'],
+            ['fire',          '🔥'], ['sparkles',      '✨'], ['star',          '⭐'],
+            ['glowing_star',  '🌟'], ['shooting_star', '🌠'],
+        ]],
+        // ── Music & Media ──
+        ['music', '🎵', [
+            ['notes',         '🎵'], ['musical_note',  '🎶'], ['headphones',    '🎧'],
+            ['guitar',        '🎸'], ['cd',            '💿'], ['vinyl',         '📀'],
+            ['mic',           '🎤'], ['speaker',       '🔊'], ['mute',          '🔇'],
+            ['studio_mic',    '🎙️'], ['radio',         '📻'], ['saxophone',     '🎷'],
+            ['accordion',     '🪗'], ['drum',          '🥁'], ['piano',         '🎹'],
+            ['trumpet',       '🎺'], ['violin',        '🎻'], ['banjo',         '🪕'],
+            ['maracas',       '🪇'], ['long_drum',     '🪘'], ['movie',         '🎬'],
+            ['tv',            '📺'], ['camera',        '📷'], ['video_camera',  '📹'],
+            ['clapper',       '🎬'], ['film',          '🎞️'], ['projector',     '📽️'],
+            ['popcorn',       '🍿'], ['ticket',        '🎫'], ['loudly_crying', '📢'],
+            ['bell',          '🔔'], ['mega',          '📣'],
+        ]],
+        // ── Animals & Nature ──
+        ['nature', '🌿', [
+            ['dog',           '🐶'], ['cat',           '🐱'], ['fox',           '🦊'],
+            ['wolf',          '🐺'], ['bear',          '🐻'], ['panda',         '🐼'],
+            ['koala',         '🐨'], ['tiger',         '🐯'], ['lion',          '🦁'],
+            ['unicorn',       '🦄'], ['horse',         '🐴'], ['cow',           '🐮'],
+            ['pig',           '🐷'], ['frog',          '🐸'], ['monkey',        '🐵'],
+            ['chicken',       '🐔'], ['penguin',       '🐧'], ['bird',          '🐦'],
+            ['eagle',         '🦅'], ['bat',           '🦇'], ['owl',           '🦉'],
+            ['butterfly',     '🦋'], ['bee',           '🐝'], ['ladybug',       '🐞'],
+            ['snake',         '🐍'], ['octopus',       '🐙'], ['whale',         '🐋'],
+            ['dolphin',       '🐬'], ['fish',          '🐟'], ['shark',         '🦈'],
+            ['turtle',        '🐢'], ['dragon',        '🐉'], ['cactus',        '🌵'],
+            ['tree',          '🌲'], ['palm_tree',     '🌴'], ['seedling',      '🌱'],
+            ['herb',          '🌿'], ['four_leaf',     '🍀'], ['mushroom',      '🍄'],
+            ['rose',          '🌹'], ['cherry_blossom','🌸'], ['sunflower',     '🌻'],
+            ['rainbow',       '🌈'], ['snowflake',     '❄️'], ['tornado',       '🌪️'],
+            ['ocean',         '🌊'], ['crescent_moon', '🌙'], ['sun',           '☀️'],
+        ]],
+        // ── Food & Drink ──
+        ['food', '🍕', [
+            ['pizza',         '🍕'], ['hamburger',     '🍔'], ['fries',         '🍟'],
+            ['hotdog',        '🌭'], ['taco',          '🌮'], ['burrito',       '🌯'],
+            ['sushi',         '🍣'], ['ramen',         '🍜'], ['spaghetti',     '🍝'],
+            ['rice',          '🍚'], ['curry',         '🍛'], ['bento',         '🍱'],
+            ['egg',           '🥚'], ['pancakes',      '🥞'], ['waffle',        '🧇'],
+            ['bacon',         '🥓'], ['steak',         '🥩'], ['croissant',     '🥐'],
+            ['bread',         '🍞'], ['bagel',         '🥯'], ['pretzel',       '🥨'],
+            ['apple',         '🍎'], ['grapes',        '🍇'], ['watermelon',    '🍉'],
+            ['strawberry',    '🍓'], ['peach',         '🍑'], ['mango',         '🥭'],
+            ['banana',        '🍌'], ['avocado',       '🥑'], ['ice_cream',     '🍦'],
+            ['donut',         '🍩'], ['cookie',        '🍪'], ['cake',          '🎂'],
+            ['chocolate',     '🍫'], ['candy',         '🍬'], ['lollipop',      '🍭'],
+            ['beers',         '🍻'], ['wine',          '🍷'], ['cocktail',      '🍸'],
+            ['champagne',     '🍾'], ['coffee',        '☕'], ['tea',           '🍵'],
+            ['bubble_tea',    '🧋'], ['juice',         '🧃'], ['milk',          '🥛'],
+            ['beer',          '🍺'], ['tropical_drink','🍹'], ['mate',          '🧉'],
+        ]],
+        // ── Activities & Sports ──
+        ['activities', '🎮', [
+            ['trophy',        '🏆'], ['medal',         '🏅'], ['gold_medal',    '🥇'],
+            ['silver_medal',  '🥈'], ['bronze_medal',  '🥉'], ['soccer',        '⚽'],
+            ['basketball',    '🏀'], ['football',      '🏈'], ['baseball',      '⚾'],
+            ['tennis',        '🎾'], ['volleyball',    '🏐'], ['rugby',         '🏉'],
+            ['cricket',       '🏏'], ['golf',          '⛳'], ['ping_pong',     '🏓'],
+            ['badminton',     '🏸'], ['boxing',        '🥊'], ['skateboard',    '🛹'],
+            ['surfing',       '🏄'], ['swimming',      '🏊'], ['biking',        '🚴'],
+            ['running',       '🏃'], ['yoga',          '🧘'], ['climbing',      '🧗'],
+            ['video_game',    '🎮'], ['joystick',      '🕹️'], ['dice',          '🎲'],
+            ['puzzle',        '🧩'], ['chess',         '♟️'], ['dart',          '🎯'],
+            ['bowling',       '🎳'], ['billiards',     '🎱'], ['slot_machine',  '🎰'],
+            ['fishing',       '🎣'], ['kite',          '🪁'],
+        ]],
+        // ── Objects & Tools ──
+        ['objects', '💡', [
+            ['bulb',          '💡'], ['flashlight',    '🔦'], ['candle',        '🕯️'],
+            ['gem',           '💎'], ['crown',         '👑'], ['ring',          '💍'],
+            ['money_bag',     '💰'], ['dollar',        '💵'], ['credit_card',   '💳'],
+            ['chart',         '📈'], ['chart_down',    '📉'], ['calendar',      '📅'],
+            ['clipboard',     '📋'], ['pushpin',       '📌'], ['paperclip',     '📎'],
+            ['scissors',      '✂️'], ['lock',          '🔒'], ['unlock',        '🔓'],
+            ['key',           '🔑'], ['hammer',        '🔨'], ['wrench',        '🔧'],
+            ['gear',          '⚙️'], ['magnet',        '🧲'], ['link',          '🔗'],
+            ['battery',       '🔋'], ['plug',          '🔌'], ['computer',      '💻'],
+            ['phone',         '📱'], ['hourglass',     '⏳'], ['alarm',         '⏰'],
+            ['bomb',          '💣'], ['knife',         '🔪'], ['shield',        '🛡️'],
+            ['label',         '🏷️'], ['bookmark',      '🔖'], ['package',       '📦'],
+            ['mailbox',       '📫'], ['envelope',      '✉️'], ['scroll',        '📜'],
+            ['book',          '📖'], ['telescope',     '🔭'], ['microscope',    '🔬'],
+            ['pill',          '💊'], ['dna',           '🧬'], ['test_tube',     '🧪'],
+        ]],
+        // ── Symbols ──
+        ['symbols', '✅', [
+            ['check',         '✅'], ['x',             '❌'], ['warning',       '⚠️'],
+            ['question',      '❓'], ['exclamation',   '❗'], ['no_entry',      '⛔'],
+            ['prohibited',    '🚫'], ['recycle',       '♻️'], ['infinity',      '♾️'],
+            ['plus',          '➕'], ['minus',         '➖'], ['multiply',      '✖️'],
+            ['equals',        '🟰'], ['arrow_right',   '➡️'], ['arrow_left',    '⬅️'],
+            ['arrow_up',      '⬆️'], ['arrow_down',    '⬇️'], ['refresh',       '🔄'],
+            ['new',           '🆕'], ['free',          '🆓'], ['cool',          '🆒'],
+            ['sos',           '🆘'], ['atm',           '🏧'], ['no_sound',      '🔇'],
+            ['tada',          '🎉'], ['confetti',      '🎊'], ['balloon',       '🎈'],
+            ['ribbon',        '🎀'], ['gift',          '🎁'], ['trophy_sym',    '🏆'],
+            ['rocket',        '🚀'], ['airplane',      '✈️'], ['satellite',     '🛰️'],
+            ['ufo',           '🛸'], ['anchor',        '⚓'], ['fuel',          '⛽'],
+            ['stopwatch',     '⏱️'], ['timer_clock',   '⏲️'], ['world_map',     '🗺️'],
+            ['flag_white',    '🏳️'], ['flag_black',    '🏴'], ['pirate_flag',   '🏴‍☠️'],
+            ['checkered_flag','🏁'], ['rainbow_flag',  '🏳️‍🌈'],['zap',          '⚡'],
+        ]],
+    ];
+    // Build the flat lookup from the categorized source.
+    var EMOJI = {};
+    var EMOJI_CATS = [];
+    var EMOJI_CAT_TITLES = {
+        'animated': '✨ Animated (SoulSync)',
+        'smileys': '😀 Smileys & Emotion',
+        'animals': '🐶 Animals & Nature',
+        'food': '🍔 Food & Drink',
+        'activities': '⚽ Activities',
+        'travel': '🚀 Travel & Places',
+        'objects': '💡 Objects',
+        'symbols': '🔣 Symbols',
+        'flags': '🚩 Flags'
     };
+    _EMOJI_DATA.forEach(function (cat) {
+        var slug = cat[0], icon = cat[1], entries = cat[2];
+        var names = [];
+        entries.forEach(function (pair) { EMOJI[pair[0]] = pair[1]; names.push(pair[0]); });
+        EMOJI_CATS.push({ slug: slug, icon: icon, title: EMOJI_CAT_TITLES[slug] || slug, names: names });
+    });
+
+    // ── Animated Emojis (Google Fonts Noto Animated WebP CDN) ────────────────
+    // High-fps, looped WebP animated emojis for best-in-class chat experience.
+    var ANIMATED_EMOJI = {
+        'a_fire':         { cp: '1f525',                 u: '🔥',   name: 'fire' },
+        'a_party':        { cp: '1f973',                 u: '🥳',   name: 'party' },
+        'a_tada':         { cp: '1f389',                 u: '🎉',   name: 'tada' },
+        'a_joy':          { cp: '1f602',                 u: '😂',   name: 'joy' },
+        'a_rofl':         { cp: '1f923',                 u: '🤣',   name: 'rofl' },
+        'a_heart':        { cp: '2764_fe0f',             u: '❤️',   name: 'heart' },
+        'a_heart_fire':   { cp: '2764_fe0f_200d_1f525',   u: '❤️‍🔥',  name: 'heart_fire' },
+        'a_heart_eyes':   { cp: '1f60d',                 u: '😍',   name: 'heart_eyes' },
+        'a_sparkles':     { cp: '2728',                  u: '✨',   name: 'sparkles' },
+        'a_star':         { cp: '2b50',                  u: '⭐',   name: 'star' },
+        'a_skull':        { cp: '1f480',                 u: '💀',   name: 'skull' },
+        'a_rocket':       { cp: '1f680',                 u: '🚀',   name: 'rocket' },
+        'a_hundred':      { cp: '1f4af',                 u: '💯',   name: 'hundred' },
+        'a_thumbsup':     { cp: '1f44d',                 u: '👍',   name: 'thumbsup' },
+        'a_clap':         { cp: '1f44f',                 u: '👏',   name: 'clap' },
+        'a_wave':         { cp: '1f44b',                 u: '👋',   name: 'wave' },
+        'a_sunglasses':   { cp: '1f60e',                 u: '😎',   name: 'sunglasses' },
+        'a_mindblown':    { cp: '1f92f',                 u: '🤯',   name: 'mindblown' },
+        'a_sob':          { cp: '1f62d',                 u: '😭',   name: 'sob' },
+        'a_melting':      { cp: '1fae0',                 u: '🫠',   name: 'melting' },
+        'a_thinking':     { cp: '1f914',                 u: '🤔',   name: 'thinking' },
+        'a_pleading':     { cp: '1f97a',                 u: '🥺',   name: 'pleading' },
+        'a_scream':       { cp: '1f631',                 u: '😱',   name: 'scream' },
+        'a_nerd':         { cp: '1f913',                 u: '🤓',   name: 'nerd' },
+        'a_monocle':      { cp: '1f9d0',                 u: '🧐',   name: 'monocle' },
+        'a_hot':          { cp: '1f975',                 u: '🥵',   name: 'hot' },
+        'a_cold':         { cp: '1f976',                 u: '🥶',   name: 'cold' },
+        'a_salute':       { cp: '1fae1',                 u: '🫡',   name: 'salute' },
+        'a_money':        { cp: '1f911',                 u: '🤑',   name: 'money' },
+        'a_ghost':        { cp: '1f47b',                 u: '👻',   name: 'ghost' },
+        'a_alien':        { cp: '1f47d',                 u: '👽',   name: 'alien' },
+        'a_robot':        { cp: '1f916',                 u: '🤖',   name: 'robot' },
+        'a_poop':         { cp: '1f4a9',                 u: '💩',   name: 'poop' },
+        'a_check':        { cp: '2705',                  u: '✅',   name: 'check' },
+        'a_boom':         { cp: '1f4a5',                 u: '💥',   name: 'boom' },
+        'a_zap':          { cp: '26a1',                  u: '⚡',   name: 'zap' },
+        'a_coffee':       { cp: '2615',                  u: '☕',   name: 'coffee' },
+        'a_notes':        { cp: '1f3b6',                 u: '🎶',   name: 'notes' },
+        'a_guitar':       { cp: '1f3b8',                 u: '🎸',   name: 'guitar' },
+        'a_eyes':         { cp: '1f440',                 u: '👀',   name: 'eyes' },
+        'a_dance':        { cp: '1f483',                 u: '💃',   name: 'dance' },
+        'a_cat':          { cp: '1f431',                 u: '🐱',   name: 'cat' },
+        'a_dog':          { cp: '1f415',                 u: '🐕',   name: 'dog' },
+        'a_unicorn':      { cp: '1f984',                 u: '🦄',   name: 'unicorn' },
+        'a_rainbow':      { cp: '1f308',                 u: '🌈',   name: 'rainbow' },
+        'a_crown':        { cp: '1f451',                 u: '👑',   name: 'crown' },
+        'a_gem':          { cp: '1f48e',                 u: '💎',   name: 'gem' },
+        'a_pizza':        { cp: '1f355',                 u: '🍕',   name: 'pizza' },
+        'a_cake':         { cp: '1f382',                 u: '🎂',   name: 'cake' },
+        'a_muscle':       { cp: '1f4aa',                 u: '💪',   name: 'muscle' }
+    };
+
+    function _animEmojiUrl(key) {
+        var info = ANIMATED_EMOJI[key];
+        if (!info) return '';
+        return 'https://fonts.gstatic.com/s/e/notoemoji/latest/' + info.cp + '/512.webp';
+    }
+
+    function _animEmojiStaticUrl(key) {
+        var info = ANIMATED_EMOJI[key];
+        if (!info) return '';
+        return 'https://fonts.gstatic.com/s/e/notoemoji/latest/' + info.cp + '/128.png';
+    }
+
+    function _animEmojiImg(key, extraClass) {
+        var info = ANIMATED_EMOJI[key];
+        if (!info) return '';
+        var cls = 'chat-anim-emoji' + (extraClass ? ' ' + extraClass : '');
+        return '<img class="' + cls + '" src="' + _animEmojiUrl(key) +
+               '" alt="' + attr(info.u) + '" title=":' + key + ':" loading="lazy">';
+    }
+
+    // Prepend the Animated category as the primary tab in the picker
+    var _animKeys = Object.keys(ANIMATED_EMOJI);
+    EMOJI_CATS.unshift({ slug: 'animated', icon: '✨', title: '✨ Animated (SoulSync)', names: _animKeys });
+
+    var EMOJI_CAT_BY_NAME = {};
+    EMOJI_CATS.forEach(function (cat) {
+        cat.names.forEach(function (n) {
+            EMOJI_CAT_BY_NAME[n] = cat;
+        });
+    });
+
+    function _emojiCatFor(name) {
+        return EMOJI_CAT_BY_NAME[name] || { slug: 'symbols', title: 'Symbols', icon: '🔣' };
+    }
+
+    var EMOJI_RECENT_KEY = 'soulsync_emoji_recent';
+    function _getRecentEmojis() {
+        try { return JSON.parse(localStorage.getItem(EMOJI_RECENT_KEY) || '[]').slice(0, 24); }
+        catch (e) { return []; }
+    }
+    function _pushRecentEmoji(em) {
+        if (!em) return;
+        var clean = em.trim().replace(/^:|:$/g, '');
+        var list = _getRecentEmojis().filter(function (e2) { return e2 !== clean && e2 !== em; });
+        list.unshift(clean);
+        if (list.length > 24) list.length = 24;
+        try { localStorage.setItem(EMOJI_RECENT_KEY, JSON.stringify(list)); } catch (e) {}
+    }
+
+    var EMOJI_SYNONYMS = {
+        'happy': ['smile', 'grinning', 'joy', 'blush', 'a_joy', 'a_party', 'a_sparkles', 'a_thumbsup'],
+        'smile': ['smile', 'grinning', 'smiley', 'a_joy', 'blush', 'grin'],
+        'laugh': ['joy', 'rofl', 'a_joy', 'a_rofl', 'lol', 'laughing'],
+        'lol': ['joy', 'rofl', 'a_joy', 'a_rofl'],
+        'love': ['heart', 'heart_eyes', 'a_heart', 'a_heart_fire', 'a_heart_eyes', 'kissing_heart'],
+        'heart': ['heart', 'a_heart', 'a_heart_fire', 'a_heart_eyes', 'sparkling_heart', 'heartpulse'],
+        'fire': ['fire', 'a_fire', 'a_heart_fire', 'hot', 'a_hot'],
+        'lit': ['fire', 'a_fire', 'a_heart_fire'],
+        'hot': ['fire', 'a_fire', 'a_hot', 'hot'],
+        'party': ['tada', 'a_tada', 'a_party', 'balloon', 'confetti'],
+        'celebrate': ['tada', 'a_tada', 'a_party', 'champagne', 'sparkles'],
+        'sad': ['sob', 'cry', 'a_sob', 'disappointed', 'pensive'],
+        'cry': ['sob', 'a_sob', 'cry', 'pleading', 'a_pleading'],
+        'cool': ['sunglasses', 'a_sunglasses'],
+        'music': ['notes', 'guitar', 'musical_note', 'a_notes', 'a_guitar', 'headphones', 'sound'],
+        'song': ['notes', 'guitar', 'musical_note', 'a_notes', 'a_guitar'],
+        'dance': ['dance', 'a_dance', 'party'],
+        'cat': ['cat', 'a_cat', 'cat2', 'smile_cat'],
+        'dog': ['dog', 'a_dog', 'dog2'],
+        'animal': ['cat', 'dog', 'unicorn', 'a_cat', 'a_dog', 'a_unicorn', 'fox', 'panda', 'bear'],
+        'food': ['pizza', 'a_pizza', 'burger', 'cake', 'a_cake', 'coffee', 'a_coffee'],
+        'pizza': ['pizza', 'a_pizza'],
+        'coffee': ['coffee', 'a_coffee', 'tea'],
+        'drink': ['coffee', 'a_coffee', 'tea', 'beer', 'cocktail', 'wine_glass'],
+        'beer': ['beer', 'beers'],
+        'strong': ['muscle', 'a_muscle', 'punch'],
+        'muscle': ['muscle', 'a_muscle'],
+        'yes': ['check', 'a_check', 'thumbsup', 'a_thumbsup', '100', 'a_hundred', 'white_check_mark', 'ok_hand'],
+        'ok': ['ok_hand', 'check', 'a_check', 'thumbsup', 'a_thumbsup'],
+        'no': ['x', 'cross_mark', 'prohibited', 'no_entry'],
+        'star': ['star', 'a_star', 'sparkles', 'a_sparkles', 'dizzy'],
+        'magic': ['sparkles', 'a_sparkles', 'crystal_ball', 'unicorn', 'a_unicorn'],
+        'sparkles': ['sparkles', 'a_sparkles', 'star', 'a_star'],
+        'thinking': ['thinking', 'a_thinking', 'monocle', 'a_monocle', 'hmm'],
+        'skull': ['skull', 'a_skull', 'dead'],
+        'dead': ['skull', 'a_skull', 'ghost', 'a_ghost'],
+        'money': ['money', 'a_money', 'moneybag', 'dollar', 'gem', 'a_gem'],
+        'car': ['car', 'rocket', 'a_rocket'],
+        'rocket': ['rocket', 'a_rocket'],
+        'mindblown': ['mindblown', 'a_mindblown', 'exploding_head', 'boom', 'a_boom'],
+        'boom': ['boom', 'a_boom', 'fire', 'a_fire', 'mindblown', 'a_mindblown'],
+        'shock': ['scream', 'a_scream', 'flushed'],
+        'alien': ['alien', 'a_alien', 'robot', 'a_robot', 'space_invader'],
+        'robot': ['robot', 'a_robot', 'alien', 'a_alien'],
+        'wave': ['wave', 'a_wave', 'hand'],
+        'clap': ['clap', 'a_clap', 'applause'],
+        'sleep': ['sleeping', 'zzz', 'bed'],
+        'win': ['trophy', 'crown', 'a_crown', 'first_place', 'medal', '100', 'a_hundred'],
+        'crown': ['crown', 'a_crown', 'gem', 'a_gem'],
+        'rock': ['guitar', 'a_guitar', 'metal'],
+        'guitar': ['guitar', 'a_guitar', 'notes', 'a_notes'],
+        'eyes': ['eyes', 'a_eyes', 'see', 'look'],
+        'look': ['eyes', 'a_eyes', 'see'],
+        'salute': ['salute', 'a_salute'],
+        'poop': ['poop', 'a_poop'],
+        'nerd': ['nerd', 'a_nerd', 'monocle', 'a_monocle'],
+        'ghost': ['ghost', 'a_ghost', 'skull', 'a_skull']
+    };
+
+    function _searchEmojis(query) {
+        var v = String(query || '').toLowerCase().trim();
+        if (!v) return [];
+        var allKeys = Object.keys(ANIMATED_EMOJI).concat(Object.keys(EMOJI));
+        var seen = {};
+        var exactHits = [];
+        var prefixHits = [];
+        var subHits = [];
+        var synHits = [];
+
+        var synMatchingKeys = {};
+        Object.keys(EMOJI_SYNONYMS).forEach(function (synWord) {
+            if (synWord.indexOf(v) === 0 || v.indexOf(synWord) === 0) {
+                (EMOJI_SYNONYMS[synWord] || []).forEach(function (k) {
+                    synMatchingKeys[k] = true;
+                });
+            }
+        });
+
+        allKeys.forEach(function (n) {
+            if (seen[n]) return;
+            var info = ANIMATED_EMOJI[n];
+            var cleanName = info ? info.name : n;
+            var glyph = info ? info.u : EMOJI[n];
+            if (n === v || cleanName === v || glyph === v) {
+                seen[n] = true;
+                exactHits.push(n);
+            } else if (n.indexOf(v) === 0 || cleanName.indexOf(v) === 0) {
+                seen[n] = true;
+                prefixHits.push(n);
+            } else if (n.indexOf(v) > -1 || cleanName.indexOf(v) > -1) {
+                seen[n] = true;
+                subHits.push(n);
+            } else if (synMatchingKeys[n] || (info && synMatchingKeys[info.name])) {
+                seen[n] = true;
+                synHits.push(n);
+            }
+        });
+
+        return exactHits.concat(prefixHits, subHits, synHits);
+    }
+
+    function _isJumboji(text) {
+        if (!text) return false;
+        var trimmed = text.trim();
+        var tokens = trimmed.split(/\s+/);
+        if (!tokens.length || tokens.length > 3) return false;
+        for (var i = 0; i < tokens.length; i++) {
+            var tok = tokens[i];
+            var sm = tok.match(/^:([a-z0-9_+-]+):$/);
+            if (sm && (ANIMATED_EMOJI[sm[1]] || EMOJI[sm[1]])) continue;
+            try {
+                if (/^(\p{Extended_Pictographic}|\p{Emoji_Presentation}|\u200d|[\uFE0E\uFE0F])+$/u.test(tok)) continue;
+            } catch (e) {}
+            return false;
+        }
+        return true;
+    }
     var URL_RE = /(https?:\/\/[^\s]+)/g;
 
     function _trimUrl(u) {
@@ -152,9 +543,42 @@
         return m ? u.slice(0, -m[0].length) : u;
     }
 
+    function _classifyUrl(u) {
+        var raw = (u || '').replace(/&amp;/g, '&').toLowerCase();
+        if (raw.indexOf('youtube.com') > -1 || raw.indexOf('youtu.be') > -1) {
+            return { cls: 'chat-link--yt', brand: 'YouTube' };
+        }
+        if (raw.indexOf('spotify.com') > -1) {
+            return { cls: 'chat-link--spotify', brand: 'Spotify' };
+        }
+        if (raw.indexOf('soundcloud.com') > -1) {
+            return { cls: 'chat-link--sc', brand: 'SoundCloud' };
+        }
+        if (raw.indexOf('bandcamp.com') > -1) {
+            return { cls: 'chat-link--bc', brand: 'Bandcamp' };
+        }
+        if (raw.indexOf('deezer.com') > -1) {
+            return { cls: 'chat-link--dz', brand: 'Deezer' };
+        }
+        if (raw.indexOf('music.apple.com') > -1) {
+            return { cls: 'chat-link--apple', brand: 'Apple Music' };
+        }
+        if (raw.indexOf('github.com') > -1) {
+            return { cls: 'chat-link--github', brand: 'GitHub' };
+        }
+        if (raw.indexOf('wikipedia.org') > -1) {
+            return { cls: 'chat-link--wiki', brand: 'Wikipedia' };
+        }
+        if (raw.indexOf('reddit.com') > -1) {
+            return { cls: 'chat-link--reddit', brand: 'Reddit' };
+        }
+        return { cls: 'chat-link--web', brand: '' };
+    }
+
     function _linkHtml(u) {
         // u is already-escaped text (esc ran first) — safe in attr + label.
-        return '<a class="chat-link" href="' + u + '" target="_blank" rel="noopener noreferrer">' + u + '</a>';
+        var info = _classifyUrl(u);
+        return '<a class="chat-link ' + info.cls + '" href="' + u + '" target="_blank" rel="noopener noreferrer">' + u + '</a>';
     }
 
     // ── embeds (richchat P3): click-to-load, never auto-load ─────────────────
@@ -170,6 +594,27 @@
                 raw.match(/youtu\.be\/([A-Za-z0-9_-]{6,20})/) ||
                 raw.match(/youtube\.com\/shorts\/([A-Za-z0-9_-]{6,20})/);
         return m ? m[1] : null;
+    }
+
+    function _spotifyEmbedInfo(u) {
+        var raw = u.replace(/&amp;/g, '&');
+        var m = raw.match(/open\.spotify\.com\/(track|album|playlist|episode)\/([A-Za-z0-9]{15,30})/i);
+        return m ? { type: m[1].toLowerCase(), id: m[2] } : null;
+    }
+
+    function _deezerEmbedInfo(u) {
+        var raw = u.replace(/&amp;/g, '&');
+        var m = raw.match(/deezer\.com\/(?:[a-z]{2}\/)?(track|album|playlist)\/([0-9]{3,15})/i);
+        return m ? { type: m[1].toLowerCase(), id: m[2] } : null;
+    }
+
+    function _soundcloudEmbedInfo(u) {
+        var raw = u.replace(/&amp;/g, '&');
+        var m = raw.match(/^https?:\/\/(?:www\.)?soundcloud\.com\/([A-Za-z0-9_-]+)\/([A-Za-z0-9_-]+)(?:[?#]|$)/i);
+        if (m && m[1] !== 'you' && m[1] !== 'discover' && m[1] !== 'stream' && m[1] !== 'search' && m[1] !== 'upload') {
+            return { user: m[1], track: m[2] };
+        }
+        return null;
     }
 
     // ── SoulSync deep links (richchat P4) ────────────────────────────────────
@@ -209,8 +654,25 @@
         var yt = _ytId(u);
         if (yt) {
             // id is regex-constrained to [A-Za-z0-9_-] — attribute-safe by shape
-            return html + ' <button type="button" class="chat-embed-chip" data-chat-embed-yt="' +
-                yt + '" title="Play here (YouTube)">▶ play</button>';
+            return html + ' <button type="button" class="chat-embed-chip chat-embed-chip--yt" data-chat-embed-yt="' +
+                yt + '" title="Play YouTube video inline in chat">▶ play</button>' +
+                ' <button type="button" class="chat-embed-action chat-embed-action--jbx" data-chat-jbx-add="' +
+                yt + '" title="Queue to Room Jukebox">🎵 jukebox</button>';
+        }
+        var sp = _spotifyEmbedInfo(u);
+        if (sp) {
+            return html + ' <button type="button" class="chat-embed-chip chat-embed-chip--sp" data-chat-embed-spotify="' +
+                sp.type + '/' + sp.id + '" title="Open Spotify player inline">🟢 spotify</button>';
+        }
+        var dz = _deezerEmbedInfo(u);
+        if (dz) {
+            return html + ' <button type="button" class="chat-embed-chip chat-embed-chip--dz" data-chat-embed-deezer="' +
+                dz.type + '/' + dz.id + '" title="Open Deezer player inline">💜 deezer</button>';
+        }
+        var sc = _soundcloudEmbedInfo(u);
+        if (sc) {
+            return html + ' <button type="button" class="chat-embed-chip chat-embed-chip--sc" data-chat-embed-sc="' +
+                encodeURIComponent(u) + '" title="Open SoundCloud player inline">☁ soundcloud</button>';
         }
         if (IMG_RE.test(u)) {
             return html + ' <button type="button" class="chat-embed-chip" data-chat-embed-img="' +
@@ -262,6 +724,23 @@
             return _linkWithEmbeds(u) + m.slice(u.length);
         });
         s = _mentionify(s);
+        var jumbo = _isJumboji(text);
+        s = s.replace(/:([a-z0-9_+-]+):/g, function (m, name) {
+            if (ANIMATED_EMOJI[name]) {
+                return _animEmojiImg(name, jumbo ? 'chat-anim-emoji--jumbo' : '');
+            }
+            if (EMOJI[name]) {
+                return jumbo ? '<span class="chat-unicode-jumbo">' + EMOJI[name] + '</span>' : EMOJI[name];
+            }
+            return m;
+        });
+        if (jumbo) {
+            try {
+                s = s.replace(/(\p{Extended_Pictographic}|\p{Emoji_Presentation}|\u200d|[\uFE0E\uFE0F])+/gu, function (m) {
+                    return '<span class="chat-unicode-jumbo">' + m + '</span>';
+                });
+            } catch (e) {}
+        }
         return _restore(s, hold).replace(/\n/g, '<br>');
     }
 
@@ -287,7 +766,8 @@
         s = _extract(s, /\[([^\]\n]{1,80})\]\((https?:\/\/[^\s)]+)\)/g, hold, function (m) {
             var mm = m.match(/^\[([^\]]+)\]\((.+)\)$/);
             var label = mm[1], url = mm[2];
-            return '<a class="chat-link" href="' + url + '" target="_blank" rel="noopener noreferrer">' +
+            var info = _classifyUrl(url);
+            return '<a class="chat-link ' + info.cls + '" href="' + url + '" target="_blank" rel="noopener noreferrer">' +
                 label + '</a><span class="chat-link-domain">(' + _hostOf(url) + ')</span>';
         });
         s = _extract(s, URL_RE, hold, function (m) {
@@ -313,7 +793,23 @@
         s = s.replace(/\|\|([^|\n]+)\|\|/g,
             '<span class="chat-spoiler" data-chat-spoiler title="Spoiler — click to reveal">$1</span>');
         // 3) emoji shortcodes + @mentions
-        s = s.replace(/:([a-z0-9_+-]+):/g, function (m, name) { return EMOJI[name] || m; });
+        var jumbo = _isJumboji(text);
+        s = s.replace(/:([a-z0-9_+-]+):/g, function (m, name) {
+            if (ANIMATED_EMOJI[name]) {
+                return _animEmojiImg(name, jumbo ? 'chat-anim-emoji--jumbo' : '');
+            }
+            if (EMOJI[name]) {
+                return jumbo ? '<span class="chat-unicode-jumbo">' + EMOJI[name] + '</span>' : EMOJI[name];
+            }
+            return m;
+        });
+        if (jumbo) {
+            try {
+                s = s.replace(/(\p{Extended_Pictographic}|\p{Emoji_Presentation}|\u200d|[\uFE0E\uFE0F])+/gu, function (m) {
+                    return '<span class="chat-unicode-jumbo">' + m + '</span>';
+                });
+            } catch (e) {}
+        }
         s = _mentionify(s);
         // 4) line-level blocks: headings, quotes, bullets ('>' is &gt; here)
         s = s.split('\n').map(function (line) {
@@ -351,6 +847,8 @@
                 return r.json().catch(function () { return {}; }).then(function (body) {
                     return { ok: r.ok, status: r.status, body: body };
                 });
+            }).catch(function () {
+                return { ok: false, status: 0, body: { error: 'Could not reach SoulSync. Your message was not confirmed; check the conversation before trying again.' } };
             });
     }
 
@@ -440,18 +938,33 @@
         }
         var me = !self && state.view === 'room' && mentionsMe(showText);
         var replyRef = (m.reply && m.reply.u)
-            ? '<div class="chat-reply-ref">↩ <b>' + esc(m.reply.u) + '</b> ' +
+            ? '<div class="chat-reply-ref" data-chat-jump-reply="' + attr(m.reply.u) + '" ' +
+              'data-chat-jump-x="' + attr((m.reply.x || '').slice(0, 40)) + '" ' +
+              'title="Click to jump to message">↩ <b>' + esc(m.reply.u) + '</b> ' +
               '<span>' + esc(m.reply.x || '') + '</span></div>'
             : '';
         var acts = '<button type="button" class="chat-line-reply" title="Copy text" ' +
             'data-chat-copy="' + attr(showText) + '">⧉</button>';
         if (state.view === 'room' && state.canSend && !self) {
-            acts = '<button type="button" class="chat-line-reply" title="React" ' +
+            var quickReacts = '<button type="button" class="chat-line-reply chat-quick-react-btn" title="React with ❤️" ' +
+                'data-chat-react-quick="❤️" data-chat-react-user="' + attr(m.username || '') + '" ' +
+                'data-chat-react-text="' + attr(String(m.message || '')) + '">❤️</button>' +
+                '<button type="button" class="chat-line-reply chat-quick-react-btn" title="React with 🔥" ' +
+                'data-chat-react-quick="🔥" data-chat-react-user="' + attr(m.username || '') + '" ' +
+                'data-chat-react-text="' + attr(String(m.message || '')) + '">🔥</button>' +
+                '<button type="button" class="chat-line-reply chat-quick-react-btn" title="React with 😂" ' +
+                'data-chat-react-quick="😂" data-chat-react-user="' + attr(m.username || '') + '" ' +
+                'data-chat-react-text="' + attr(String(m.message || '')) + '">😂</button>';
+
+            acts = quickReacts +
+                '<button type="button" class="chat-line-reply" title="Add reaction" ' +
                 'data-chat-react-user="' + attr(m.username || '') + '" ' +
                 'data-chat-react-text="' + attr(String(m.message || '')) + '">🙂+</button>' +   // FULL text — the react key is a hash of it
                 '<button type="button" class="chat-line-reply" title="Reply" ' +
                 'data-chat-reply-user="' + attr(m.username || '') + '" ' +
-                'data-chat-reply-x="' + attr(showText.slice(0, 100)) + '">↩</button>' + acts;
+                'data-chat-reply-x="' + attr(showText.slice(0, 100)) + '">↩</button>' +
+                '<button type="button" class="chat-line-reply" title="Browse ' + attr(m.username || '') + '’s files" ' +
+                'data-chat-browse-user="' + attr(m.username || '') + '">📁</button>' + acts;
         }
         // Your own SoulSync message, still under the edit cap → offer ✏.
         // File cards are excluded (their text is the link the card dresses),
@@ -482,18 +995,32 @@
                 'data-chat-hide-user="' + attr(m.username || '') + '" ' +
                 'data-chat-hide-ts="' + attr(String(m.timestamp || '')) + '">🚫</button>';
         }
-        var actions = '<span class="chat-line-acts">' + acts + '</span>';
+        var actions = '<span class="chat-line-acts chat-msg-hover-bar">' + acts + '</span>';
         var chips = '';
         if (m.reactions && m.reactions.length) {
             chips = '<div class="chat-react-row">' + m.reactions.map(function (r) {
-                return '<span class="chat-react-chip" title="' +
-                    attr((r.users || []).join(', ')) + '">' + esc(r.e) +
+                var animKey = String(r.e || '').replace(/^:|:$/g, '');
+                var isAnim = ANIMATED_EMOJI[animKey];
+                var iconHtml = isAnim
+                    ? '<img class="chat-anim-chip-emoji" src="' + _animEmojiUrl(animKey) + '" alt="' + attr(isAnim.u) + '">'
+                    : esc(r.e);
+                return '<span class="chat-react-chip' + (isAnim ? ' chat-react-chip--anim' : '') + '" title="' +
+                    attr((r.users || []).join(', ')) + '">' + iconHtml +
                     (r.n > 1 ? ' <b>' + r.n + '</b>' : '') + '</span>';
             }).join('') + '</div>';
         }
-        var bodyHtml = (m.file && m.file.n)
-            ? _fileCardHtml(m)
-            : (m.rich ? renderRich(showText) : renderPlain(showText));
+        var npData = m.np || _extractNpFromText(m.message);
+        var wantData = m.want || _extractWantFromText(m.message);
+        var fileData = (m.file && m.file.n) ? m.file : _extractFileFromText(m.message);
+        var bodyHtml = (npData && npData.t)
+            ? _nowPlayingCardHtml(m, npData)
+            : (wantData && wantData.t)
+                ? _wantedCardHtml(m, wantData)
+                : (m.overlay && m.overlay.n)
+                    ? _overlayCardHtml(m)
+                    : (fileData && (fileData.n || fileData.url))
+                        ? _fileCardHtml(m, fileData)
+                        : (m.rich ? renderRich(showText) : renderPlain(showText));
         // An edited message wears the marker; hovering it shows every prior
         // version, oldest first (the history is retained, not replaced).
         if (versions) {
@@ -514,14 +1041,277 @@
             bodyHtml + actions + chips + '</div>';
     }
 
-    // ── shared file card (filepost.dev links dressed by envelope 'f') ────
+    // chat.js guards every showToast call (it can load without downloads.js,
+    // which defines it) — 45 places do this. One helper rather than a 46th
+    // hand-rolled guard.
+    function _ovToast(msg, kind) {
+        if (typeof showToast === 'function') showToast(msg, kind);
+    }
+
+    // Pick one of YOUR templates and send it.
+    //
+    // A grid of RENDERED previews, not a list of names. Each card is the
+    // template composited onto a neutral poster by the same endpoint the
+    // Overlay Studio gallery uses — a template is a visual thing, and choosing
+    // one by name is choosing blind. (The first version of this was a
+    // window.prompt asking for a number, which is exactly as bad as it sounds.)
+    function _pickOverlayToShare() {
+        toggleAttachPanel(true);
+        var ov = q('[data-chat-ovl-modal]');
+        var grid = q('[data-chat-ovl-grid]');
+        if (!ov || !grid) { _ovToast('The overlay picker is unavailable', 'error'); return; }
+        grid.innerHTML = '<div class="chat-ovl-empty">Loading your templates\u2026</div>';
+        ov.hidden = false;
+        _bindOverlayPickerEsc();
+        fetch('/api/video/overlays/templates', { headers: { Accept: 'application/json' } })
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (d) {
+                var list = (d && d.templates) || [];
+                if (!list.length) {
+                    grid.innerHTML = '<div class="chat-ovl-empty">You have no overlay templates yet. ' +
+                        'Design one in the Overlay Studio and it will show up here.</div>';
+                    return;
+                }
+                grid.innerHTML = list.map(_overlayPickCard).join('');
+            })
+            .catch(function () {
+                grid.innerHTML = '<div class="chat-ovl-empty">Could not load your templates.</div>';
+            });
+    }
+
+    function _overlayPickCard(t) {
+        var layers = Number(t.layer_count || 0);
+        return '<button type="button" class="chat-ovl-card" data-chat-ovl-pick="' + attr(t.id) + '" ' +
+            'data-chat-ovl-name="' + attr(t.name || 'Overlay template') + '" ' +
+            'title="Share ' + attr(t.name || 'this template') + '">' +
+            // same preview the studio gallery shows, so what you pick is what
+            // they get
+            '<span class="chat-ovl-shot">' +
+                // thumb 404s if pillow can't render. a broken image icon here
+                // looks like the template is broken, so fall back instead
+                '<img src="/api/video/overlays/templates/' + attr(t.id) + '/thumb" alt="" loading="lazy" ' +
+                    'onerror="this.parentNode.classList.add(\'is-noshot\');this.remove();">' +
+            '</span>' +
+            '<span class="chat-ovl-meta">' +
+                '<span class="chat-ovl-cardname">' + esc(t.name || 'Untitled') + '</span>' +
+                '<span class="chat-ovl-cardsub">' + layers +
+                    (layers === 1 ? ' layer' : ' layers') +
+                    (t.kind && t.kind !== 'poster' ? ' \u00b7 ' + esc(t.kind) : '') +
+                '</span>' +
+            '</span>' +
+        '</button>';
+    }
+
+    function _closeOverlayPicker() {
+        var ov = q('[data-chat-ovl-modal]');
+        if (ov) ov.hidden = true;
+        if (_ovlEsc) { document.removeEventListener('keydown', _ovlEsc); _ovlEsc = null; }
+    }
+
+    // escape closes it. the other chat modals don't bother but they should.
+    // unbind on close, otherwise you stack a listener per open.
+    var _ovlEsc = null;
+    function _bindOverlayPickerEsc() {
+        if (_ovlEsc) return;
+        _ovlEsc = function (ev) { if (ev.key === 'Escape') _closeOverlayPicker(); };
+        document.addEventListener('keydown', _ovlEsc);
+    }
+
+    // The gallery row is a summary — the DEFINITION has to be fetched before it
+    // can be sent.
+    function _shareOverlayById(id, name) {
+        _closeOverlayPicker();
+        fetch('/api/video/overlays/templates/' + encodeURIComponent(id),
+              { headers: { Accept: 'application/json' } })
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (full) {
+                var defn = full && full.definition;
+                if (!defn || !defn.layers || !defn.layers.length) {
+                    _ovToast('That template has no layers to share', 'error');
+                    return;
+                }
+                _sendOverlayShare(name || full.name || 'Overlay template', defn);
+            })
+            .catch(function () { _ovToast('Could not read that template', 'error'); });
+    }
+
+    function _sendOverlayShare(name, definition) {
+        // Rooms only. A PM is sent as plaintext by design, so an envelope-only
+        // share would arrive as nothing at all rather than as a card.
+        if (state.view !== 'room') {
+            _ovToast('Overlay templates can only be shared in a room', 'info');
+            return;
+        }
+        postJSON('/api/chat/room/message', _tagRoomPayload({
+            message: '',
+            overlay: { n: name, d: definition },
+        })).then(function (res) {
+            if (res && res.ok) {
+                _ovToast('Shared "' + name + '"', 'success');
+                // The composer's own trick: clearing lastStamp forces the next
+                // poll to render authoritatively instead of diffing. There is
+                // no loadRoom() to call — only loadRooms(), which reloads the
+                // room LIST and would not bring the message back any sooner.
+                state.lastStamp = null;
+                state.stickBottom = true;
+            } else {
+                // The server names the half that did not fit - with a template
+                // attached, "message too long" would send someone to shorten a
+                // sentence that was already empty.
+                _ovToast((res && res.body && res.body.error) ||
+                          'Could not share that template', 'error');
+            }
+        });
+    }
+
+    // Definitions of the templates currently on screen, so the Add button can
+    // carry a short key instead of a few KB of JSON in an attribute.
+    var _overlayShares = { n: 0, map: {}, order: [] };
+    var OVERLAY_SHARE_KEEP = 40;
+
+    function _rememberOverlayShare(share) {
+        var key = 'ov' + (_overlayShares.n++);
+        _overlayShares.map[key] = share;
+        _overlayShares.order.push(key);
+        // Bounded on purpose. Each definition is a few KB and a busy room would
+        // otherwise hold every template ever scrolled past for the life of the
+        // tab. Forty covers everything on screen and then some.
+        while (_overlayShares.order.length > OVERLAY_SHARE_KEEP) {
+            delete _overlayShares.map[_overlayShares.order.shift()];
+        }
+        return key;
+    }
+
+    // Adopt a template someone shared. The definition is already on the
+    // message (it rode the envelope), so this is one POST and no fetching.
+    function _adoptSharedOverlay(btn) {
+        var o = _overlayShares.map[btn.getAttribute('data-chat-overlay-add')];
+        if (!o || !o.d) { _ovToast('That template is no longer on screen', 'error'); return; }
+        btn.disabled = true;
+        var was = btn.textContent;
+        btn.textContent = 'Adding\u2026';
+        fetch('/api/video/overlays/templates/from-share', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+            body: JSON.stringify({ name: o.n, definition: o.d })
+        })
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+                if (!d || !d.ok) {
+                    btn.disabled = false; btn.textContent = was;
+                    _ovToast((d && d.error) || 'Could not add that template', 'error');
+                    return;
+                }
+                btn.textContent = '\u2713 added';
+                var miss = (d.missing_assets || []).length;
+                // The missing half is said AFTER the success, not instead of
+                // it: the template really was added, it just has holes the
+                // sender has to send you separately.
+                _ovToast(miss
+                    ? 'Added "' + d.name + '" \u2014 ' + miss +
+                      (miss === 1 ? ' image is' : ' images are') +
+                      ' missing, ask the sender for them'
+                    : 'Added "' + d.name + '" to your overlays',
+                    miss ? 'info' : 'success');
+            })
+            .catch(function () {
+                btn.disabled = false; btn.textContent = was;
+                _ovToast('Could not add that template', 'error');
+            });
+    }
+
+    // ── shared overlay template (envelope 'o') ──────────────────────────
+    //
+    // A design, not a link: the whole template rides the message, so the card
+    // can say what it IS before anyone commits to adopting it — how many layers,
+    // and crucially how many images it depends on that this install does not
+    // have. Those refs are content-addressed (asset://<sha1>), so an image you
+    // already uploaded resolves for free and anything else is named exactly.
+    function _overlayCardHtml(m) {
+        var o = m.overlay || {};
+        var layers = Number(o.layers || 0);
+        var assets = (o.assets || []).length;
+        // The definition is far too large for a data- attribute, so it goes in
+        // a render-scoped registry and only the KEY rides the button. The file
+        // card can put its whole payload (a url) on the element; a template
+        // cannot, and inventing a lookup that does not exist is how the last
+        // card like this ended up doing nothing when clicked.
+        var key = _rememberOverlayShare({ n: o.n, d: o.d });
+        return '<div class="chat-overlay-card">' +
+            '<span class="chat-overlay-icon">\u25F0</span>' +
+            '<span class="chat-overlay-meta">' +
+                '<b class="chat-overlay-name">' + esc(o.n || 'Overlay template') + '</b>' +
+                '<span class="chat-overlay-sub">Overlay template \u00b7 ' +
+                    layers + (layers === 1 ? ' layer' : ' layers') + '</span>' +
+                // Said up front, not after the click: adopting a template whose
+                // art you lack leaves layers that paint nothing, and finding
+                // that out afterwards feels like a broken import.
+                (assets ? '<span class="chat-overlay-warn">Needs ' + assets +
+                          (assets === 1 ? ' image' : ' images') +
+                          ' you may not have</span>' : '') +
+            '</span>' +
+            '<button type="button" class="chat-embed-chip chat-overlay-add" ' +
+                'data-chat-overlay-add="' + key + '">\u2795 add to my overlays</button>' +
+        '</div>';
+    }
+
+    // ── shared file card (filepost.dev links dressed by envelope 'f' or detected in plain text) ────
     var _AUDIO_EXT = /\.(flac|mp3|m4a|ogg|opus|wav|aiff?)$/i;
     var _VIDEO_EXT = /\.(mp4|mkv|webm|mov)$/i;
     var _IMAGE_EXT = /\.(jpe?g|png|gif|webp)$/i;
 
-    function _fileCardHtml(m) {
-        var url = String(m.message || '').trim();
-        var f = m.file || {};
+    function _extractFileFromText(text) {
+        if (window.ChatProtocol && typeof window.ChatProtocol.extractFileFromText === 'function') {
+            return window.ChatProtocol.extractFileFromText(text);
+        }
+        if (!text || typeof text !== 'string') return null;
+        var trimmed = text.trim();
+        var m = trimmed.match(/https?:\/\/(?:[a-z0-9-]+\.)?filepost\.dev\/[^\s]+/i);
+        if (!m) {
+            m = trimmed.match(/https?:\/\/[^\s]+?\.(?:flac|mp3|m4a|ogg|opus|wav|aiff?|mp4|mkv|webm|mov)(?:\?[^\s]*)?/i);
+        }
+        if (!m) return null;
+        var url = m[0];
+        var textLead = '';
+        var name = '';
+        var colonMatch = trimmed.match(/^([^:\n]+):\s*(https?:\/\/[^\s]+)$/);
+        if (colonMatch) {
+            var lead = colonMatch[1].trim();
+            if (/\.(flac|mp3|m4a|ogg|opus|wav|aiff?|mp4|mkv|webm|mov|jpe?g|png|gif|webp|zip|tar|gz|pdf|txt)$/i.test(lead)) {
+                name = lead;
+            } else {
+                textLead = lead;
+            }
+        } else if (trimmed !== url) {
+            textLead = trimmed.replace(url, '').replace(/^[:\s-]+|[:\s-]+$/g, '').trim();
+        }
+        if (!name) {
+            var cleanUrl = url.split('?')[0].split('#')[0];
+            var parts = cleanUrl.split('/');
+            var last = parts[parts.length - 1];
+            if (last && last.indexOf('.') !== -1) {
+                try { name = decodeURIComponent(last); } catch (e) { name = last; }
+            } else {
+                name = 'shared-file';
+            }
+        }
+        var mime = '';
+        if (_AUDIO_EXT.test(name)) {
+            var ext = name.split('.').pop().toLowerCase();
+            mime = 'audio/' + (ext === 'mp3' ? 'mpeg' : ext);
+        } else if (_VIDEO_EXT.test(name)) {
+            var vext = name.split('.').pop().toLowerCase();
+            mime = 'video/' + vext;
+        } else if (_IMAGE_EXT.test(name)) {
+            var iext = name.split('.').pop().toLowerCase();
+            mime = 'image/' + (iext === 'jpg' ? 'jpeg' : iext);
+        }
+        return { n: name, m: mime, url: url, textLead: textLead };
+    }
+
+    function _fileCardHtml(m, fileOverride) {
+        var f = fileOverride || m.file || {};
+        var url = String(f.url || m.message || '').trim();
         var name = String(f.n || 'file');
         var mime = String(f.m || '');
         var isAudio = mime.indexOf('audio/') === 0 || _AUDIO_EXT.test(name);
@@ -544,7 +1334,7 @@
             preview = '<button type="button" class="chat-embed-chip" data-chat-embed-img="' +
                 attr(url) + '">🖼 show</button>';
         }
-        return '<div class="chat-file-card">' +
+        var card = '<div class="chat-file-card">' +
             '<span class="chat-file-icon">' + icon + '</span>' +
             '<span class="chat-file-meta"><b class="chat-file-name">' + esc(name) + '</b>' +
             (f.s ? '<span class="chat-file-size">' + esc(_fmtBytes(f.s)) + '</span>' : '') +
@@ -558,6 +1348,11 @@
             '<a class="chat-embed-chip chat-file-dl" href="' + attr(url) +
                 '" target="_blank" rel="noopener noreferrer" download>⬇ download</a>' +
             '<div class="chat-file-slot"></div></div>';
+        if (f.textLead) {
+            var leadHtml = m.rich ? renderRich(f.textLead) : renderPlain(f.textLead);
+            return '<div class="chat-file-lead">' + leadHtml + '</div>' + card;
+        }
+        return card;
     }
 
     // Save a shared audio file into the library: hand the filepost link to the
@@ -593,6 +1388,1049 @@
                 btn.textContent = was;
                 if (typeof showToast === 'function') showToast('Could not save that file', 'error');
             });
+    }
+
+    // ── Now Playing & Wanted / ISO Cards ────────────────────────────────────
+    function _extractNpFromText(text) {
+        if (!text || typeof text !== 'string') return null;
+        var m = text.match(/🎵\s*Now Playing:\s*([^\-]+?)\s*-\s*([^(]+?)(?:\s*\(([^)]+)\))?$/i);
+        if (!m) return null;
+        return { a: m[1].trim(), t: m[2].trim(), al: (m[3] || '').trim(), src: 'shared' };
+    }
+
+    function _extractWantFromText(text) {
+        if (!text || typeof text !== 'string') return null;
+        var m = text.match(/🔍\s*In Search Of:\s*(?:\[(ALBUM|TRACK|EP|SINGLE)\]\s*)?([^\-]+?)\s*-\s*([^(]+?)(?:\s*\(([^)]+)\))?$/i);
+        if (!m) return null;
+        var ty = (m[1] || 'album').toLowerCase();
+        return { a: m[2].trim(), t: m[3].trim(), y: (m[4] || '').trim(), ty: ty, src: 'shared' };
+    }
+
+    var _npArtCache = {};
+    var _npArtPending = {};
+
+    function _scheduleNpArtProbe(title, artist, isAlbum) {
+        if (!title && !artist) return;
+        var key = (artist || '').toLowerCase().trim() + '|||' + (title || '').toLowerCase().trim();
+        if (key in _npArtCache || _npArtPending[key]) return;
+        _npArtPending[key] = true;
+
+        var qStr = (artist && artist !== 'Unknown Artist' ? artist + ' ' : '') + (title && title !== 'Unknown Track' ? title : '');
+        qStr = qStr.trim();
+        if (!qStr) {
+            delete _npArtPending[key];
+            return;
+        }
+
+        fetch('/api/enhanced-search', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query: qStr })
+        })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (data) {
+            delete _npArtPending[key];
+            if (!data) return;
+            var trs = data.tracks || data.spotify_tracks || [];
+            var als = data.albums || data.spotify_albums || [];
+            var candidates = isAlbum ? als.concat(trs) : trs.concat(als);
+            var hit = candidates.find(function (c) {
+                return c && (c.image_url || (c.images && c.images[0] && (typeof c.images[0] === 'string' ? c.images[0] : c.images[0].url)));
+            }) || candidates[0];
+
+            if (hit) {
+                var imgUrl = hit.image_url || (hit.images && hit.images[0] && (typeof hit.images[0] === 'string' ? hit.images[0] : hit.images[0].url)) || '';
+                if (imgUrl) {
+                    _npArtCache[key] = imgUrl;
+                    _applyNpArtToDom(key, imgUrl, hit);
+                }
+            }
+        })
+        .catch(function () {
+            delete _npArtPending[key];
+        });
+    }
+
+    function _applyNpArtToDom(key, imgUrl, hit) {
+        document.querySelectorAll('.chat-np-card').forEach(function (card) {
+            var cTitle = (card.getAttribute('data-np-title') || '').toLowerCase().trim();
+            var cArtist = (card.getAttribute('data-np-artist') || '').toLowerCase().trim();
+            var cKey = cArtist + '|||' + cTitle;
+            if (cKey === key) {
+                card.setAttribute('data-np-img', imgUrl);
+                var ph = card.querySelector('.chat-np-thumb--ph');
+                if (ph) {
+                    var img = document.createElement('img');
+                    img.className = 'chat-np-thumb';
+                    img.src = imgUrl;
+                    img.alt = '';
+                    img.loading = 'lazy';
+                    ph.replaceWith(img);
+                }
+            }
+        });
+        document.querySelectorAll('.chat-wanted-card').forEach(function (card) {
+            var cTitle = (card.getAttribute('data-wanted-title') || '').toLowerCase().trim();
+            var cArtist = (card.getAttribute('data-wanted-artist') || '').toLowerCase().trim();
+            var cKey = cArtist + '|||' + cTitle;
+            if (cKey === key) {
+                card.setAttribute('data-wanted-img', imgUrl);
+                if (hit) {
+                    if (hit.id && !card.getAttribute('data-wanted-id')) card.setAttribute('data-wanted-id', hit.id);
+                    if (hit.source && (!card.getAttribute('data-wanted-src') || card.getAttribute('data-wanted-src') === 'shared')) {
+                        card.setAttribute('data-wanted-src', hit.source);
+                    }
+                    if (hit.album && !card.getAttribute('data-wanted-album')) card.setAttribute('data-wanted-album', hit.album);
+                }
+                var ph = card.querySelector('.chat-wanted-thumb--ph');
+                if (ph) {
+                    var img = document.createElement('img');
+                    img.className = 'chat-wanted-thumb';
+                    img.src = imgUrl;
+                    img.alt = '';
+                    img.loading = 'lazy';
+                    ph.replaceWith(img);
+                }
+            }
+        });
+    }
+
+    function _nowPlayingCardHtml(m, npOverride) {
+        var np = npOverride || m.np || _extractNpFromText(m.message);
+        if (!np) return m.rich ? renderRich(m.message) : renderPlain(m.message);
+        var t = esc(np.t || 'Unknown Track');
+        var a = esc(np.a || 'Unknown Artist');
+        var al = esc(np.al || '');
+        var src = esc((np.src || 'MUSIC').toUpperCase());
+        var br = np.br ? '<span class="chat-np-badge chat-np-badge--br">' + esc(np.br) + 'k</span>' : '';
+        var durBadge = '';
+        if (np.dur && Number(np.dur) > 0) {
+            var rawD = Number(np.dur);
+            var secTotal = Math.round(rawD > 1000 ? rawD / 1000 : rawD);
+            var dMin = Math.floor(secTotal / 60);
+            var dSec = Math.floor(secTotal % 60);
+            durBadge = '<span class="chat-np-badge chat-np-badge--dur">' + dMin + ':' + (dSec < 10 ? '0' : '') + dSec + '</span>';
+        }
+
+        var probeKey = (np.a || '').toLowerCase().trim() + '|||' + (np.t || '').toLowerCase().trim();
+        var resolvedImg = np.img || _npArtCache[probeKey] || '';
+        var img = (resolvedImg && (/^https?:\/\//.test(resolvedImg) || /^\/api\//.test(resolvedImg)))
+            ? '<img class="chat-np-thumb" src="' + attr(resolvedImg) + '" alt="" loading="lazy">'
+            : '<div class="chat-np-thumb chat-np-thumb--ph">🎵</div>';
+        if (!resolvedImg && (np.t || np.a)) {
+            _scheduleNpArtProbe(np.t, np.a);
+        }
+
+        return '<div class="chat-np-card" data-np-title="' + attr(np.t) + '" data-np-artist="' + attr(np.a) + '" data-np-album="' + attr(np.al || '') + '" data-np-id="' + attr(np.id || '') + '" data-np-src="' + attr(np.src || '') + '" data-np-dur="' + attr(np.dur || 0) + '" data-np-img="' + attr(resolvedImg || np.img || '') + '" data-np-type="track">' +
+            '<div class="chat-np-header">' +
+                '<span class="chat-np-tag"><span class="chat-np-eq"><i></i><i></i><i></i></span> NOW PLAYING</span>' +
+                '<span class="chat-np-src-pill">' + src + '</span>' +
+                br +
+                durBadge +
+            '</div>' +
+            '<div class="chat-np-body">' +
+                img +
+                '<div class="chat-np-meta">' +
+                    '<div class="chat-np-title" title="' + attr(np.t) + '">' + t + '</div>' +
+                    '<div class="chat-np-artist" title="' + attr(np.a) + '">' + a + '</div>' +
+                    (al ? '<div class="chat-np-album" title="' + attr(np.al) + '">' + al + '</div>' : '') +
+                '</div>' +
+            '</div>' +
+            '<div class="chat-np-actions">' +
+                '<button type="button" class="chat-card-btn chat-card-btn--primary" data-chat-card-stream title="Preview audio stream">▶ Preview</button>' +
+                '<button type="button" class="chat-card-btn chat-card-btn--accent" data-chat-card-dl title="Open Download Tracks modal">📥 Download</button>' +
+                '<button type="button" class="chat-card-btn chat-card-btn--wishlist" data-chat-card-wishlist title="Add to your Wishlist">➕ Wishlist</button>' +
+                '<button type="button" class="chat-card-btn" data-chat-card-artist title="Go to ' + attr(np.a) + ' artist page">👤 Artist</button>' +
+                '<button type="button" class="chat-card-btn" data-chat-card-search title="Search SoulSync for this release">🔍 Search</button>' +
+            '</div>' +
+        '</div>';
+    }
+
+    var _wantedPresenceCache = {};
+    var _wantedPresencePending = {};
+
+    function _scheduleWantedPresenceProbe(w) {
+        var key = (w.a || '').toLowerCase().trim() + '|||' + (w.t || '').toLowerCase().trim();
+        if (key in _wantedPresenceCache || _wantedPresencePending[key]) return;
+        _wantedPresencePending[key] = true;
+
+        var reqData = {
+            albums: (w.ty === 'album' || w.ty === 'ep') ? [{ title: w.t, artist: w.a }] : [],
+            tracks: (w.ty === 'track' || w.ty === 'single') ? [{ name: w.t, artist: w.a, album: w.al || '' }] : []
+        };
+        if (!reqData.albums.length && !reqData.tracks.length) {
+            reqData.albums = [{ title: w.t, artist: w.a }];
+        }
+
+        fetch('/api/enhanced-search/library-check', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(reqData)
+        })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+            delete _wantedPresencePending[key];
+            var owned = false;
+            if (data && data.albums && data.albums[0] === true) owned = true;
+            if (data && data.tracks && data.tracks[0] && data.tracks[0].in_library === true) owned = true;
+            _wantedPresenceCache[key] = owned;
+            document.querySelectorAll('[data-chat-wanted-probe="' + attr(key) + '"]').forEach(function (el) {
+                el.className = 'chat-wanted-badge ' + (owned ? 'chat-wanted-badge--owned' : 'chat-wanted-badge--miss');
+                el.textContent = owned ? '✓ In Your Library' : 'Not in library';
+                if (owned) {
+                    var card = el.closest('.chat-wanted-card');
+                    if (card) {
+                        var btn = card.querySelector('[data-chat-wanted-have]');
+                        if (btn) btn.classList.add('chat-card-btn--glow');
+                    }
+                }
+            });
+        })
+        .catch(function () { delete _wantedPresencePending[key]; });
+    }
+
+    function _wantedCardHtml(m, wantOverride) {
+        var w = wantOverride || m.want || _extractWantFromText(m.message);
+        if (!w) return m.rich ? renderRich(m.message) : renderPlain(m.message);
+        var t = esc(w.t || 'Unknown Title');
+        var a = esc(w.a || 'Unknown Artist');
+        var ty = esc((w.ty || 'album').toUpperCase());
+        var y = w.y ? esc(w.y) : '';
+        var src = esc(w.src || '');
+        var requester = m.username || 'user';
+        var isMe = (m.username === state.selfName || m.self === true || requester === 'you');
+
+        var cacheKey = (w.a || '').toLowerCase().trim() + '|||' + (w.t || '').toLowerCase().trim();
+        var inLib = _wantedPresenceCache[cacheKey];
+
+        var probeKey = (w.a || '').toLowerCase().trim() + '|||' + (w.t || '').toLowerCase().trim();
+        var resolvedImg = w.img || _npArtCache[probeKey] || '';
+        var img = (resolvedImg && (/^https?:\/\//.test(resolvedImg) || /^\/api\//.test(resolvedImg)))
+            ? '<img class="chat-wanted-thumb" src="' + attr(resolvedImg) + '" alt="" loading="lazy">'
+            : '<div class="chat-wanted-thumb chat-wanted-thumb--ph">💿</div>';
+        if (!resolvedImg && (w.t || w.a)) {
+            _scheduleNpArtProbe(w.t, w.a, (w.ty === 'album' || w.ty === 'ep'));
+        }
+
+        var statusChip = '';
+        if (inLib === true) {
+            statusChip = '<span class="chat-wanted-badge chat-wanted-badge--owned">✓ In Your Library</span>';
+        } else if (inLib === false) {
+            statusChip = '<span class="chat-wanted-badge chat-wanted-badge--miss">Not in library</span>';
+        } else {
+            statusChip = '<span class="chat-wanted-badge chat-wanted-badge--checking" data-chat-wanted-probe="' + attr(cacheKey) + '">Checking library…</span>';
+            _scheduleWantedPresenceProbe(w);
+        }
+
+        var haveBtn = '';
+        if (!isMe) {
+            haveBtn = '<button type="button" class="chat-card-btn chat-card-btn--success' + (inLib === true ? ' chat-card-btn--glow' : '') + '" ' +
+                'data-chat-wanted-have data-wanted-user="' + attr(requester) + '" data-wanted-title="' + attr(w.t) + '" data-wanted-artist="' + attr(w.a) + '" ' +
+                'title="Send @' + attr(requester) + ' a direct message saying you have this!">' +
+                '💬 I Have This! (Send PM)</button>';
+        }
+
+        return '<div class="chat-wanted-card" ' +
+            'data-wanted-title="' + attr(w.t) + '" ' +
+            'data-wanted-artist="' + attr(w.a) + '" ' +
+            'data-wanted-album="' + attr(w.al || '') + '" ' +
+            'data-wanted-type="' + attr(w.ty || 'album') + '" ' +
+            'data-wanted-id="' + attr(w.id || '') + '" ' +
+            'data-wanted-src="' + attr(w.src || '') + '" ' +
+            'data-wanted-img="' + attr(resolvedImg || w.img || '') + '" ' +
+            'data-wanted-year="' + attr(w.y || '') + '" ' +
+            'data-wanted-dur="' + attr(w.dur || 0) + '" ' +
+            'data-wanted-key="' + attr(cacheKey) + '">' +
+            '<div class="chat-wanted-header">' +
+                '<span class="chat-wanted-tag">🔍 IN SEARCH OF</span>' +
+                '<span class="chat-wanted-type-pill">' + ty + '</span>' +
+                (src ? '<span class="chat-wanted-src-pill">' + src.toUpperCase() + '</span>' : '') +
+                statusChip +
+            '</div>' +
+            '<div class="chat-wanted-body">' +
+                img +
+                '<div class="chat-wanted-meta">' +
+                    '<div class="chat-wanted-title" title="' + attr(w.t) + '">' + t + '</div>' +
+                    '<div class="chat-wanted-artist" title="' + attr(w.a) + '">' + a + (y ? ' <span class="chat-wanted-year">(' + y + ')</span>' : '') + '</div>' +
+                    '<div class="chat-wanted-req">Requested by <b>@' + esc(requester) + '</b></div>' +
+                '</div>' +
+            '</div>' +
+            '<div class="chat-wanted-actions">' +
+                haveBtn +
+                '<button type="button" class="chat-card-btn chat-card-btn--accent" data-chat-card-dl title="Open Download Tracks modal">📥 Download</button>' +
+                '<button type="button" class="chat-card-btn chat-card-btn--wishlist" data-chat-wanted-wishlist title="Add to your Wishlist">➕ Wishlist</button>' +
+                '<button type="button" class="chat-card-btn" data-chat-card-artist title="Go to ' + attr(w.a) + ' artist page">👤 Artist</button>' +
+                '<button type="button" class="chat-card-btn" data-chat-card-search title="Search SoulSync for this release">🔍 Search</button>' +
+            '</div>' +
+        '</div>';
+    }
+
+    async function shareNowPlaying() {
+        if (state.view !== 'room' || _plainOn() || !state.canSend) {
+            if (typeof showToast === 'function') {
+                showToast('🎵 Now Playing cards can only be shared in SoulSync rooms.', 'warning');
+            }
+            return;
+        }
+        var cur = window.__ssCurrentTrack || (typeof window.getCurrentTrack === 'function' ? window.getCurrentTrack() : null) || state.localNowPlaying;
+        if (!cur || (!cur.title && !cur.name)) {
+            if (typeof showToast === 'function') {
+                showToast('🎵 Nothing is currently playing in SoulSync. Start a track first!', 'info');
+            }
+            return;
+        }
+        var t = String(cur.title || cur.name || 'Unknown Track').replace(/^[a-z0-9_-]+\|\|/i, '');
+        var a = String(cur.artist || 'Unknown Artist').replace(/^[a-z0-9_-]+\|\|/i, '');
+        var al = String(cur.album || '').replace(/^[a-z0-9_-]+\|\|/i, '');
+        var src = cur.source || (cur.is_library ? 'library' : 'stream');
+        var id = String(cur.id || '');
+        var img = String(cur.image_url || cur.album_cover_url || cur.thumb_url || '');
+        if (!img) {
+            var artEl = document.getElementById('sidebar-album-art') || document.getElementById('np-album-art');
+            if (artEl && artEl.src && !artEl.src.endsWith('/trans2.png') && !artEl.src.endsWith('/default-artwork.png')) {
+                img = artEl.src;
+            }
+        }
+        if (img && !/^https?:\/\//.test(img) && !/^\/api\//.test(img)) img = '';
+
+        var dur = 0;
+        if (cur.duration_ms && Number(cur.duration_ms) > 0) {
+            dur = Math.round(Number(cur.duration_ms));
+        } else if (cur.duration && Number(cur.duration) > 0) {
+            var rawD = Number(cur.duration);
+            dur = rawD > 1000 ? Math.round(rawD) : Math.round(rawD * 1000);
+        }
+        if (!dur) {
+            var apEl = document.getElementById('audio-player');
+            if (apEl && isFinite(apEl.duration) && apEl.duration > 0) {
+                dur = Math.round(apEl.duration * 1000);
+            }
+        }
+        var br = cur.bitrate || 0;
+
+        var probeKey = (a || '').toLowerCase().trim() + '|||' + (t || '').toLowerCase().trim();
+        if (!img && _npArtCache[probeKey]) {
+            img = _npArtCache[probeKey];
+        }
+
+        if (!img && (t || a)) {
+            try {
+                var searchQ = (a && a !== 'Unknown Artist' ? a + ' ' : '') + (t && t !== 'Unknown Track' ? t : '');
+                if (searchQ.trim()) {
+                    var searchRes = await fetch('/api/enhanced-search', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ query: searchQ.trim() })
+                    }).then(function (r) { return r.ok ? r.json() : null; });
+                    if (searchRes) {
+                        var candTracks = searchRes.tracks || searchRes.spotify_tracks || [];
+                        var candAlbums = searchRes.albums || searchRes.spotify_albums || [];
+                        var best = candTracks[0] || candAlbums[0];
+                        if (best) {
+                            if (best.image_url) {
+                                img = best.image_url;
+                                _npArtCache[probeKey] = img;
+                            }
+                            if (!dur && best.duration_ms) dur = Math.round(best.duration_ms);
+                            if (!al && best.album) al = best.album;
+                            if (cur && typeof cur === 'object') {
+                                if (img && !cur.image_url) cur.image_url = img;
+                                if (dur && !cur.duration_ms) cur.duration_ms = dur;
+                                if (al && !cur.album) cur.album = al;
+                            }
+                        }
+                    }
+                }
+            } catch (err) {
+                console.warn('[Chat] Failed to probe art before sharing now playing:', err);
+            }
+        }
+
+        var fallbackText = '🎵 Now Playing: ' + a + ' - ' + t + (al ? ' (' + al + ')' : '');
+        var payload = {
+            message: fallbackText,
+            np: { t: t, a: a, al: al, src: src, id: id, img: img, dur: dur, br: br }
+        };
+        _tagRoomPayload(payload);
+        postJSON('/api/chat/room/message', payload).then(function (res) {
+            if (res.ok) {
+                refresh();
+                if (typeof showToast === 'function') showToast('🎵 Shared Now Playing to chat!', 'success');
+            } else if (typeof showToast === 'function') {
+                showToast(res.body && res.body.error || 'Failed to share Now Playing', 'error');
+            }
+        });
+    }
+
+    var _wantSearchTimer = null;
+    var _wantActiveSource = 'auto';
+
+    function openWantedModal(query) {
+        if (state.view !== 'room' || _plainOn() || !state.canSend) {
+            if (typeof showToast === 'function') {
+                showToast('🔍 Wanted cards can only be posted in SoulSync rooms.', 'warning');
+            }
+            return;
+        }
+        var modal = q('[data-chat-want-modal]');
+        var backdrop = q('[data-chat-want-backdrop]');
+        if (!modal) return;
+        modal.hidden = false;
+        if (backdrop) backdrop.hidden = false;
+        requestAnimationFrame(function () {
+            modal.classList.add('visible');
+            if (backdrop) backdrop.classList.add('visible');
+        });
+        var inp = q('[data-chat-want-input]');
+        if (inp) {
+            if (query) inp.value = query;
+            setTimeout(function () { inp.focus(); }, 60);
+            if (query) searchWanted();
+        }
+    }
+
+    function closeWantedModal() {
+        var modal = q('[data-chat-want-modal]');
+        var backdrop = q('[data-chat-want-backdrop]');
+        if (modal) {
+            modal.classList.remove('visible');
+            setTimeout(function () { modal.hidden = true; }, 320);
+        }
+        if (backdrop) {
+            backdrop.classList.remove('visible');
+            setTimeout(function () { backdrop.hidden = true; }, 320);
+        }
+    }
+
+    function searchWanted() {
+        var inp = q('[data-chat-want-input]');
+        var resultsEl = q('[data-chat-want-results]');
+        var statusEl = q('[data-chat-want-status]');
+        var clearBtn = q('[data-chat-want-clear]');
+        if (!inp || !resultsEl) return;
+
+        var query = (inp.value || '').trim();
+        if (clearBtn) clearBtn.hidden = !query;
+
+        if (query.length < 2) {
+            resultsEl.innerHTML = '';
+            if (statusEl) {
+                statusEl.hidden = false;
+                statusEl.textContent = 'Type 2+ letters to search across metadata providers';
+            }
+            return;
+        }
+
+        if (statusEl) {
+            statusEl.hidden = false;
+            statusEl.textContent = 'Searching metadata providers…';
+        }
+
+        var fetchFn = (typeof enhancedSearchFetch === 'function')
+            ? enhancedSearchFetch
+            : function (q, opt) {
+                var b = { query: q };
+                if (opt && opt.source && opt.source !== 'auto') b.source = opt.source;
+                return fetch('/api/enhanced-search', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(b)
+                }).then(function (r) { return r.json(); });
+            };
+
+        fetchFn(query, { source: _wantActiveSource })
+            .then(function (data) {
+                if (!data) {
+                    if (statusEl) statusEl.textContent = 'No results returned';
+                    return;
+                }
+                var items = [];
+                var primarySrc = data.metadata_source || data.primary_source || 'spotify';
+                var albums = data.albums || data.spotify_albums || data.results || [];
+                albums.slice(0, 15).forEach(function (al) {
+                    var albumImg = al.image_url ||
+                        (al.images && al.images[0] && (typeof al.images[0] === 'string' ? al.images[0] : al.images[0].url)) ||
+                        al.cover_xl || al.cover_big || al.cover_medium || '';
+                    items.push({
+                        name: al.name || al.title || '',
+                        artist: al.artist || (al.artists && al.artists[0] && al.artists[0].name) || '',
+                        type: al.album_type || 'album',
+                        year: al.release_date ? al.release_date.slice(0, 4) : (al.year || ''),
+                        source: al.source || primarySrc,
+                        id: String(al.id || ''),
+                        image_url: albumImg
+                    });
+                });
+                var tracks = data.tracks || data.spotify_tracks || [];
+                tracks.slice(0, 15).forEach(function (tr) {
+                    var trImg = tr.image_url ||
+                        (tr.images && tr.images[0] && (typeof tr.images[0] === 'string' ? tr.images[0] : tr.images[0].url)) ||
+                        (tr.album && tr.album.images && tr.album.images[0] && (typeof tr.album.images[0] === 'string' ? tr.album.images[0] : tr.album.images[0].url)) ||
+                        '';
+                    items.push({
+                        name: tr.name || tr.title || '',
+                        artist: tr.artist || (tr.artists && tr.artists[0] && tr.artists[0].name) || '',
+                        album: (typeof tr.album === 'string' ? tr.album : (tr.album && tr.album.name)) || '',
+                        type: 'track',
+                        year: tr.release_date ? tr.release_date.slice(0, 4) : '',
+                        source: tr.source || primarySrc,
+                        id: String(tr.id || ''),
+                        image_url: trImg,
+                        duration_ms: tr.duration_ms || 0
+                    });
+                });
+
+                if (!items.length) {
+                    if (statusEl) statusEl.textContent = 'No releases found for "' + query + '"';
+                    resultsEl.innerHTML = '';
+                    return;
+                }
+
+                if (statusEl) statusEl.hidden = true;
+                resultsEl.innerHTML = items.map(function (item, idx) {
+                    var thumb = item.image_url
+                        ? '<img class="chat-want-res-img" src="' + attr(item.image_url) + '" alt="" loading="lazy">'
+                        : '<div class="chat-want-res-img chat-want-res-img--ph">' + (item.type === 'track' ? '🎵' : '💿') + '</div>';
+                    return '<div class="chat-want-res-row">' +
+                        thumb +
+                        '<div class="chat-want-res-meta">' +
+                            '<div class="chat-want-res-name">' + esc(item.name) + '</div>' +
+                            '<div class="chat-want-res-sub">' + esc(item.artist) + (item.year ? ' · ' + esc(item.year) : '') + '</div>' +
+                            '<div class="chat-want-res-badges">' +
+                                '<span class="chat-want-res-pill">' + esc(item.type.toUpperCase()) + '</span>' +
+                                '<span class="chat-want-res-pill chat-want-res-pill--src">' + esc(item.source.toUpperCase()) + '</span>' +
+                            '</div>' +
+                        '</div>' +
+                        '<button type="button" class="chat-card-btn chat-card-btn--primary" data-chat-want-post-idx="' + idx + '">⭐ Post to Chat</button>' +
+                    '</div>';
+                }).join('');
+
+                resultsEl._items = items;
+            })
+            .catch(function (err) {
+                if (statusEl) statusEl.textContent = 'Search failed: ' + (err.message || err);
+            });
+    }
+
+    function postWantedCard(item) {
+        if (!item || !state.canSend || state.view !== 'room' || _plainOn()) return;
+        var t = item.name || item.title || 'Unknown Title';
+        var a = item.artist || (item.artists && item.artists[0] && item.artists[0].name) || 'Unknown Artist';
+        var ty = item.type || (item.album_type ? 'album' : 'track');
+        var al = item.album || '';
+        var src = item.source || 'spotify';
+        var id = String(item.id || '');
+        var img = item.image_url || '';
+        if (img && !/^https?:\/\//.test(img) && !/^\/api\//.test(img)) img = '';
+        var y = String(item.year || item.release_date || '').slice(0, 4);
+        var dur = item.duration_ms || 0;
+
+        // Cache art immediately so local rendering never flickers
+        var key = a.toLowerCase().trim() + '|||' + t.toLowerCase().trim();
+        if (img) _npArtCache[key] = img;
+
+        var fallbackText = '🔍 In Search Of: [' + ty.toUpperCase() + '] ' + a + ' - ' + t + (y ? ' (' + y + ')' : '');
+        var wantObj = { t: t, a: a, ty: ty, al: al, src: src, id: id, img: img, y: y };
+        if (dur) wantObj.dur = dur;
+
+        var payload = {
+            message: fallbackText,
+            want: wantObj
+        };
+        _tagRoomPayload(payload);
+        postJSON('/api/chat/room/message', payload).then(function (res) {
+            closeWantedModal();
+            if (res.ok) {
+                refresh();
+                if (typeof showToast === 'function') showToast('⭐ Posted Wanted card to chat!', 'success');
+            } else if (typeof showToast === 'function') {
+                showToast(res.body && res.body.error || 'Failed to post card', 'error');
+            }
+        });
+    }
+
+    async function _openDownloadForCard(artist, title, album, id, src, durationMs, imageUrl, cardType) {
+        if (typeof window.openDownloadMissingModalForArtistAlbum !== 'function') {
+            if (typeof showToast === 'function') showToast('Download missing modal unavailable', 'error');
+            return;
+        }
+
+        var albumName = album || title;
+        var isAlbum = (cardType === 'album' || cardType === 'ep');
+        durationMs = Number(durationMs) || 0;
+        if (durationMs > 0 && durationMs < 1000) {
+            durationMs = Math.round(durationMs * 1000);
+        }
+
+        // 1. Check active audio player if duration is missing
+        if (!durationMs) {
+            var cur = (typeof window.getCurrentTrack === 'function' && window.getCurrentTrack())
+                || window.__ssCurrentTrack
+                || (typeof currentTrack !== 'undefined' ? currentTrack : null);
+            if (cur && (cur.title === title || cur.name === title || !title)) {
+                if (cur.duration_ms) durationMs = Math.round(Number(cur.duration_ms));
+                else if (cur.duration) {
+                    var rd = Number(cur.duration);
+                    durationMs = rd > 1000 ? Math.round(rd) : Math.round(rd * 1000);
+                }
+                if (!imageUrl) imageUrl = cur.image_url || cur.album_cover_url || cur.thumb_url || '';
+            }
+            if (!durationMs) {
+                var ap = document.getElementById('audio-player');
+                if (ap && isFinite(ap.duration) && ap.duration > 0) {
+                    durationMs = Math.round(ap.duration * 1000);
+                }
+            }
+        }
+
+        // 2. If duration, image or id is still missing, query enhanced search
+        if ((!durationMs || !imageUrl || !id) && (artist || title)) {
+            try {
+                var searchQ = (artist ? artist + ' ' : '') + (title || '');
+                var searchRes = await fetch('/api/enhanced-search', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ query: searchQ.trim() })
+                });
+                if (searchRes.ok) {
+                    var sData = await searchRes.json();
+                    var tracksList = sData.spotify_tracks || sData.tracks || [];
+                    var albumsList = sData.spotify_albums || sData.albums || [];
+                    if (isAlbum && albumsList.length > 0) {
+                        var matchAl = albumsList.find(function (al) {
+                            return al.name && title && al.name.toLowerCase() === title.toLowerCase();
+                        }) || albumsList[0];
+                        if (matchAl) {
+                            if (!imageUrl && matchAl.image_url) imageUrl = matchAl.image_url;
+                            if ((!albumName || albumName === title) && matchAl.name) albumName = matchAl.name;
+                            if (!id && matchAl.id) id = String(matchAl.id);
+                            if (!src && matchAl.source) src = matchAl.source;
+                        }
+                    } else if (tracksList.length > 0) {
+                        var match = tracksList.find(function (tr) {
+                            return tr.name && title && tr.name.toLowerCase() === title.toLowerCase();
+                        }) || tracksList[0];
+                        if (match) {
+                            if (!durationMs && match.duration_ms) durationMs = match.duration_ms;
+                            if (!imageUrl && match.image_url) imageUrl = match.image_url;
+                            if ((!albumName || albumName === title) && match.album) albumName = match.album;
+                            if (!id && match.id) id = String(match.id);
+                            if (!src && match.source) src = match.source;
+                        }
+                    }
+                }
+            } catch (err) {
+                console.debug('Enhanced search lookup for download modal failed:', err);
+            }
+        }
+
+        var virtualId = (isAlbum ? 'album_' : 'np_') + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
+        var imagesArray = imageUrl ? [{ url: imageUrl }] : [];
+
+        var spotifyTracks = [{
+            id: id || virtualId,
+            name: title,
+            artist: artist,
+            artists: [{ name: artist, id: null }],
+            album: {
+                name: albumName,
+                id: id || null,
+                album_type: isAlbum ? (cardType || 'album') : 'single',
+                images: imagesArray,
+                total_tracks: 1
+            },
+            source: src || 'spotify',
+            duration_ms: durationMs || 0,
+            image_url: imageUrl || null,
+            total_tracks: 1
+        }];
+
+        var albumObj = {
+            id: id || null,
+            name: albumName,
+            album_type: isAlbum ? (cardType || 'album') : 'single',
+            images: imagesArray,
+            artists: [{ name: artist }]
+        };
+
+        var artistObj = {
+            id: null,
+            name: artist,
+            source: src || 'spotify'
+        };
+
+        // If it's an album and we have an ID and source, fetch the full album tracks
+        if (isAlbum && id && src && src !== 'shared') {
+            try {
+                var albRes = await fetch('/api/spotify/album/' + encodeURIComponent(id) + '?source=' + encodeURIComponent(src) + '&name=' + encodeURIComponent(albumName) + '&artist=' + encodeURIComponent(artist));
+                if (albRes.ok) {
+                    var albData = await albRes.json();
+                    if (albData && albData.tracks && albData.tracks.length > 0) {
+                        spotifyTracks = albData.tracks.map(function (tr, idx) {
+                            return {
+                                id: tr.id || (virtualId + '_' + idx),
+                                name: tr.name || tr.title || ('Track ' + (idx + 1)),
+                                artist: artist,
+                                artists: tr.artists || [{ name: artist, id: null }],
+                                album: albumObj,
+                                track_number: tr.track_number || (idx + 1),
+                                disc_number: tr.disc_number || 1,
+                                duration_ms: tr.duration_ms || 0,
+                                source: src,
+                                image_url: imageUrl || null
+                            };
+                        });
+                        albumObj.total_tracks = spotifyTracks.length;
+                        if (albData.images && albData.images.length) {
+                            albumObj.images = albData.images;
+                        }
+                    }
+                }
+            } catch (err) {
+                console.debug('[Chat] Album tracks fetch for download failed:', err);
+            }
+        }
+
+        window.openDownloadMissingModalForArtistAlbum(
+            virtualId,
+            '[' + artist + '] ' + albumName,
+            spotifyTracks,
+            albumObj,
+            artistObj,
+            false
+        );
+    }
+
+    function _openArtistPage(artist, artist_id, src) {
+        if (artist_id && typeof navigateToArtistDetail === 'function') {
+            navigateToArtistDetail(artist_id, artist, src);
+            return;
+        }
+        if (typeof _navigateToArtistFromWishlist === 'function') {
+            _navigateToArtistFromWishlist(artist);
+            return;
+        }
+        _searchFromCard(artist, '');
+    }
+
+    function _searchFromCard(artist, title) {
+        var qstr = ((artist ? artist + ' ' : '') + (title || '')).trim();
+        if (typeof navigateToPage === 'function') {
+            navigateToPage('search');
+            setTimeout(function () {
+                // 'search-input' is a class, not an id; the react search bar is the only input
+                var inp = document.getElementById('enhanced-search-input');
+                if (inp) {
+                    inp.value = qstr;
+                    inp.dispatchEvent(new Event('input', { bubbles: true }));
+                    inp.focus();
+                }
+            }, 300);
+        }
+    }
+
+    function _streamFromCard(title, artist, album) {
+        if (typeof showToast === 'function') showToast('🔍 Finding preview for "' + title + '"…', 'info');
+        fetch('/api/enhanced-search/stream-track', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                track_name: title,
+                artist_name: artist,
+                album_name: album || ''
+            })
+        })
+        .then(function (r) { return r.json(); })
+        .then(function (res) {
+            if (res && res.success && res.track) {
+                if (typeof startStream === 'function') {
+                    startStream(res.track);
+                } else if (typeof setTrackInfo === 'function') {
+                    setTrackInfo(res.track);
+                }
+                if (typeof showToast === 'function') showToast('▶ Playing preview for ' + title, 'success');
+            } else {
+                if (typeof showToast === 'function') showToast((res && res.error) || 'Could not find a stream preview for this track', 'warning');
+            }
+        })
+        .catch(function () {
+            if (typeof showToast === 'function') showToast('Failed to start stream preview', 'error');
+        });
+    }
+
+    function _onHaveWanted(username, title, artist) {
+        if (!username || username === 'you' || username === state.selfName) {
+            if (typeof showToast === 'function') showToast('This is your own wanted card!', 'info');
+            return;
+        }
+        openPm(username);
+        var input = q('[data-chat-input]');
+        if (input) {
+            input.value = 'Hey @' + username + '! I saw your request for "' + title + '" by ' + artist + ' — I have this in my library! Feel free to browse my shares or let me know if you want me to send it over.';
+            input.focus();
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        if (typeof showToast === 'function') {
+            showToast('Switched to PM with @' + username + ' — message ready to send!', 'success');
+        }
+    }
+
+    async function _addWantedToWishlist(w) {
+        if (!w || (!w.t && !w.a)) return;
+        var title = w.t || 'Unknown Title';
+        var artist = w.a || 'Unknown Artist';
+        var albumName = w.al || w.t || title;
+        var imgUrl = w.img || '';
+        var src = w.src || 'spotify';
+        if (src === 'shared') src = 'spotify';
+        var id = w.id || '';
+        var ty = (w.ty || 'album').toLowerCase();
+        var isAlbum = (ty === 'album' || ty === 'ep');
+
+        if (typeof showToast === 'function') {
+            showToast('Loading ' + (isAlbum ? 'album details' : 'track') + ' for wishlist…', 'info');
+        }
+
+        var fullAlbumData = null;
+        var tracks = [];
+
+        // 1. If it's an album and we have an ID and source, fetch the full album tracks directly
+        if (isAlbum && id && src) {
+            try {
+                var albRes = await fetch('/api/spotify/album/' + encodeURIComponent(id) + '?source=' + encodeURIComponent(src) + '&name=' + encodeURIComponent(albumName) + '&artist=' + encodeURIComponent(artist));
+                if (albRes.ok) {
+                    fullAlbumData = await albRes.json();
+                }
+            } catch (e) {
+                console.debug('[Chat] Direct album fetch failed:', e);
+            }
+        }
+
+        // 2. If we don't have full album data, or if id was missing, query enhanced-search
+        if ((isAlbum && (!fullAlbumData || !fullAlbumData.tracks || !fullAlbumData.tracks.length)) || !id || !imgUrl) {
+            try {
+                var searchQ = (artist !== 'Unknown Artist' ? artist + ' ' : '') + title;
+                var sr = await fetch('/api/enhanced-search', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ query: searchQ.trim() })
+                }).then(function (r) { return r.ok ? r.json() : null; });
+                if (sr) {
+                    var als = sr.albums || sr.spotify_albums || [];
+                    var trs = sr.tracks || sr.spotify_tracks || [];
+                    if (isAlbum && als.length > 0) {
+                        var matchAl = als.find(function (a) {
+                            return a.name && title && a.name.toLowerCase() === title.toLowerCase();
+                        }) || als[0];
+                        if (matchAl) {
+                            if (!id) id = String(matchAl.id || '');
+                            if (!imgUrl && matchAl.image_url) imgUrl = matchAl.image_url;
+                            if (matchAl.source) src = matchAl.source;
+                            if (matchAl.name) albumName = matchAl.name;
+                            // Fetch full tracks using the resolved ID and source
+                            if (id) {
+                                var albRes2 = await fetch('/api/spotify/album/' + encodeURIComponent(id) + '?source=' + encodeURIComponent(src) + '&name=' + encodeURIComponent(albumName) + '&artist=' + encodeURIComponent(artist));
+                                if (albRes2.ok) {
+                                    fullAlbumData = await albRes2.json();
+                                }
+                            }
+                        }
+                    } else if (!isAlbum && trs.length > 0) {
+                        var matchTr = trs.find(function (t) {
+                            return t.name && title && t.name.toLowerCase() === title.toLowerCase();
+                        }) || trs[0];
+                        if (matchTr) {
+                            if (!id) id = String(matchTr.id || '');
+                            if (!imgUrl && matchTr.image_url) imgUrl = matchTr.image_url;
+                            if (matchTr.album) albumName = matchTr.album;
+                            if (matchTr.source) src = matchTr.source;
+                            if (matchTr.duration_ms) w.dur = matchTr.duration_ms;
+                        }
+                    }
+                }
+            } catch (e) {
+                console.debug('[Chat] Enhanced-search fallback for wishlist failed:', e);
+            }
+        }
+
+        // 3. Build albumObj and tracks array with full context
+        var albumObj = {
+            id: id || null,
+            name: (fullAlbumData && fullAlbumData.name) || albumName,
+            album_type: ty,
+            image_url: (fullAlbumData && fullAlbumData.images && fullAlbumData.images[0] && fullAlbumData.images[0].url) || imgUrl,
+            images: (fullAlbumData && fullAlbumData.images && fullAlbumData.images.length)
+                ? fullAlbumData.images
+                : (imgUrl ? [{ url: imgUrl }] : []),
+            artists: (fullAlbumData && fullAlbumData.artists && fullAlbumData.artists.length)
+                ? fullAlbumData.artists
+                : [{ name: artist }],
+            release_date: (fullAlbumData && fullAlbumData.release_date) || w.y || '',
+            total_tracks: (fullAlbumData && fullAlbumData.total_tracks) || 0,
+            source: src
+        };
+
+        var artistObj = {
+            id: (fullAlbumData && fullAlbumData.artists && fullAlbumData.artists[0] && fullAlbumData.artists[0].id) || null,
+            name: artist,
+            image_url: '',
+            source: src
+        };
+
+        if (fullAlbumData && fullAlbumData.tracks && fullAlbumData.tracks.length > 0) {
+            tracks = fullAlbumData.tracks.map(function (tr, idx) {
+                return {
+                    id: tr.id || ('wanted_' + id + '_' + idx),
+                    name: tr.name || tr.title || ('Track ' + (idx + 1)),
+                    artist: artist,
+                    artists: (tr.artists && tr.artists.length) ? tr.artists : [{ name: artist }],
+                    album: albumObj,
+                    track_number: tr.track_number || (idx + 1),
+                    disc_number: tr.disc_number || 1,
+                    duration_ms: tr.duration_ms || 0,
+                    image_url: albumObj.image_url,
+                    source: src
+                };
+            });
+            albumObj.total_tracks = tracks.length;
+        } else {
+            tracks = [{
+                id: id || ('wanted_' + Date.now()),
+                name: title,
+                artist: artist,
+                artists: [{ name: artist }],
+                album: albumObj,
+                track_number: 1,
+                total_tracks: 1,
+                duration_ms: Number(w.dur) || 0,
+                image_url: imgUrl,
+                source: src
+            }];
+        }
+
+        // Use openAddToWishlistModal if available (the proper standard)
+        if (typeof window.openAddToWishlistModal === 'function') {
+            try {
+                window.openAddToWishlistModal(albumObj, artistObj, tracks, ty, null);
+                return;
+            } catch (err) {
+                console.error('[Chat] openAddToWishlistModal failed:', err);
+                if (typeof showToast === 'function') showToast('Could not open wishlist modal', 'error');
+            }
+            return;
+        }
+
+        // Fallback: direct API call
+        try {
+            var trackObj = tracks[0] || {
+                id: id || 'wanted_' + Date.now(),
+                name: title,
+                artist: artist,
+                artists: [{ name: artist }],
+                duration_ms: 0,
+                source: src
+            };
+            var res = await fetch('/api/add-album-to-wishlist', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    track: trackObj,
+                    artist: { id: null, name: artist, source: src },
+                    album: { id: id || null, name: albumName, album_type: ty, images: imgUrl ? [{ url: imgUrl }] : [] },
+                    source_type: ty,
+                    source_context: { album_name: albumName, artist_name: artist, album_type: ty }
+                })
+            });
+            var result = await res.json();
+            if (result.success) {
+                if (typeof showToast === 'function') showToast('✅ Added "' + title + '" to Wishlist!', 'success');
+            } else {
+                if (typeof showToast === 'function') showToast(result.error || 'Failed to add to wishlist', 'error');
+            }
+        } catch (err) {
+            console.error('[Chat] Failed to add to wishlist:', err);
+            if (typeof showToast === 'function') showToast('Failed to add to wishlist', 'error');
+        }
+    }
+
+    function _bindChatDragAndDrop() {
+        var zone = q('.chat-view') || q('.chat-main') || q('[data-chat-messages]');
+        var overlay = q('[data-chat-drop-overlay]');
+        if (!zone || !overlay) return;
+
+        var dragCounter = 0;
+        function isFilesDrag(e) {
+            if (!e.dataTransfer || !e.dataTransfer.types) return false;
+            for (var i = 0; i < e.dataTransfer.types.length; i++) {
+                if (e.dataTransfer.types[i] === 'Files') return true;
+            }
+            return false;
+        }
+
+        window.addEventListener('dragenter', function (e) {
+            if (!isFilesDrag(e)) return;
+            e.preventDefault();
+            dragCounter++;
+            overlay.hidden = false;
+            overlay.classList.add('chat-drop-overlay--active');
+        });
+        window.addEventListener('dragover', function (e) {
+            if (!isFilesDrag(e)) return;
+            e.preventDefault();
+            if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+            overlay.hidden = false;
+            overlay.classList.add('chat-drop-overlay--active');
+        });
+        window.addEventListener('dragleave', function (e) {
+            if (!isFilesDrag(e)) return;
+            e.preventDefault();
+            dragCounter--;
+            if (dragCounter <= 0) {
+                dragCounter = 0;
+                overlay.hidden = true;
+                overlay.classList.remove('chat-drop-overlay--active');
+            }
+        });
+        window.addEventListener('drop', function (e) {
+            if (!isFilesDrag(e)) return;
+            e.preventDefault();
+            dragCounter = 0;
+            overlay.hidden = true;
+            overlay.classList.remove('chat-drop-overlay--active');
+            if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
+                var file = e.dataTransfer.files[0];
+                attachUploadFile(file);
+            }
+        });
+    }
+
+    // ── developer identification ───────────────────────────────────────────
+    // one lead dev (the creator), plus contributors who earned a dev tag.
+    // slskd usernames, lowercase
+    var LEAD_DEV = 'boulderbadgedad';
+    var CHAT_DEVS = ['ezra9'];
+
+    function isLeadDev(name) {
+        return !!name && String(name).toLowerCase() === LEAD_DEV;
+    }
+
+    // any dev, lead included. drives the sort and the purple border
+    function isDev(name) {
+        if (!name) return false;
+        return isLeadDev(name) || CHAT_DEVS.indexOf(String(name).toLowerCase()) !== -1;
+    }
+
+    function devTitle(name) {
+        return isLeadDev(name) ? 'SoulSync Creator & Lead Developer' : 'SoulSync Developer';
+    }
+
+    // the badge markup, '' for everyone else. mod is '', 'inline' or 'lg'
+    function devBadge(name, mod) {
+        if (!isDev(name)) return '';
+        var cls = 'chat-dev-badge' + (mod ? ' chat-dev-badge--' + mod : '');
+        return '<span class="' + cls + '" title="' + devTitle(name) + '">' +
+            '<span class="chat-dev-badge-check">✔</span> ' +
+            (isLeadDev(name) ? 'LEAD DEV' : 'DEV') + '</span>';
     }
 
     // Consecutive messages from the same sender (same app-ness, <5 min apart)
@@ -634,7 +2472,9 @@
                 '<button class="chat-msg-user" type="button" data-chat-user="' + attr(user) +
                     '" style="color:hsl(' + _hue(user) + ',65%,68%)" title="Message ' +
                     attr(user) + '">' + esc(user) + '</button>' +
-                (ext ? '<span class="chat-ext-tag" title="Sent from another Soulseek client — not SoulSync">via Soulseek</span>' : '') +
+                devBadge(user) +
+                (!self && isFriend(user) ? '<span class="chat-friend-badge" title="Friend">⭐ Friend</span>' : '') +
+                (ext ? '<span class="chat-peer-badge chat-ext-tag" title="Sent from another Soulseek client — not SoulSync">via Soulseek</span>' : '<span class="chat-peer-badge chat-peer-badge--soulsync">SoulSync</span>') +
                 '<span class="chat-msg-time">' + esc(fmtTime(m.timestamp)) + '</span>' +
                 '</div>' + _lineHtml(m) };
         }
@@ -681,6 +2521,18 @@
         var editFold = _applyEdits(msgs);
         _editsByKey = editFold.edits;
         var shown = editFold.list, hidden = 0, muted = 0;
+        // Suppress messages from locally blocked users (both in rooms and PMs)
+        var blk = blockedSet();
+        if (blk.length) {
+            shown = shown.filter(function (m) {
+                var u = String(m.username || m.user || '');
+                if (isBlocked(u) && !(m.self === true || m.direction === 'Out')) {
+                    muted++;
+                    return false;
+                }
+                return true;
+            });
+        }
         if (state.view === 'room') {
             var ign = ignoredSet();
             if (ign.length) {
@@ -729,11 +2581,16 @@
         } else {
             body = renderGroups(shown);
         }
-        host.innerHTML = body +
+        var listHtml = body +
             (hidden ? '<button type="button" class="chat-hidden-note" data-chat-filter>' + hidden +
                 ' message' + (hidden === 1 ? '' : 's') + ' from other Soulseek clients hidden — show</button>' : '') +
             (muted ? '<div class="chat-hidden-note">' + muted +
                 ' message' + (muted === 1 ? '' : 's') + ' from muted users hidden</div>' : '');
+        // patched, not rebuilt: a rebuild killed any video, player or inline
+        // preview the reader had open every time someone posted (src/shell/chat-morph.ts)
+        if (typeof window.patchChatMessages === 'function') window.patchChatMessages(host, listHtml);
+        else host.innerHTML = listHtml;
+        _unfurlPendingLinks(host);
         if (state.stickBottom) {
             host.scrollTop = host.scrollHeight;
             // deep-scrollback cleanup: once the reader is back at the bottom,
@@ -793,6 +2650,165 @@
         renderUsersList();
     }
 
+    // ── social badges updater (sidebar buttons, drawer tabs, peer bookmarks button) ──
+    function _updateSocialBadges() {
+        var frCount = friendsSet().length;
+        var blCount = blockedSet().length;
+        var bmCount = peerBookmarksSet().length;
+
+        // Sidebar navigation badges
+        var sideFr = q('[data-chat-side-count-friends]');
+        if (sideFr) {
+            sideFr.textContent = frCount;
+            sideFr.hidden = (frCount === 0);
+        }
+        var sideBl = q('[data-chat-side-count-blocked]');
+        if (sideBl) {
+            sideBl.textContent = blCount;
+            sideBl.hidden = (blCount === 0);
+        }
+        var sideBm = q('[data-chat-side-count-bookmarks]');
+        if (sideBm) {
+            sideBm.textContent = bmCount;
+            sideBm.hidden = (bmCount === 0);
+        }
+
+        // Drawer tab pills
+        var dFr = q('[data-chat-count-friends]');
+        if (dFr) dFr.textContent = frCount;
+        var dBl = q('[data-chat-count-blocked]');
+        if (dBl) dBl.textContent = blCount;
+        var dBm = q('[data-chat-count-bookmarks]');
+        if (dBm) dBm.textContent = bmCount;
+
+        // Peer explorer drawer bookmarks button
+        var peerBmBtn = q('[data-chat-browse-saved-peers]');
+        if (peerBmBtn) {
+            peerBmBtn.textContent = '📚 Bookmarks (' + bmCount + ')';
+        }
+    }
+
+    // the bookmark handlers still call this by its old name; the count now
+    // lives with the rest of the social badges, so it's the same refresh
+    function _updateSavedPeersBtn() { _updateSocialBadges(); }
+
+    // ── friend list (local only — special shiny star & badge, no requesting) ──
+    function friendsSet() {
+        try { return JSON.parse(localStorage.getItem('chat_friends') || '[]'); }
+        catch (e) { return []; }
+    }
+    function isFriend(name) {
+        if (!name) return false;
+        return friendsSet().some(function (f) { return String(f).toLowerCase() === String(name).toLowerCase(); });
+    }
+    function toggleFriend(name) {
+        if (!name) return false;
+        var list = friendsSet();
+        var idx = -1;
+        for (var i = 0; i < list.length; i++) {
+            if (String(list[i]).toLowerCase() === String(name).toLowerCase()) { idx = i; break; }
+        }
+        var isNow = false;
+        if (idx > -1) {
+            list.splice(idx, 1);
+        } else {
+            list.push(name);
+            isNow = true;
+        }
+        try { localStorage.setItem('chat_friends', JSON.stringify(list)); } catch (e) { /* ignore */ }
+        state.lastStamp = null;
+        renderMessages(state.msgs);
+        renderUsersList();
+        _updateSocialBadges();
+        return isNow;
+    }
+
+    // ── block list (local only — completely suppresses chat messages by user) ──
+    function blockedSet() {
+        try { return JSON.parse(localStorage.getItem('chat_blocked') || '[]'); }
+        catch (e) { return []; }
+    }
+    function isBlocked(name) {
+        if (!name) return false;
+        return blockedSet().some(function (b) { return String(b).toLowerCase() === String(name).toLowerCase(); });
+    }
+    function toggleBlocked(name) {
+        if (!name) return false;
+        var list = blockedSet();
+        var idx = -1;
+        for (var i = 0; i < list.length; i++) {
+            if (String(list[i]).toLowerCase() === String(name).toLowerCase()) { idx = i; break; }
+        }
+        var isNowBlocked = false;
+        if (idx > -1) {
+            list.splice(idx, 1);
+        } else {
+            list.push(name);
+            isNowBlocked = true;
+        }
+        try { localStorage.setItem('chat_blocked', JSON.stringify(list)); } catch (e) { /* ignore */ }
+        state.lastStamp = null;
+        renderMessages(state.msgs);
+        renderUsersList();
+        _updateSocialBadges();
+        return isNowBlocked;
+    }
+
+    // ── peer bookmarks (local only — saved peers to browse or bookmark) ──
+    function peerBookmarksSet() {
+        try { return JSON.parse(localStorage.getItem('chat_peer_bookmarks') || '[]'); }
+        catch (e) { return []; }
+    }
+    function isPeerBookmarked(name) {
+        if (!name) return false;
+        return peerBookmarksSet().some(function (p) { return String(p).toLowerCase() === String(name).toLowerCase(); });
+    }
+    function togglePeerBookmark(name) {
+        if (!name) return false;
+        var list = peerBookmarksSet();
+        var idx = -1;
+        for (var i = 0; i < list.length; i++) {
+            if (String(list[i]).toLowerCase() === String(name).toLowerCase()) { idx = i; break; }
+        }
+        var isNowBookmarked = false;
+        if (idx > -1) {
+            list.splice(idx, 1);
+        } else {
+            list.push(name);
+            isNowBookmarked = true;
+        }
+        try { localStorage.setItem('chat_peer_bookmarks', JSON.stringify(list)); } catch (e) { /* ignore */ }
+        _updateSocialBadges();
+        return isNowBookmarked;
+    }
+
+    // ── direct message closed / hidden list (dismissed so they don't show in list) ──
+    function hiddenDmsSet() {
+        try { return JSON.parse(localStorage.getItem('chat_hidden_dms') || '[]'); }
+        catch (e) { return []; }
+    }
+    function isDmHidden(name) {
+        if (!name) return false;
+        return hiddenDmsSet().some(function (h) { return String(h).toLowerCase() === String(name).toLowerCase(); });
+    }
+    function hideDm(name) {
+        if (!name) return;
+        var list = hiddenDmsSet();
+        var exists = list.some(function (h) { return String(h).toLowerCase() === String(name).toLowerCase(); });
+        if (!exists) {
+            list.push(name);
+            try { localStorage.setItem('chat_hidden_dms', JSON.stringify(list)); } catch (e) {}
+        }
+    }
+    function unhideDm(name) {
+        if (!name) return;
+        var list = hiddenDmsSet();
+        var filtered = list.filter(function (h) { return String(h).toLowerCase() !== String(name).toLowerCase(); });
+        if (filtered.length !== list.length) {
+            try { localStorage.setItem('chat_hidden_dms', JSON.stringify(filtered)); } catch (e) {}
+        }
+    }
+
     // Users who spoke through SoulSync (the envelope is the app signature) —
     // sourced from the loaded messages, so it's an approximation of "runs
     // SoulSync", not a directory.
@@ -818,17 +2834,24 @@
         // Discord-style member row: avatar + presence dot, name, and an activity
         // subline (the jukebox listen state doubles as "playing a game").
         var ign = isIgnored(n);
+        var blk = isBlocked(n);
+        var fr = isFriend(n);
         var tuned = tunedMap && tunedMap[n];
         var np = npMap && npMap[n];
         return '<button class="chat-user' + (extraClass || '') + (ign ? ' chat-user--ignored' : '') +
+            (blk ? ' chat-user--blocked' : '') + (fr ? ' chat-user--friend' : '') +
             '" type="button" data-chat-user="' + attr(n) + '" title="' + attr(n) +
+            (fr ? ' (Friend)' : '') + (blk ? ' (Blocked)' : '') +
             (tuned ? ' — listening to the room jukebox' : '') + '">' +
             '<span class="chat-user-av">' +
                 _avatarHtml(n, avMap && avMap[n], 'chat-av--fill') +
                 '<span class="chat-user-dot' + (tuned ? ' chat-user-dot--tuned' : '') + '"></span>' +
             '</span>' +
             '<span class="chat-user-main">' +
-                '<span class="chat-user-name">' + esc(n) + '</span>' +
+                '<span class="chat-user-name">' + esc(n) +
+                    devBadge(n, 'inline') +
+                    (fr ? '<span class="chat-user-friend-star" title="Friend">⭐</span>' : '') +
+                '</span>' +
                 // the shared jukebox wins the line — it's what the room is doing
                 // together; a personal now-playing shows otherwise
                 (tuned
@@ -838,7 +2861,7 @@
                             '">♪ ' + esc(np.t) + (np.a ? ' · ' + esc(np.a) : '') + '</span>'
                         : '')) +
             '</span>' +
-            (ign ? '<span class="chat-user-mute">muted</span>' : '') + '</button>';
+            (blk ? '<span class="chat-user-mute">blocked</span>' : (ign ? '<span class="chat-user-mute">muted</span>' : '')) + '</button>';
     }
 
     function renderUsers(users) {
@@ -859,6 +2882,22 @@
         renderUsersList();
     }
 
+    // which sidebar group each user lands in. lead dev gets its own group
+    // above the other devs
+    function _bucketUsers(names, cls) {
+        var b = { leads: [], devs: [], self: [], friends: [], apps: [], rest: [] };
+        names.forEach(function (n) {
+            if (isLeadDev(n)) b.leads.push(n);
+            else if (isDev(n)) b.devs.push(n);
+            else if (state.selfName && n === state.selfName) b.self.push(n);
+            else if (isFriend(n)) b.friends.push(n);
+            // the flip: unknown (never spoke) = assumed SoulSync
+            else if (cls[n] !== 'vanilla') b.apps.push(n);
+            else b.rest.push(n);
+        });
+        return b;
+    }
+
     function renderUsersList() {
         var listHost = q('[data-chat-user-list]');
         if (!listHost) return;
@@ -868,13 +2907,9 @@
         });
         if (f) names = names.filter(function (n) { return n.toLowerCase().indexOf(f) > -1; });
         var cls = _userClassification();
-        var self = [], apps = [], rest = [];
-        names.forEach(function (n) {
-            if (state.selfName && n === state.selfName) self.push(n);
-            // the flip: unknown (never spoke) = assumed SoulSync
-            else if (cls[n] !== 'vanilla') apps.push(n);
-            else rest.push(n);
-        });
+        var b = _bucketUsers(names, cls);
+        var leads = b.leads, devs = b.devs, self = b.self,
+            friends = b.friends, apps = b.apps, rest = b.rest;
         var _evs = window.ChatProtocol ? _roomEvents() : [];
         var tunedMap = window.ChatProtocol
             ? window.ChatProtocol.reduceTuned(_evs) : {};            // once, not per user
@@ -883,9 +2918,21 @@
         var avMap = _avatarMap();
         // Discord groups members by role with a "NAME — count" header.
         var html = '';
+        if (leads.length) {
+            html += '<div class="chat-users-label chat-users-label--sub" style="color:#a5b4fc;">👑 Lead Developer &mdash; ' + leads.length + '</div>' +
+                leads.map(function (n) { return _userBtn(n, ' chat-user--dev', tunedMap, npMap, avMap); }).join('');
+        }
+        if (devs.length) {
+            html += '<div class="chat-users-label chat-users-label--sub" style="color:#a5b4fc;">🛠️ Developer &mdash; ' + devs.length + '</div>' +
+                devs.map(function (n) { return _userBtn(n, ' chat-user--dev', tunedMap, npMap, avMap); }).join('');
+        }
         if (self.length) {
             html += '<div class="chat-users-label chat-users-label--sub">You</div>' +
                 self.map(function (n) { return _userBtn(n, ' chat-user--self', tunedMap, npMap, avMap); }).join('');
+        }
+        if (friends.length) {
+            html += '<div class="chat-users-label chat-users-label--sub" style="color:#fbbf24;">⭐ Friends &mdash; ' + friends.length + '</div>' +
+                friends.map(function (n) { return _userBtn(n, '', tunedMap, npMap, avMap); }).join('');
         }
         if (apps.length) {
             html += '<div class="chat-users-label chat-users-label--sub">SoulSync &mdash; ' + apps.length + '</div>' +
@@ -898,7 +2945,7 @@
                 rest.length + '</div>' +
                 rest.map(function (n) { return _userBtn(n, '', tunedMap, npMap, avMap); }).join('');
         }
-        if (!self.length && !apps.length && !rest.length) {
+        if (!leads.length && !devs.length && !self.length && !friends.length && !apps.length && !rest.length) {
             html += '<div class="chat-side-none">No users match</div>';
         }
         listHost.innerHTML = html;
@@ -912,14 +2959,28 @@
         // lists saying the same thing).
         var host = q('[data-chat-convos]');
         if (!host) return;
-        var list = (convos || []).map(function (c) {
+        var list = (convos || []).filter(function (c) {
             var name = c.username || c.name || '';
-            if (!name) return '';
+            if (!name) return false;
+            var unread = c.hasUnAcknowledgedMessages || c.unAcknowledgedMessageCount > 0;
+            if (unread) {
+                unhideDm(name);
+                return true;
+            }
+            if (state.view === 'pm' && state.pmUser === name) {
+                return true;
+            }
+            return !isDmHidden(name);
+        }).map(function (c) {
+            var name = c.username || c.name || '';
             var unread = c.hasUnAcknowledgedMessages || c.unAcknowledgedMessageCount > 0;
             var on = state.view === 'pm' && state.pmUser === name;
-            return '<button class="chat-side-item' + (on ? ' chat-side-item--on' : '') +
+            return '<div class="chat-side-convo' + (on ? ' chat-side-item--on' : '') + '">' +
+                '<button class="chat-side-item' + (on ? ' chat-side-item--on' : '') +
                 '" type="button" data-chat-open-pm="' + attr(name) + '">' + esc(name) +
-                (unread ? '<span class="chat-side-dot"></span>' : '') + '</button>';
+                (unread ? '<span class="chat-side-dot"></span>' : '') + '</button>' +
+                '<button class="chat-side-convo-close" type="button" data-chat-close-pm="' + attr(name) + '" title="Close conversation">×</button>' +
+            '</div>';
         }).join('');
         host.innerHTML = list || '<div class="chat-side-none">No conversations</div>';
         renderGuilds();
@@ -3060,7 +5121,9 @@
             (state.isAdmin
                 ? '<button class="chat-userpanel-btn" type="button" data-chat-settings-btn ' +
                     'title="Chat settings">⚙</button>'
-                : '');
+                : '') +
+            '<button class="chat-userpanel-btn" type="button" data-chat-open-social="friends" ' +
+                'title="Social & Lists (Friends, Blocklist, Bookmarks)">👥</button>';
     }
 
     function renderHead() {
@@ -3124,13 +5187,20 @@
               'title="Movie night — nominate something, the room votes, owners watch together">🎬 Movie night</button>' +
               '<button class="chat-filter-btn' + (state.ssOnly ? ' chat-filter-btn--on' : '') +
               '" type="button" data-chat-filter title="' +
-              (state.ssOnly ? 'Showing SoulSync app messages only — click for everything'
-                            : 'Showing everything — click to hide other Soulseek clients') + '">' +
+              (state.ssOnly ? 'SoulSync only: hiding other Soulseek clients, and sending in SoulSync format'
+                            : 'All messages: showing every Soulseek client, and sending in plain text they can read') + '">' +
               (state.ssOnly ? 'SoulSync only' : 'All messages') + '</button>' +
               (state.isAdmin ? '<button class="chat-cog-btn" type="button" data-chat-settings-btn ' +
                   'title="Chat settings">⚙</button>' : '')
-            : '<span class="chat-head-title">' + esc(state.pmUser || '') + '</span>' +
-              '<span class="chat-head-sub">private message</span>';
+            : '<span class="chat-head-title">' + esc(state.pmUser || '') +
+              (isDev(state.pmUser) ? ' ' + devBadge(state.pmUser) : '') +
+              (isFriend(state.pmUser) ? ' <span class="chat-friend-badge" title="Friend">⭐ Friend</span>' : '') +
+              '</span>' +
+              '<span class="chat-head-sub">private message</span>' +
+              '<div class="chat-head-actions" style="margin-left:auto;display:flex;align-items:center;gap:8px;">' +
+              '<button type="button" class="chat-filter-btn" data-chat-browse-user="' + attr(state.pmUser || '') + '" title="Browse their files">📁 Browse Files</button>' +
+              '<button type="button" class="chat-head-close-pm" data-chat-head-close-pm title="Close this conversation">✕ Close Chat</button>' +
+              '</div>';
     }
 
     function renderComposer() {
@@ -3151,16 +5221,29 @@
             : 'Read-only — chat sending is admin-only on this server';
         // Formatting only exists inside the envelope — the toolbar is a ROOM
         // thing (PMs are plaintext for non-SoulSync readers + the ProveIt bots).
+        var isRoomCanSend = (state.view === 'room' && state.canSend);
         var bar = q('[data-chat-toolbar]');
-        if (bar) bar.hidden = !(state.view === 'room' && state.canSend);
+        if (bar) bar.hidden = !isRoomCanSend;
         // GIF = sending a CDN URL through the room pipeline — room-only. The
         // emoji button stays everywhere (plain unicode is fine in PMs).
         var gifBtn = q('[data-chat-gif-btn]');
-        if (gifBtn) gifBtn.hidden = !(state.view === 'room' && state.canSend);
+        if (gifBtn) gifBtn.hidden = !isRoomCanSend;
         // polls are a room thing (bus events mean nothing in a PM)
         var pollBtn = q('[data-chat-poll-btn]');
-        if (pollBtn) pollBtn.hidden = !(state.view === 'room' && state.canSend);
-        if (state.view !== 'room') { toggleEmojiPicker(true); toggleGifPicker(true); togglePollPop(true); }
+        if (pollBtn) pollBtn.hidden = !isRoomCanSend;
+        var npBtn = q('[data-chat-np-btn]');
+        if (npBtn) npBtn.hidden = !isRoomCanSend;
+        var wantBtn = q('[data-chat-want-btn]');
+        if (wantBtn) wantBtn.hidden = !isRoomCanSend;
+        // File attach works in BOTH rooms and PMs — _sendFileMessage already
+        // handles the PM branch (sends the filepost URL as plaintext).
+        var attachBtn = q('[data-chat-attach-btn]');
+        if (attachBtn) attachBtn.hidden = !state.canSend;
+        if (state.view !== 'room') { toggleGifPicker(true); togglePollPop(true); }
+        // last, because plain mode overrides the placeholder and hides the
+        // rich controls this function just showed
+        _syncModeBtn();
+        if (state.connectionError) input.placeholder = state.connectionError;
     }
 
     // ── composer toolbar (room only) ─────────────────────────────────────────
@@ -3209,6 +5292,34 @@
         if (bar) bar.hidden = true;
     }
 
+    function _jumpToRepliedMessage(user, snippet) {
+        if (!user) return;
+        var host = q('[data-chat-messages]');
+        if (!host) return;
+        var lines = host.querySelectorAll('.chat-line');
+        var targetLine = null;
+        for (var i = lines.length - 1; i >= 0; i--) {
+            var el = lines[i];
+            var author = el.closest('.chat-msg-group');
+            var authorName = author ? author.querySelector('.chat-msg-author') : null;
+            var text = el.textContent || '';
+            if ((!authorName || authorName.textContent.trim() === user) &&
+                (!snippet || text.indexOf(snippet) > -1)) {
+                targetLine = el;
+                break;
+            }
+        }
+        if (targetLine) {
+            targetLine.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            targetLine.classList.add('chat-line--highlighted');
+            setTimeout(function () {
+                targetLine.classList.remove('chat-line--highlighted');
+            }, 1800);
+        } else if (typeof showToast === 'function') {
+            showToast('Replied message is outside current view', 'info');
+        }
+    }
+
     // ── edit composing ───────────────────────────────────────────────────────
     // Reuses the reply bar as the "editing…" banner (they're mutually
     // exclusive composer modes) and preloads the input with the current text.
@@ -3240,7 +5351,7 @@
     }
 
     // ── reactions (chatbic P4) ───────────────────────────────────────────────
-    var QUICK_REACTS = ['👍', '❤️', '😂', '🔥', '🎵', '👀', '💯'];
+    var QUICK_REACTS = ['👍', '❤️', '😂', '🔥', '🎵', '👀', '💯', '✅', '🎉', '🤔', '😍', '👏'];
 
     function showReactRow(anchorBtn, user, text) {
         closeReactRow();
@@ -3249,9 +5360,271 @@
         row.setAttribute('data-chat-react-pick-row', '1');
         row.innerHTML = QUICK_REACTS.map(function (e2) {
             return '<button type="button" class="chat-emoji" data-chat-react-do="' + e2 + '">' + e2 + '</button>';
-        }).join('');
+        }).join('') +
+            '<button type="button" class="chat-emoji chat-react-more" data-chat-react-expand title="More emoji…">+</button>';
         row._target = { user: user, text: text };
         anchorBtn.parentNode.insertBefore(row, anchorBtn.nextSibling);
+    }
+
+    function _showReactFullPicker(expandBtn) {
+        var row = expandBtn.closest('[data-chat-react-pick-row]');
+        if (!row) return;
+        var existing = row.querySelector('[data-chat-react-full]');
+        if (existing) { existing.remove(); return; }
+        var panel = document.createElement('div');
+        panel.className = 'chat-react-full-picker chat-emoji-picker';
+        panel.setAttribute('data-chat-react-full', '1');
+
+        // search bar
+        var searchWrap = document.createElement('div');
+        searchWrap.className = 'chat-emoji-search-wrap';
+        searchWrap.innerHTML = '<span class="chat-emoji-search-icon">🔍</span>' +
+            '<input type="text" class="chat-emoji-search" placeholder="Search reactions (fire, lol, love)…" autocomplete="off">' +
+            '<button type="button" class="chat-emoji-search-clear" title="Clear" hidden>×</button>';
+        panel.appendChild(searchWrap);
+        var search = searchWrap.querySelector('.chat-emoji-search');
+        var clearBtn = searchWrap.querySelector('.chat-emoji-search-clear');
+
+        // category tabs
+        var tabs = document.createElement('div');
+        tabs.className = 'chat-emoji-tabs';
+        EMOJI_CATS.forEach(function (cat, i) {
+            var btn = document.createElement('button');
+            btn.type = 'button'; btn.className = 'chat-emoji-tab' + (i === 0 ? ' chat-emoji-tab--active' : '');
+            btn.setAttribute('data-emoji-cat', cat.slug);
+            btn.textContent = cat.icon; btn.title = cat.title || cat.slug;
+            tabs.appendChild(btn);
+        });
+        panel.appendChild(tabs);
+
+        // continuous scroll pane
+        var scrollPane = document.createElement('div');
+        scrollPane.className = 'chat-emoji-scroll';
+        EMOJI_CATS.forEach(function (cat) {
+            var sec = document.createElement('div');
+            sec.className = 'chat-emoji-section';
+            sec.setAttribute('data-emoji-section', cat.slug);
+            var hdr = document.createElement('div');
+            hdr.className = 'chat-emoji-cat-header';
+            hdr.textContent = cat.title || cat.slug;
+            sec.appendChild(hdr);
+            var grid = document.createElement('div');
+            grid.className = 'chat-emoji-grid';
+            grid.innerHTML = cat.names.map(function (n) {
+                var isAnim = !!ANIMATED_EMOJI[n];
+                var doVal = isAnim ? ':' + n + ':' : (EMOJI[n] || ':' + n + ':');
+                if (isAnim) {
+                    return '<button type="button" class="chat-emoji chat-emoji--anim" data-chat-react-do="' +
+                        attr(doVal) + '" data-emoji-name="' + attr(n) + '" title=":' + n + ':"><img class="chat-anim-preview" src="' +
+                        _animEmojiStaticUrl(n) + '" data-anim-src="' + _animEmojiUrl(n) + '" data-static-src="' + _animEmojiStaticUrl(n) + '" alt="' + attr(ANIMATED_EMOJI[n].u) + '" loading="lazy"></button>';
+                }
+                var e2 = EMOJI[n];
+                if (!e2) return '';
+                return '<button type="button" class="chat-emoji" data-chat-react-do="' +
+                    attr(doVal) + '" data-emoji-name="' + attr(n) + '" title=":' + n + ':">' + e2 + '</button>';
+            }).join('');
+            sec.appendChild(grid);
+            scrollPane.appendChild(sec);
+        });
+
+        // search results section
+        var searchSec = document.createElement('div');
+        searchSec.className = 'chat-emoji-section';
+        searchSec.setAttribute('data-emoji-section', 'search');
+        searchSec.hidden = true;
+        var sHdr = document.createElement('div');
+        sHdr.className = 'chat-emoji-cat-header chat-emoji-search-header';
+        sHdr.textContent = 'Search Results';
+        searchSec.appendChild(sHdr);
+        var sGrid = document.createElement('div');
+        sGrid.className = 'chat-emoji-grid';
+        searchSec.appendChild(sGrid);
+        scrollPane.appendChild(searchSec);
+        panel.appendChild(scrollPane);
+
+        // footer preview
+        var footer = document.createElement('div');
+        footer.className = 'chat-emoji-footer';
+        footer.innerHTML = '<div class="chat-emoji-footer-preview">✨</div>' +
+            '<div class="chat-emoji-footer-info">' +
+            '<div class="chat-emoji-footer-name">Pick reaction</div>' +
+            '<div class="chat-emoji-footer-cat">Hover an emoji</div></div>';
+        panel.appendChild(footer);
+
+        row.appendChild(panel);
+
+        function _setActiveTab(slug) {
+            var all = tabs.querySelectorAll('.chat-emoji-tab');
+            for (var i = 0; i < all.length; i++) {
+                if (all[i].getAttribute('data-emoji-cat') === slug) all[i].classList.add('chat-emoji-tab--active');
+                else all[i].classList.remove('chat-emoji-tab--active');
+            }
+        }
+
+        tabs.addEventListener('click', function (e2) {
+            var btn = e2.target.closest('[data-emoji-cat]');
+            if (!btn) return;
+            var slug = btn.getAttribute('data-emoji-cat');
+            var targetSec = panel.querySelector('[data-emoji-section="' + slug + '"]');
+            if (targetSec && scrollPane) {
+                search.value = '';
+                clearBtn.hidden = true;
+                searchSec.hidden = true;
+                var allSecs = scrollPane.querySelectorAll('.chat-emoji-section:not([data-emoji-section="search"])');
+                for (var j = 0; j < allSecs.length; j++) allSecs[j].hidden = false;
+                var top = targetSec.offsetTop - scrollPane.offsetTop;
+                scrollPane.scrollTo({ top: top, behavior: 'smooth' });
+                _setActiveTab(slug);
+            }
+        });
+
+        var _reactScrollSpy = null;
+        scrollPane.addEventListener('scroll', function () {
+            if (!searchSec.hidden) return;
+            if (_reactScrollSpy) return;
+            _reactScrollSpy = setTimeout(function () {
+                _reactScrollSpy = null;
+                var st = scrollPane.scrollTop;
+                var secs = scrollPane.querySelectorAll('.chat-emoji-section:not([hidden])');
+                var currentSlug = EMOJI_CATS[0].slug;
+                for (var i = 0; i < secs.length; i++) {
+                    var sec = secs[i];
+                    var diff = sec.offsetTop - scrollPane.offsetTop;
+                    if (diff <= st + 24) {
+                        currentSlug = sec.getAttribute('data-emoji-section');
+                    } else {
+                        break;
+                    }
+                }
+                _setActiveTab(currentSlug);
+            }, 40);
+        }, { passive: true });
+
+        search.addEventListener('input', function () {
+            var v = search.value.trim().toLowerCase();
+            clearBtn.hidden = !v;
+            var allSecs = scrollPane.querySelectorAll('.chat-emoji-section:not([data-emoji-section="search"])');
+            if (!v) {
+                searchSec.hidden = true;
+                for (var i = 0; i < allSecs.length; i++) allSecs[i].hidden = false;
+                return;
+            }
+            for (var j = 0; j < allSecs.length; j++) allSecs[j].hidden = true;
+            searchSec.hidden = false;
+            var hits = _searchEmojis(v);
+            sHdr.textContent = hits.length ? 'Search Results (' + hits.length + ')' : 'No matching emojis';
+            sGrid.innerHTML = hits.map(function (n) {
+                var isAnim = !!ANIMATED_EMOJI[n];
+                var doVal = isAnim ? ':' + n + ':' : (EMOJI[n] || ':' + n + ':');
+                if (isAnim) {
+                    return '<button type="button" class="chat-emoji chat-emoji--anim" data-chat-react-do="' +
+                        attr(doVal) + '" data-emoji-name="' + attr(n) + '" title=":' + n + ':"><img class="chat-anim-preview" src="' +
+                        _animEmojiStaticUrl(n) + '" data-anim-src="' + _animEmojiUrl(n) + '" data-static-src="' + _animEmojiStaticUrl(n) + '" alt="' + attr(ANIMATED_EMOJI[n].u) + '" loading="lazy"></button>';
+                }
+                var e2 = EMOJI[n];
+                if (!e2) return '';
+                return '<button type="button" class="chat-emoji" data-chat-react-do="' +
+                    attr(doVal) + '" data-emoji-name="' + attr(n) + '" title=":' + n + ':">' + e2 + '</button>';
+            }).join('');
+        });
+
+        clearBtn.addEventListener('click', function () {
+            search.value = '';
+            clearBtn.hidden = true;
+            searchSec.hidden = true;
+            var allSecs = scrollPane.querySelectorAll('.chat-emoji-section:not([data-emoji-section="search"])');
+            for (var i = 0; i < allSecs.length; i++) allSecs[i].hidden = false;
+            search.focus();
+        });
+
+        search.addEventListener('keydown', function (e2) {
+            if (e2.key === 'Enter') {
+                e2.preventDefault();
+                var first = panel.querySelector('.chat-emoji-section:not([hidden]) [data-chat-react-do]');
+                if (first) {
+                    var em = first.getAttribute('data-chat-react-do');
+                    if (em && row._target) sendReaction(row._target, em);
+                }
+            } else if (e2.key === 'Escape') {
+                e2.preventDefault();
+                closeReactRow();
+            }
+        });
+
+        var _activeReactBtn = null;
+        function _deactivateReactBtn() {
+            if (!_activeReactBtn) return;
+            var img = _activeReactBtn.querySelector('img[data-static-src]');
+            if (img) {
+                var s = img.getAttribute('data-static-src');
+                if (img.src !== s) img.src = s;
+            }
+            _activeReactBtn = null;
+        }
+
+        var _reactPreviewName = null;
+        var _reactPreviewRaf = null;
+
+        panel.addEventListener('mouseover', function (e2) {
+            var btn = e2.target.closest('[data-chat-react-do]');
+            if (btn) {
+                if (_activeReactBtn && _activeReactBtn !== btn) {
+                    _deactivateReactBtn();
+                }
+                _activeReactBtn = btn;
+                var curImg = btn.querySelector('img[data-anim-src]');
+                if (curImg) {
+                    var a = curImg.getAttribute('data-anim-src');
+                    if (curImg.src !== a) curImg.src = a;
+                }
+                var name = btn.getAttribute('data-emoji-name');
+                if (_reactPreviewName === name) return;
+                _reactPreviewName = name;
+
+                if (_reactPreviewRaf) cancelAnimationFrame(_reactPreviewRaf);
+                _reactPreviewRaf = requestAnimationFrame(function () {
+                    var cat = name ? _emojiCatFor(name) : null;
+                    var prevEl = footer.querySelector('.chat-emoji-footer-preview');
+                    var nameEl = footer.querySelector('.chat-emoji-footer-name');
+                    var catEl = footer.querySelector('.chat-emoji-footer-cat');
+                    if (!prevEl || !nameEl || !catEl) return;
+                    if (name && ANIMATED_EMOJI[name]) {
+                        var img = prevEl.querySelector('img');
+                        var url = _animEmojiUrl(name);
+                        if (img) {
+                            if (img.getAttribute('data-src') !== url) {
+                                img.setAttribute('data-src', url);
+                                img.src = url;
+                                img.alt = ANIMATED_EMOJI[name].u;
+                            }
+                        } else {
+                            prevEl.innerHTML = '<img class="chat-anim-preview chat-anim-preview--lg" data-src="' + url + '" src="' + url + '" alt="' + attr(ANIMATED_EMOJI[name].u) + '">';
+                        }
+                    } else {
+                        prevEl.textContent = btn.textContent.trim() || '✨';
+                    }
+                    if (name) nameEl.textContent = ':' + name + ':';
+                    if (cat) catEl.textContent = cat.title;
+                });
+            } else if (e2.target.closest('.chat-emoji-tabs') || e2.target.closest('.chat-emoji-header')) {
+                _deactivateReactBtn();
+            }
+        });
+
+        panel.addEventListener('mouseleave', function () {
+            _deactivateReactBtn();
+            _reactPreviewName = null;
+        });
+
+        panel.addEventListener('click', function (e2) {
+            var btn = e2.target.closest('[data-chat-react-do]');
+            if (btn) {
+                var em = btn.getAttribute('data-chat-react-do');
+                if (em && row._target) sendReaction(row._target, em);
+            }
+        });
+
+        search.focus();
     }
 
     function closeReactRow() {
@@ -3302,12 +5675,31 @@
         if (!overlay) { openPm(name); return; }
         var body = q('[data-chat-user-card-body]');
         if (body) {
+            var isFr = isFriend(name);
             body.innerHTML = '<div class="chat-card-head">' + _avatar(name) +
-                '<span class="chat-card-name">' + esc(name) + '</span></div>' +
+                '<span class="chat-card-name">' + esc(name) + '</span>' +
+                devBadge(name, 'lg') +
+                (isFr ? '<span class="chat-friend-badge" style="margin-left:8px;">⭐ Friend</span>' : '') +
+                '</div>' +
+                (isDev(name) ? '<div class="chat-card-sub" style="color:#a5b4fc;font-weight:700;font-size:12px;margin:2px 0 6px;">🛠️ ' + esc(devTitle(name)) + '</div>' : '') +
                 '<div class="chat-card-info">Loading…</div>';
         }
         overlay.hidden = false;
         overlay.setAttribute('data-chat-user-card-for', name);
+        var frBtn = overlay.querySelector('[data-chat-card-friend]');
+        if (frBtn) {
+            frBtn.hidden = state.selfName && name === state.selfName;
+            frBtn.textContent = isFriend(name) ? '⭐ Remove Friend' : '⭐ Add Friend';
+        }
+        var blkBtn = overlay.querySelector('[data-chat-card-block]');
+        if (blkBtn) {
+            blkBtn.hidden = state.selfName && name === state.selfName;
+            blkBtn.textContent = isBlocked(name) ? 'Unblock' : '🚫 Block';
+        }
+        var bmBtn = overlay.querySelector('[data-chat-card-bookmark]');
+        if (bmBtn) {
+            bmBtn.textContent = isPeerBookmarked(name) ? '★ Bookmarked' : '⭐ Bookmark';
+        }
         var ignBtn = overlay.querySelector('[data-chat-card-ignore]');
         if (ignBtn) {
             ignBtn.hidden = state.selfName && name === state.selfName;
@@ -3452,8 +5844,8 @@
         });
     }
 
-    // ── share browser: a peer's files, downloadable in place ─────────────────
-    var _browse = { user: null, dirs: [], dir: null, files: [] };
+    // ── slide-over peer hub & file explorer (better than nicotine+/slskd) ───────
+    var _browse = { user: null, dirs: [], dir: null, files: [], crumbs: [{ name: 'Shares', path: null }] };
 
     function _fmtSize(bytes) {
         if (!bytes) return '';
@@ -3467,128 +5859,476 @@
         return parts[parts.length - 1] || path;
     }
 
+    function _fileQualityBadge(fn) {
+        if (!fn) return '';
+        var lower = fn.toLowerCase();
+        if (lower.endsWith('.flac')) {
+            return '<span class="chat-audio-badge chat-audio-badge--flac">FLAC</span>';
+        }
+        if (lower.endsWith('.wav')) {
+            return '<span class="chat-audio-badge chat-audio-badge--wav">WAV</span>';
+        }
+        if (lower.endsWith('.mp3')) {
+            var match = lower.match(/(320|256|192|v0|v2)/i);
+            var label = match ? match[1].toUpperCase() : 'MP3';
+            return '<span class="chat-audio-badge chat-audio-badge--mp3">' + esc(label) + '</span>';
+        }
+        if (lower.endsWith('.m4a') || lower.endsWith('.aac')) {
+            return '<span class="chat-audio-badge chat-audio-badge--mp3">AAC</span>';
+        }
+        return '';
+    }
+
+    function _folderFormatBadge(dirName) {
+        if (!dirName) return '';
+        var s = String(dirName).toLowerCase();
+        // Hi-Res / 24-bit FLAC
+        if (/(24[\s\-]?bit|24\/96|24\/192|96khz|192khz|hi[\s\-]?res)/i.test(s)) {
+            return '<span class="chat-folder-badge chat-folder-badge--flac">FLAC 24-bit</span>';
+        }
+        // Standard FLAC / Lossless / ALAC
+        if (/(flac|lossless|alac)/i.test(s)) {
+            return '<span class="chat-folder-badge chat-folder-badge--flac">FLAC</span>';
+        }
+        // Vinyl rips
+        if (/(vinyl|lp[\s\-_]rip|vinylrip)/i.test(s)) {
+            return '<span class="chat-folder-badge chat-folder-badge--vinyl">VINYL</span>';
+        }
+        // WAV
+        if (/(\bwav\b|\.wav)/i.test(s)) {
+            return '<span class="chat-folder-badge chat-folder-badge--wav">WAV</span>';
+        }
+        // MP3 320k
+        if (/(320|320k|320kbps|cbr)/i.test(s)) {
+            return '<span class="chat-folder-badge chat-folder-badge--320">320K</span>';
+        }
+        // V0 / V2 / VBR
+        if (/(v0|v2|vbr)/i.test(s)) {
+            return '<span class="chat-folder-badge chat-folder-badge--vbr">V0 VBR</span>';
+        }
+        return '';
+    }
+
+    function closeBrowse() {
+        var overlay = q('[data-chat-browse-modal]');
+        var backdrop = q('[data-chat-browse-backdrop]');
+        if (overlay) {
+            overlay.classList.remove('visible');
+            setTimeout(function () { overlay.hidden = true; }, 320);
+        }
+        if (backdrop) {
+            backdrop.classList.remove('visible');
+            setTimeout(function () { backdrop.hidden = true; }, 320);
+        }
+        if (window.location.hash && window.location.hash.indexOf('#browse') === 0) {
+            try { history.replaceState(null, '', window.location.pathname + window.location.search); } catch (e) {}
+        }
+    }
+
     function openBrowse(name) {
         if (!name) return;
         closeUserCard();
         var overlay = q('[data-chat-browse-modal]');
+        var backdrop = q('[data-chat-browse-backdrop]');
         if (!overlay) return;
-        _browse = { user: name, dirs: [], dir: null, files: [] };
+        _browse = {
+            user: name,
+            dirs: [],
+            cache: {},
+            expanded: {},
+            selected: {},
+            filter: '',
+            formatFilter: 'all'
+        };
         overlay.hidden = false;
+        if (backdrop) backdrop.hidden = false;
+        requestAnimationFrame(function () {
+            overlay.classList.add('visible');
+            if (backdrop) backdrop.classList.add('visible');
+        });
+
+        // Set Hero identity
         var title = q('[data-chat-browse-title]');
-        if (title) title.textContent = name + '’s files';
+        if (title) {
+            title.innerHTML = esc(name) + (isDev(name) ? ' ' + devBadge(name, 'inline') : '');
+        }
+        var av = q('[data-chat-browse-av]');
+        if (av) av.textContent = (name[0] || '👤').toUpperCase();
+        var statusText = q('[data-chat-browse-status-text]');
+        if (statusText) statusText.textContent = isDev(name) ? devTitle(name) : 'Connecting…';
+
+        // Setup format filter pills
+        var pBar = q('.chat-browse-format-filters');
+        if (pBar) {
+            pBar.querySelectorAll('.chat-fmt-pill').forEach(function (pill) {
+                pill.classList.toggle('chat-fmt-pill--active', pill.getAttribute('data-chat-browse-fmt') === 'all');
+            });
+        }
+
+        // Setup bookmark button & saved peers count
+        var bmBtn = q('[data-chat-peer-bookmark]');
+        if (bmBtn) {
+            var isBm = isPeerBookmarked(name);
+            bmBtn.textContent = isBm ? '★ Bookmarked' : '⭐ Bookmark';
+            bmBtn.classList.toggle('chat-peer-bm-btn--active', isBm);
+        }
+        _updateSavedPeersBtn();
+
+        // Setup friend and block quickbar buttons
+        var frBtn = q('[data-chat-browse-friend]');
+        if (frBtn) {
+            frBtn.textContent = isFriend(name) ? '⭐ Friend (Remove)' : '⭐ Friend';
+        }
+        var blkBtn = q('[data-chat-browse-block]');
+        if (blkBtn) {
+            blkBtn.textContent = isBlocked(name) ? 'Unblock' : '🚫 Block';
+        }
+
+        // Reset telemetry
+        var spd = q('[data-chat-browse-speed]');
+        if (spd) { spd.textContent = '—'; spd.className = 'chat-peer-stat-val'; }
+        var qEl = q('[data-chat-browse-queue]');
+        if (qEl) qEl.textContent = '—';
+        var slots = q('[data-chat-browse-slots]');
+        if (slots) { slots.textContent = '—'; slots.className = 'chat-peer-stat-val'; }
+        var fCount = q('[data-chat-browse-folders-count]');
+        if (fCount) fCount.textContent = '—';
+        var histPill = q('[data-chat-browse-history]');
+        if (histPill) histPill.hidden = true;
+
         var inp = q('[data-chat-browse-search]');
-        if (inp) { inp.value = ''; inp.placeholder = 'Filter folders…'; }
-        _browseChrome();
+        if (inp) { inp.value = ''; inp.placeholder = 'Filter folders or search files…'; }
+        _syncBrowseDock();
+
         var body = q('[data-chat-browse-body]');
-        if (body) body.innerHTML = '<div class="chat-gif-hint">Browsing ' + esc(name) + '’s shares…</div>';
+        if (body) body.innerHTML = '<div class="chat-gif-hint">Connecting to ' + esc(name) + '’s Soulseek node…</div>';
+
+        // Update hash for browser Back navigation
+        try { history.replaceState(null, '', '#browse/' + encodeURIComponent(name)); } catch (e) {}
+
+        // Fetch User Info / Telemetry in parallel
+        getJSON('/api/chat/user/' + encodeURIComponent(name)).then(function (res) {
+            if (_browse.user !== name) return;
+            var info = (res.ok && res.body.info) || {};
+            var status = (res.ok && res.body.status) || {};
+            var hist = (res.ok && res.body.history) || null;
+
+            if (statusText) {
+                var pres = status.presence || status.status ||
+                    (status.isOnline === true ? 'Online' : (status.isOnline === false ? 'Offline' : 'Soulseek Peer'));
+                statusText.textContent = String(pres);
+            }
+            if (spd) {
+                spd.textContent = info.uploadSpeed ? (_fmtBytes(info.uploadSpeed) + '/s') : (status.uploadSpeed ? _fmtBytes(status.uploadSpeed) + '/s' : 'Available');
+                spd.className = 'chat-peer-stat-val chat-peer-stat-val--good';
+            }
+            if (qEl) {
+                qEl.textContent = info.queueLength != null ? String(info.queueLength) : '0';
+            }
+            if (slots) {
+                slots.textContent = info.hasFreeUploadSlot ? 'Yes' : (info.uploadSlots ? String(info.uploadSlots) : 'Free');
+                if (info.hasFreeUploadSlot) slots.className = 'chat-peer-stat-val chat-peer-stat-val--good';
+            }
+            if (hist && hist.downloads > 0 && histPill) {
+                var ht = q('[data-chat-browse-history-text]');
+                if (ht) {
+                    ht.textContent = hist.downloads + ' downloads · ' +
+                        (hist.success_rate != null ? hist.success_rate + '% success · ' : '') +
+                        (hist.total_bytes > 0 ? _fmtBytes(hist.total_bytes) : '');
+                }
+                histPill.hidden = false;
+            }
+        });
+
+        // Fetch Shares
         getJSON('/api/chat/user/' + encodeURIComponent(name) + '/shares').then(function (res) {
             if (_browse.user !== name) return;
             if (!res.ok) {
                 if (body) {
                     body.innerHTML = '<div class="chat-gif-hint">' +
                         esc(res.body && res.body.error || 'Could not browse') + '</div>' +
-                        '<div class="chat-browse-retry-row">' +
+                        '<div class="chat-browse-retry-row" style="text-align:center;margin-top:16px;">' +
                         '<button type="button" class="modal-button modal-button--primary" ' +
                             'data-chat-browse-retry>Try again</button></div>';
                 }
                 return;
             }
             _browse.dirs = res.body.directories || [];
-            renderBrowseDirs('');
+            if (fCount) fCount.textContent = _browse.dirs.length + ' folders';
+            renderBrowseTree('');
         });
     }
 
-    function _browseChrome() {
-        var back = q('[data-chat-browse-back]');
-        var dl = q('[data-chat-browse-dl]');
-        var inp = q('[data-chat-browse-search]');
-        var inFiles = _browse.dir != null;
-        if (back) back.hidden = !inFiles;
-        if (dl) dl.hidden = !inFiles;
-        if (inp) inp.placeholder = inFiles ? 'Filter files…' : 'Filter folders…';
-    }
-
-    function renderBrowseDirs(filter) {
+    function renderBrowseTree(filter) {
         var body = q('[data-chat-browse-body]');
         if (!body) return;
-        _browse.dir = null; _browse.files = [];
-        _browseChrome();
-        var f = String(filter || '').toLowerCase();
+        _browse.filter = filter != null ? filter : (_browse.filter || '');
+        var f = String(_browse.filter).toLowerCase();
+        var fmt = _browse.formatFilter || 'all';
+
         var dirs = _browse.dirs.filter(function (d) {
-            return !f || d.name.toLowerCase().indexOf(f) > -1;
-        }).slice(0, 400);
+            if (fmt === 'flac') {
+                var s = d.name.toLowerCase();
+                var isFlac = /(flac|24bit|24-bit|lossless|alac|vinyl)/i.test(s);
+                var cached = _browse.cache[d.name];
+                if (!isFlac && cached) isFlac = cached.some(function (x) { return /\.flac$/i.test(x.filename); });
+                if (!isFlac) return false;
+            } else if (fmt === '320') {
+                var s = d.name.toLowerCase();
+                var is320 = /(320|320k|320kbps|cbr)/i.test(s);
+                var cached = _browse.cache[d.name];
+                if (!is320 && cached) is320 = cached.some(function (x) { return /320/i.test(x.filename); });
+                if (!is320) return false;
+            } else if (fmt === 'vbr') {
+                var s = d.name.toLowerCase();
+                var isVbr = /(v0|v2|vbr|mp3)/i.test(s) && !/(320|flac|lossless)/i.test(s);
+                var cached = _browse.cache[d.name];
+                if (!isVbr && cached) isVbr = cached.some(function (x) { return /\.(mp3|aac|m4a)$/i.test(x.filename) && !/320/i.test(x.filename); });
+                if (!isVbr) return false;
+            }
+            if (!f) return true;
+            if (d.name.toLowerCase().indexOf(f) > -1) return true;
+            var cached2 = _browse.cache[d.name];
+            if (cached2 && cached2.some(function (x) { return x.filename.toLowerCase().indexOf(f) > -1; })) return true;
+            return false;
+        }).slice(0, 500);
+
         if (!dirs.length) {
             body.innerHTML = '<div class="chat-gif-hint">' +
-                (_browse.dirs.length ? 'No folders match' : 'Nothing shared') + '</div>';
+                (_browse.dirs.length ? 'No folders match that filter' : 'Nothing shared') + '</div>';
+            _syncBrowseDock();
             return;
         }
+
         body.innerHTML = dirs.map(function (d) {
-            return '<button type="button" class="chat-browse-row" data-chat-browse-dir="' +
-                attr(d.name) + '" title="' + attr(d.name) + '">' +
-                '<span class="chat-browse-icon">📁</span>' +
-                '<span class="chat-browse-name">' + esc(_baseName(d.name)) + '</span>' +
-                '<span class="chat-browse-meta">' + d.file_count + ' file' +
-                    (d.file_count === 1 ? '' : 's') + '</span></button>';
+            var isExp = !!_browse.expanded[d.name];
+            var fmtBadge = _folderFormatBadge(d.name);
+            return '<div class="chat-folder-tree-item' + (isExp ? ' chat-folder-tree-item--open' : '') + '" data-chat-folder-item="' + attr(d.name) + '">' +
+                '<div class="chat-folder-header" data-chat-browse-toggle="' + attr(d.name) + '">' +
+                    '<button type="button" class="chat-folder-chevron' + (isExp ? ' chat-folder-chevron--expanded' : '') + '" ' +
+                            'data-chat-browse-toggle="' + attr(d.name) + '" title="' + (isExp ? 'Collapse' : 'Expand') + '">' +
+                        '<svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>' +
+                    '</button>' +
+                    '<span class="chat-folder-icon">' + (isExp ? '📂' : '📁') + '</span>' +
+                    '<div class="chat-folder-info" title="' + attr(d.name) + '">' +
+                        '<div class="chat-folder-title-row">' +
+                            '<span class="chat-folder-name">' + esc(_baseName(d.name)) + '</span>' +
+                            fmtBadge +
+                        '</div>' +
+                        '<span class="chat-folder-meta">' + d.file_count + ' file' + (d.file_count === 1 ? '' : 's') + '</span>' +
+                    '</div>' +
+                    '<div class="chat-folder-actions">' +
+                        '<button type="button" class="chat-folder-dl-btn" data-chat-browse-dl-folder="' + attr(d.name) + '" title="Download entire folder in 1 click">' +
+                            '⬇ Download Folder</button>' +
+                    '</div>' +
+                '</div>' +
+                '<div class="chat-folder-children" data-chat-browse-children="' + attr(d.name) + '"' + (isExp ? '' : ' hidden') + '>' +
+                    (isExp ? _renderFolderChildrenHtml(d.name) : '') +
+                '</div>' +
+            '</div>';
         }).join('');
+
+        _syncBrowseDock();
     }
 
-    function openBrowseDir(dirName) {
+    function _renderFolderChildrenHtml(dirName) {
+        var files = _browse.cache[dirName];
+        if (!files) {
+            return '<div class="chat-folder-loading"><span class="chat-spinner-micro"></span> Loading files in ' + esc(_baseName(dirName)) + '…</div>';
+        }
+        var f = String(_browse.filter || '').toLowerCase();
+        var visibleFiles = files.filter(function (x) {
+            return !f || x.filename.toLowerCase().indexOf(f) > -1 || dirName.toLowerCase().indexOf(f) > -1;
+        });
+        if (!visibleFiles.length) {
+            return '<div class="chat-folder-empty">No matching files</div>';
+        }
+
+        var allChecked = visibleFiles.every(function (x) { return !!_browse.selected[x.filename]; });
+
+        var html = '<div class="chat-folder-subhead">' +
+            '<label class="chat-file-row chat-file-row--folder-all">' +
+                '<input type="checkbox" data-chat-browse-folder-all="' + attr(dirName) + '"' + (allChecked ? ' checked' : '') + '>' +
+                '<span class="chat-file-name" style="font-weight:700;">Select all in this folder (' + visibleFiles.length + ' tracks)</span>' +
+            '</label>' +
+        '</div>';
+
+        html += visibleFiles.map(function (x) {
+            var isSel = !!_browse.selected[x.filename];
+            var qBadge = _fileQualityBadge(x.filename);
+            return '<label class="chat-file-row' + (isSel ? ' chat-file-row--selected' : '') + '">' +
+                '<input type="checkbox" data-chat-browse-file="' + attr(x.filename) + '" data-chat-browse-size="' + (x.size || 0) + '" data-chat-browse-dir="' + attr(dirName) + '"' + (isSel ? ' checked' : '') + '>' +
+                '<span class="chat-file-icon">🎵</span>' +
+                '<span class="chat-file-name" title="' + attr(x.filename) + '">' + esc(_baseName(x.filename)) + '</span>' +
+                qBadge +
+                '<span class="chat-file-size">' + _fmtSize(x.size) + '</span>' +
+                '<button type="button" class="chat-file-quick-dl" data-chat-browse-dl-single="' + attr(x.filename) + '" data-chat-browse-size="' + (x.size || 0) + '" title="Download this track">⬇</button>' +
+            '</label>';
+        }).join('');
+
+        return html;
+    }
+
+    function _findBrowseFolderItem(dirName) {
+        if (!dirName) return null;
         var body = q('[data-chat-browse-body]');
-        if (!body) return;
-        _browse.dir = dirName;
-        _browseChrome();
-        body.innerHTML = '<div class="chat-gif-hint">Loading files…</div>';
+        if (!body) return null;
+        var items = body.querySelectorAll('.chat-folder-tree-item');
+        for (var i = 0; i < items.length; i++) {
+            if (items[i].getAttribute('data-chat-folder-item') === dirName) {
+                return items[i];
+            }
+        }
+        return null;
+    }
+
+    function toggleBrowseFolder(dirName, itemEl) {
+        if (!dirName) return;
+        var willExpand = !_browse.expanded[dirName];
+        _browse.expanded[dirName] = willExpand;
+
+        var item = itemEl || _findBrowseFolderItem(dirName);
+        var childrenEl = item ? item.querySelector('.chat-folder-children') : null;
+        var chevron = item ? item.querySelector('.chat-folder-chevron') : null;
+        var icon = item ? item.querySelector('.chat-folder-icon') : null;
+
+        if (item) {
+            if (willExpand) item.classList.add('chat-folder-tree-item--open');
+            else item.classList.remove('chat-folder-tree-item--open');
+        }
+        if (chevron) {
+            if (willExpand) chevron.classList.add('chat-folder-chevron--expanded');
+            else chevron.classList.remove('chat-folder-chevron--expanded');
+            chevron.setAttribute('title', willExpand ? 'Collapse' : 'Expand');
+        }
+        if (icon) {
+            icon.textContent = willExpand ? '📂' : '📁';
+        }
+
+        if (childrenEl) {
+            childrenEl.hidden = !willExpand;
+            if (willExpand) {
+                if (_browse.cache[dirName]) {
+                    childrenEl.innerHTML = _renderFolderChildrenHtml(dirName);
+                    _syncBrowseDock();
+                } else {
+                    childrenEl.innerHTML = '<div class="chat-folder-loading"><span class="chat-spinner-micro"></span> Loading files in ' + esc(_baseName(dirName)) + '…</div>';
+                    var name = _browse.user;
+                    getJSON('/api/chat/user/' + encodeURIComponent(name) + '/shares/files?dir=' + encodeURIComponent(dirName)).then(function (res) {
+                        if (_browse.user !== name) return;
+                        var curItem = item || _findBrowseFolderItem(dirName);
+                        var curChildren = curItem ? curItem.querySelector('.chat-folder-children') : null;
+                        if (!curChildren) return;
+                        if (!res.ok) {
+                            curChildren.innerHTML = '<div class="chat-folder-empty">' + esc(res.body && res.body.error || 'Could not load folder') + '</div>';
+                            return;
+                        }
+                        _browse.cache[dirName] = res.body.files || [];
+                        curChildren.innerHTML = _renderFolderChildrenHtml(dirName);
+                        _syncBrowseDock();
+                    });
+                }
+            }
+        }
+    }
+
+    function expandAllBrowseFolders() {
+        var dirs = _browse.dirs || [];
+        dirs.forEach(function (d) {
+            _browse.expanded[d.name] = true;
+        });
+        renderBrowseTree(_browse.filter || '');
+        dirs.forEach(function (d) {
+            if (!_browse.cache[d.name]) {
+                var name = _browse.user;
+                getJSON('/api/chat/user/' + encodeURIComponent(name) + '/shares/files?dir=' + encodeURIComponent(d.name)).then(function (res) {
+                    if (_browse.user !== name || !_browse.expanded[d.name]) return;
+                    if (res.ok) {
+                        _browse.cache[d.name] = res.body.files || [];
+                        var item = _findBrowseFolderItem(d.name);
+                        var ch = item ? item.querySelector('.chat-folder-children') : null;
+                        if (ch) ch.innerHTML = _renderFolderChildrenHtml(d.name);
+                        _syncBrowseDock();
+                    }
+                });
+            }
+        });
+    }
+
+    function collapseAllBrowseFolders() {
+        _browse.expanded = {};
+        renderBrowseTree(_browse.filter || '');
+    }
+
+    function _syncBrowseDock() {
+        var dock = q('[data-chat-browse-dock]');
+        var countEl = q('[data-chat-dock-count]');
+        var sizeEl = q('[data-chat-dock-size]');
+        if (!dock) return;
+        var selected = _browse.selected || {};
+        var keys = Object.keys(selected);
+        var count = keys.length;
+        var totalBytes = 0;
+        keys.forEach(function (k) {
+            totalBytes += Number(selected[k].size) || 0;
+        });
+
+        if (count > 0) {
+            dock.hidden = false;
+            if (countEl) countEl.textContent = count;
+            if (sizeEl) sizeEl.textContent = _fmtSize(totalBytes);
+        } else {
+            dock.hidden = true;
+        }
+    }
+
+    function downloadFolder(dirName) {
+        if (!_browse.user || !dirName) return;
+        if (typeof showToast === 'function') showToast('Fetching files in ' + _baseName(dirName) + '…', 'info');
         var name = _browse.user;
         getJSON('/api/chat/user/' + encodeURIComponent(name) + '/shares/files?dir=' +
                 encodeURIComponent(dirName)).then(function (res) {
-            if (_browse.user !== name || _browse.dir !== dirName) return;
-            if (!res.ok) {
-                body.innerHTML = '<div class="chat-gif-hint">' +
-                    esc(res.body && res.body.error || 'Could not read that folder') + '</div>';
+            if (!res.ok || !res.body.files || !res.body.files.length) {
+                if (typeof showToast === 'function') showToast('Could not read files for that folder', 'error');
                 return;
             }
-            _browse.files = res.body.files || [];
-            renderBrowseFiles('');
+            _browse.cache[dirName] = res.body.files;
+            var files = res.body.files.map(function (x) {
+                return { filename: x.filename, size: x.size };
+            });
+            postJSON('/api/chat/user/' + encodeURIComponent(name) + '/download', { files: files }).then(function (dRes) {
+                if (!dRes.ok) {
+                    if (typeof showToast === 'function') showToast(dRes.body && dRes.body.error || 'Could not queue folder', 'error');
+                    return;
+                }
+                var n = dRes.body.queued || 0;
+                if (typeof showToast === 'function') {
+                    showToast('Queued ' + n + ' files from ' + _baseName(dirName) + ' — check Downloads', 'success');
+                }
+            });
         });
     }
 
-    function renderBrowseFiles(filter) {
-        var body = q('[data-chat-browse-body]');
-        if (!body) return;
-        var f = String(filter || '').toLowerCase();
-        var files = _browse.files.filter(function (x) {
-            return !f || x.filename.toLowerCase().indexOf(f) > -1;
-        }).slice(0, 500);
-        if (!files.length) {
-            body.innerHTML = '<div class="chat-gif-hint">No files here</div>';
-            return;
-        }
-        body.innerHTML =
-            '<label class="chat-browse-row chat-browse-row--all">' +
-                '<input type="checkbox" data-chat-browse-all checked>' +
-                '<span class="chat-browse-name">Select all (' + files.length + ')</span>' +
-            '</label>' +
-            files.map(function (x, i) {
-                return '<label class="chat-browse-row">' +
-                    '<input type="checkbox" data-chat-browse-file="' + i + '" checked>' +
-                    '<span class="chat-browse-name" title="' + attr(x.filename) + '">' +
-                        esc(_baseName(x.filename)) + '</span>' +
-                    '<span class="chat-browse-meta">' + _fmtSize(x.size) + '</span></label>';
-            }).join('');
-        body._files = files;
+    function downloadSingleTrack(filePath, size) {
+        if (!_browse.user || !filePath) return;
+        postJSON('/api/chat/user/' + encodeURIComponent(_browse.user) + '/download',
+                 { files: [{ filename: filePath, size: Number(size) || 0 }] }).then(function (res) {
+            if (!res.ok) {
+                if (typeof showToast === 'function') {
+                    showToast(res.body && res.body.error || 'Could not queue track', 'error');
+                }
+                return;
+            }
+            if (typeof showToast === 'function') {
+                showToast('Queued ' + _baseName(filePath) + ' — check Downloads', 'success');
+            }
+        });
     }
 
     function browseDownloadSelected() {
-        var body = q('[data-chat-browse-body]');
         var dl = q('[data-chat-browse-dl]');
-        if (!body || !body._files) return;
-        var picked = [];
-        body.querySelectorAll('[data-chat-browse-file]').forEach(function (cb) {
-            if (cb.checked) {
-                var x = body._files[Number(cb.getAttribute('data-chat-browse-file'))];
-                if (x) picked.push({ filename: x.filename, size: x.size });
-            }
-        });
+        var selected = _browse.selected || {};
+        var picked = Object.values(selected);
         if (!picked.length) {
             if (typeof showToast === 'function') showToast('Nothing selected', 'info');
             return;
@@ -3596,7 +6336,7 @@
         if (dl) { dl.disabled = true; dl.textContent = 'Queueing…'; }
         postJSON('/api/chat/user/' + encodeURIComponent(_browse.user) + '/download',
                  { files: picked }).then(function (res) {
-            if (dl) { dl.disabled = false; dl.textContent = 'Download selected'; }
+            if (dl) { dl.disabled = false; dl.textContent = 'Download Selected'; }
             if (!res.ok) {
                 if (typeof showToast === 'function') {
                     showToast(res.body && res.body.error || 'Could not queue downloads', 'error');
@@ -3608,6 +6348,17 @@
                 showToast('Queued ' + n + ' file' + (n === 1 ? '' : 's') + ' from ' +
                           _browse.user + ' — check Downloads', 'success');
             }
+            _browse.selected = {};
+            var body = q('[data-chat-browse-body]');
+            if (body) {
+                body.querySelectorAll('[data-chat-browse-file], [data-chat-browse-folder-all]').forEach(function (cb) {
+                    cb.checked = false;
+                });
+                body.querySelectorAll('.chat-file-row--selected').forEach(function (r) {
+                    r.classList.remove('chat-file-row--selected');
+                });
+            }
+            _syncBrowseDock();
         });
     }
 
@@ -3637,28 +6388,43 @@
 
     // ── slash commands (room only — power-user glue over existing features)
     var SLASH_COMMANDS = [
-        { c: '/play',  a: '<song or link>', d: 'queue it on the jukebox' },
-        { c: '/skip',  a: '', d: 'vote to skip the current track' },
-        { c: '/tune',  a: '', d: 'tune in or out of the jukebox' },
-        { c: '/topic', a: '<text>', d: 'set the room topic' },
-        { c: '/poll',  a: '<question>', d: 'start a room poll' },
-        { c: '/pin',   a: '', d: 'pin the latest message' },
-        { c: '/gif',   a: '<search>', d: 'find a GIF' },
-        { c: '/shrug', a: '[message]', d: 'appends \u00af\\_(\u30c4)_/\u00af' },
+        { c: '/np',        a: '', d: 'share what you are playing right now' },
+        { c: '/want',      a: '[query]', d: 'search & post an In Search Of (Wanted) card' },
+        { c: '/iso',       a: '[query]', d: 'alias for /want' },
+        { c: '/friends',   a: '', d: 'open your Friends list' },
+        { c: '/blocklist', a: '', d: 'open your Blocklist' },
+        { c: '/bookmarks', a: '', d: 'open your Bookmarked Peers' },
+        { c: '/browse',    a: '<user>', d: "browse a peer's shared files" },
+        { c: '/upload',    a: '', d: 'upload & share a file via filepost.dev' },
+        { c: '/play',      a: '<song or link>', d: 'queue it on the jukebox' },
+        { c: '/skip',      a: '', d: 'vote to skip the current track' },
+        { c: '/tune',      a: '', d: 'tune in or out of the jukebox' },
+        { c: '/topic',     a: '<text>', d: 'set the room topic' },
+        { c: '/poll',      a: '<question>', d: 'start a room poll' },
+        { c: '/pin',       a: '', d: 'pin the latest message' },
+        { c: '/gif',       a: '<search>', d: 'find a GIF' },
+        { c: '/shrug',     a: '[message]', d: 'appends \u00af\\_(\u30c4)_/\u00af' },
     ];
 
     function updateSlashPop(input) {
         var pop = q('[data-chat-mention-pop]');
         if (!pop) return;
         var v = String(input.value || '');
-        var active = state.view === 'room' && state.canSend &&
-            v[0] === '/' && v.length <= 12 && !/\s/.test(v);
+        // Slash commands show in rooms; /upload also shows in PMs since
+        // file uploads work in both (the backend handles it).
+        var active = state.canSend && v[0] === '/' && v.length <= 12 && !/\s/.test(v) &&
+            (state.view === 'room' || v.indexOf('/upload') === 0);
         if (!active) {
             // only clear the pop when WE own it (mentions share the host)
             if (pop.querySelector('[data-chat-slash-pick]')) { pop.hidden = true; pop.innerHTML = ''; }
             return;
         }
-        var hits = SLASH_COMMANDS.filter(function (sc) { return sc.c.indexOf(v) === 0; });
+        var hits = SLASH_COMMANDS.filter(function (sc) {
+            if (_plainOn() && (sc.c === '/np' || sc.c === '/want' || sc.c === '/iso' || sc.c === '/poll' || sc.c === '/gif')) {
+                return false;
+            }
+            return sc.c.indexOf(v) === 0;
+        });
         if (!hits.length) { pop.hidden = true; return; }
         pop.innerHTML = hits.map(function (sc) {
             return '<button type="button" class="chat-mention-opt chat-slash-opt" ' +
@@ -3675,6 +6441,17 @@
         var pop = q('[data-chat-mention-pop]');
         if (pop) { pop.hidden = true; pop.innerHTML = ''; }
         if (!input || !cmd) return;
+        if (cmd === '/want' || cmd === '/iso') {
+            input.value = '';
+            if (state.view !== 'room' || _plainOn() || !state.canSend) {
+                if (typeof showToast === 'function') {
+                    showToast('🔍 Wanted cards can only be posted in SoulSync rooms.', 'warning');
+                }
+                return;
+            }
+            openWantedModal();
+            return;
+        }
         var meta = null;
         SLASH_COMMANDS.forEach(function (sc) { if (sc.c === cmd) meta = sc; });
         if (meta && !meta.a) {                     // no-arg commands run on click
@@ -3694,6 +6471,44 @@
         var toast = function (msg, kind) {
             if (typeof showToast === 'function') showToast(msg, kind || 'info');
         };
+        if (cmd === 'np') {
+            if (state.view !== 'room' || _plainOn() || !state.canSend) {
+                toast('🎵 Now Playing cards can only be shared in SoulSync rooms.', 'warning');
+                return true;
+            }
+            shareNowPlaying();
+            return true;
+        }
+        if (cmd === 'want' || cmd === 'iso') {
+            if (state.view !== 'room' || _plainOn() || !state.canSend) {
+                toast('🔍 Wanted cards can only be posted in SoulSync rooms.', 'warning');
+                return true;
+            }
+            openWantedModal(arg);
+            return true;
+        }
+        if (cmd === 'friends') {
+            openSocialModal('friends');
+            return true;
+        }
+        if (cmd === 'blocklist') {
+            openSocialModal('blocked');
+            return true;
+        }
+        if (cmd === 'bookmarks') {
+            openSocialModal('bookmarks');
+            return true;
+        }
+        if (cmd === 'browse') {
+            if (arg) openBrowse(arg);
+            else toast('Specify a username: /browse <user>');
+            return true;
+        }
+        if (cmd === 'upload') {
+            var fileInp = q('[data-chat-attach-file]');
+            if (fileInp) fileInp.click();
+            return true;
+        }
         if (cmd === 'shrug') {
             return (arg ? arg + ' ' : '') + '\u00af\\_(\u30c4)_/\u00af';
         }
@@ -3772,7 +6587,125 @@
         input.setSelectionRange(replaced.length, replaced.length);
     }
 
+    // ── inline :emoji: shortcode autocomplete ────────────────────────────────
+    var _emojiAcActiveIndex = 0;
+    var _emojiAcHits = [];
+
+    function _emojiShortcodeMatch(input) {
+        if (!input) return null;
+        var val = input.value || '';
+        var caret = input.selectionStart;
+        if (typeof caret !== 'number') caret = val.length;
+        var textBefore = val.slice(0, caret);
+        var match = textBefore.match(/(?:^|\s):([a-z0-9_+-]{1,25})$/i);
+        if (!match) return null;
+        var query = match[1];
+        var colonIndex = textBefore.lastIndexOf(':' + query);
+        return {
+            query: query,
+            colonIndex: colonIndex,
+            caret: caret,
+        };
+    }
+
+    function _renderEmojiAcSelection(pop) {
+        if (!pop) return;
+        var items = pop.querySelectorAll('.chat-emoji-ac-opt');
+        for (var i = 0; i < items.length; i++) {
+            if (i === _emojiAcActiveIndex) {
+                items[i].classList.add('chat-mention-opt--active');
+                try { items[i].scrollIntoView({ block: 'nearest' }); } catch (e) {}
+            } else {
+                items[i].classList.remove('chat-mention-opt--active');
+            }
+        }
+    }
+
+    function updateEmojiAutocomplete(input) {
+        var pop = q('[data-chat-emoji-autocomplete]');
+        if (!pop) return;
+        if (!state.canSend) { pop.hidden = true; return; }
+        var match = _emojiShortcodeMatch(input);
+        if (!match) {
+            pop.hidden = true;
+            pop.innerHTML = '';
+            _emojiAcHits = [];
+            _emojiAcActiveIndex = 0;
+            return;
+        }
+        var hits = _searchEmojis(match.query).slice(0, 8);
+        if (!hits.length) {
+            pop.hidden = true;
+            pop.innerHTML = '';
+            _emojiAcHits = [];
+            _emojiAcActiveIndex = 0;
+            return;
+        }
+        _emojiAcHits = hits;
+        if (_emojiAcActiveIndex >= hits.length) _emojiAcActiveIndex = 0;
+
+        pop.innerHTML = hits.map(function (n, idx) {
+            var info = ANIMATED_EMOJI[n];
+            var previewHtml = info
+                ? '<img class="chat-anim-preview" src="' + _animEmojiStaticUrl(n) + '" alt="' + attr(info.u) + '">'
+                : '<span class="chat-emoji-ac-glyph">' + (EMOJI[n] || '✨') + '</span>';
+            var shortcode = ':' + n + ':';
+            var activeCls = (idx === _emojiAcActiveIndex) ? ' chat-mention-opt--active' : '';
+            return '<button type="button" class="chat-mention-opt chat-emoji-ac-opt' + activeCls + '" ' +
+                'data-chat-emoji-ac-pick="' + attr(n) + '">' +
+                '<span class="chat-emoji-ac-preview">' + previewHtml + '</span>' +
+                '<span class="chat-emoji-ac-name">' + esc(shortcode) + '</span>' +
+                (info ? '<span class="chat-emoji-ac-tag">SoulSync Animated</span>' : '') +
+                '</button>';
+        }).join('');
+        pop.hidden = false;
+    }
+
+    function pickEmojiAutocomplete(name) {
+        var input = q('[data-chat-input]');
+        var pop = q('[data-chat-emoji-autocomplete]');
+        if (pop) { pop.hidden = true; pop.innerHTML = ''; }
+        if (!input || !name) return;
+        var match = _emojiShortcodeMatch(input);
+        var val = input.value || '';
+        var insertVal = '';
+        if (ANIMATED_EMOJI[name]) {
+            insertVal = ':' + name + ': ';
+        } else if (EMOJI[name]) {
+            insertVal = EMOJI[name] + ' ';
+        } else {
+            insertVal = ':' + name + ': ';
+        }
+
+        if (match && match.colonIndex >= 0) {
+            var before = val.slice(0, match.colonIndex);
+            var after = val.slice(match.caret);
+            input.value = before + insertVal + after;
+            var newPos = before.length + insertVal.length;
+            input.focus();
+            input.setSelectionRange(newPos, newPos);
+        } else {
+            insertAtCursor(insertVal);
+        }
+        _pushRecentEmoji(name);
+        _emojiAcHits = [];
+        _emojiAcActiveIndex = 0;
+    }
+
     var _gifTimer = null;
+
+    function _setSettingsTab(name) {
+        var tabs = document.querySelectorAll('[data-chat-settab]');
+        for (var i = 0; i < tabs.length; i++) {
+            var on = tabs[i].getAttribute('data-chat-settab') === name;
+            tabs[i].classList.toggle('chat-set-tab--on', on);
+            tabs[i].setAttribute('aria-selected', on ? 'true' : 'false');
+        }
+        var panels = document.querySelectorAll('[data-chat-setpanel]');
+        for (var j = 0; j < panels.length; j++) {
+            panels[j].hidden = panels[j].getAttribute('data-chat-setpanel') !== name;
+        }
+    }
 
     function openSettings() {
         var overlay = q('[data-chat-settings-modal]');
@@ -3813,6 +6746,7 @@
                 try { localStorage.setItem('chat_avatar', String(_avatarId(b.avatar))); } catch (err) { /* ignore */ }
             }
             renderAvatarPicker();
+            _setSettingsTab('profile');     // always open on the avatar
             overlay.hidden = false;
         });
     }
@@ -3874,7 +6808,9 @@
         if (forceClose === true) { pop.hidden = true; return; }
         pop.hidden = !pop.hidden;
         if (!pop.hidden) {
-            toggleGifPicker(true); toggleEmojiPicker(true);
+            toggleGifPicker(true); toggleEmojiPicker(true); togglePollPop(true);
+            var ovlBtn = pop.querySelector('[data-chat-attach-overlay]');
+            if (ovlBtn) ovlBtn.hidden = (_plainOn() || state.view !== 'room');
             var inp = q('[data-chat-attach-search]');
             if (inp) inp.focus();
         }
@@ -3893,9 +6829,80 @@
     // must use this — a file share and the GIF picker built their payloads by
     // hand, skipped the tags, and their messages folded into #general no matter
     // which channel they were sent from (kvkarlsson's uploads-in-the-wrong-
-    // channel report).
+    // channel report). Plain mode is only ever true in #general (_plainOn), so
+    // the early return below never drops a channel the user was standing in.
+    // One control, not two. The room filter already says which world you are
+    // in: "SoulSync only" means you are talking to SoulSync clients, so the
+    // envelope earns its keep. "All messages" means you can SEE the vanilla
+    // Soulseek users in the room, and it would be a lie to look at them while
+    // sending something they cannot read.
+    //
+    // A PM is already plaintext, so this is a ROOM idea only.
+    //
+    // And a #general idea only. Every other channel, and every thread, exists
+    // INSIDE the envelope: a vanilla client is never "in" #bugs, it only ever
+    // sees the flat room. So "talk plain so they can read it" means nothing
+    // there, and what plain mode actually did was strip the tag and refile the
+    // message into #general behind the sender's back (nanomite, Deathwing:
+    // "sent in bugs but it's showing up in general?!"). The channel you are
+    // standing in wins over the filter.
+    function _plainOn() {
+        if (state.view !== 'room' || state.ssOnly) return false;
+        if (_chanRoom() && (state.thread ||
+                (state.channel || CHAT_DEFAULT_CHANNEL) !== CHAT_DEFAULT_CHANNEL)) return false;
+        return true;
+    }
+
+    function _syncModeBtn() {
+        var hint = q('[data-chat-mode-hint]');
+        var on = _plainOn() && state.canSend;
+        if (hint) hint.hidden = !on;
+        if (!on) {
+            if (state.view === 'room' && state.canSend) {
+                var bar = q('[data-chat-toolbar]');
+                if (bar) bar.hidden = false;
+                ['[data-chat-gif-btn]', '[data-chat-poll-btn]', '[data-chat-attach-btn]',
+                 '[data-chat-np-btn]', '[data-chat-want-btn]'].forEach(function (sel) {
+                    var el = q(sel);
+                    if (el) el.hidden = false;
+                });
+            }
+            return;
+        }
+
+        // none of these survive without an envelope. leaving them live would
+        // let someone attach a template the send is about to refuse.
+        // File sharing DOES work in plain mode (sends clean URL on wire).
+        var bar = q('[data-chat-toolbar]');
+        if (bar) bar.hidden = true;                 // markdown IS the envelope
+        ['[data-chat-gif-btn]', '[data-chat-poll-btn]',
+         '[data-chat-np-btn]', '[data-chat-want-btn]'].forEach(function (sel) {
+            var el = q(sel);
+            if (el) el.hidden = true;
+        });
+        var attachBtn = q('[data-chat-attach-btn]');
+        if (attachBtn) attachBtn.hidden = !state.canSend;
+        // renderComposer already set a placeholder; only the exception overrides it
+        var input = q('[data-chat-input]');
+        if (input) input.placeholder = 'Plain message — everyone in the room can read this…';
+    }
+
     function _tagRoomPayload(payload) {
         payload.room = state.room || '';
+        // plain text has no envelope, so there is nowhere to put an avatar, a
+        // channel tag or a thread id. attaching them anyway would make the
+        // server refuse a message the user had no way to know was tagged.
+        // Rich cards (np, want, overlay, file) are NEVER sent as plain text.
+        if (_plainOn()) {
+            payload.plain = true;
+            delete payload.file;
+            delete payload.overlay;
+            delete payload.reply;
+            delete payload.edit;
+            delete payload.np;
+            delete payload.want;
+            return payload;
+        }
         if (_myAvatar()) payload.avatar = _myAvatar();
         if (_chanRoom()) {
             payload.chan = state.channel || CHAT_DEFAULT_CHANNEL;
@@ -4039,13 +7046,382 @@
         if (forceClose === true) { pop.hidden = true; return; }
         if (pop.hidden && !pop.getAttribute('data-built')) {
             pop.setAttribute('data-built', '1');
-            var names = Object.keys(EMOJI);
-            pop.innerHTML = names.map(function (n) {
-                return '<button type="button" class="chat-emoji" data-chat-emoji-pick="' +
-                    EMOJI[n] + '" title=":' + n + ':">' + EMOJI[n] + '</button>';
-            }).join('');
+            pop.classList.add('chat-emoji-picker');
+
+            // Header with search & clear
+            var headerWrap = document.createElement('div');
+            headerWrap.className = 'chat-emoji-header';
+            var searchWrap = document.createElement('div');
+            searchWrap.className = 'chat-emoji-search-wrap';
+            searchWrap.innerHTML = '<span class="chat-emoji-search-icon">🔍</span>' +
+                '<input type="text" class="chat-emoji-search" placeholder="Search emoji (try fire, party, love)…" autocomplete="off">' +
+                '<button type="button" class="chat-emoji-search-clear" title="Clear search" hidden>×</button>';
+            headerWrap.appendChild(searchWrap);
+            pop.appendChild(headerWrap);
+            var search = searchWrap.querySelector('.chat-emoji-search');
+            var clearBtn = searchWrap.querySelector('.chat-emoji-search-clear');
+
+            // Category tabs
+            var tabs = document.createElement('div');
+            tabs.className = 'chat-emoji-tabs';
+            var recentTab = document.createElement('button');
+            recentTab.type = 'button'; recentTab.className = 'chat-emoji-tab chat-emoji-tab--active';
+            recentTab.setAttribute('data-emoji-cat', 'recent');
+            recentTab.textContent = '🕒'; recentTab.title = 'Frequently Used';
+            tabs.appendChild(recentTab);
+            EMOJI_CATS.forEach(function (cat) {
+                var btn = document.createElement('button');
+                btn.type = 'button'; btn.className = 'chat-emoji-tab';
+                btn.setAttribute('data-emoji-cat', cat.slug);
+                btn.textContent = cat.icon; btn.title = cat.title || cat.slug;
+                tabs.appendChild(btn);
+            });
+            pop.appendChild(tabs);
+
+            // Scrollable continuous pane
+            var scrollPane = document.createElement('div');
+            scrollPane.className = 'chat-emoji-scroll';
+            scrollPane.setAttribute('data-chat-emoji-scroll', '1');
+
+            // Recent section
+            var recentSec = document.createElement('div');
+            recentSec.className = 'chat-emoji-section';
+            recentSec.setAttribute('data-emoji-section', 'recent');
+            var recentHdr = document.createElement('div');
+            recentHdr.className = 'chat-emoji-cat-header';
+            recentHdr.textContent = 'Frequently Used';
+            recentSec.appendChild(recentHdr);
+            var recentGrid = document.createElement('div');
+            recentGrid.className = 'chat-emoji-grid';
+            recentGrid.setAttribute('data-emoji-grid', 'recent');
+            recentSec.appendChild(recentGrid);
+            scrollPane.appendChild(recentSec);
+
+            // Category sections
+            EMOJI_CATS.forEach(function (cat) {
+                var sec = document.createElement('div');
+                sec.className = 'chat-emoji-section';
+                sec.setAttribute('data-emoji-section', cat.slug);
+                var hdr = document.createElement('div');
+                hdr.className = 'chat-emoji-cat-header';
+                hdr.textContent = cat.title || cat.slug;
+                sec.appendChild(hdr);
+                var grid = document.createElement('div');
+                grid.className = 'chat-emoji-grid';
+                grid.innerHTML = cat.names.map(function (n) {
+                    var isAnim = !!ANIMATED_EMOJI[n];
+                    var pickVal = isAnim ? ':' + n + ': ' : (EMOJI[n] || ':' + n + ': ');
+                    if (isAnim) {
+                        return '<button type="button" class="chat-emoji chat-emoji--anim" data-chat-emoji-pick="' +
+                            attr(pickVal) + '" data-emoji-name="' + attr(n) + '" data-emoji-cat="' + attr(cat.title) + '" title=":' + n + ':"><img class="chat-anim-preview" src="' +
+                            _animEmojiStaticUrl(n) + '" data-anim-src="' + _animEmojiUrl(n) + '" data-static-src="' + _animEmojiStaticUrl(n) + '" alt="' + attr(ANIMATED_EMOJI[n].u) + '" loading="lazy"></button>';
+                    }
+                    var e2 = EMOJI[n];
+                    if (!e2) return '';
+                    return '<button type="button" class="chat-emoji" data-chat-emoji-pick="' +
+                        attr(pickVal) + '" data-emoji-name="' + attr(n) + '" data-emoji-cat="' + attr(cat.title) + '" title=":' + n + ':">' + e2 + '</button>';
+                }).join('');
+                sec.appendChild(grid);
+                scrollPane.appendChild(sec);
+            });
+
+            // Search results section
+            var searchSec = document.createElement('div');
+            searchSec.className = 'chat-emoji-section';
+            searchSec.setAttribute('data-emoji-section', 'search');
+            searchSec.hidden = true;
+            var sHdr = document.createElement('div');
+            sHdr.className = 'chat-emoji-cat-header chat-emoji-search-header';
+            sHdr.textContent = 'Search Results';
+            searchSec.appendChild(sHdr);
+            var sGrid = document.createElement('div');
+            sGrid.className = 'chat-emoji-grid';
+            sGrid.setAttribute('data-emoji-grid', 'search');
+            searchSec.appendChild(sGrid);
+            scrollPane.appendChild(searchSec);
+
+            pop.appendChild(scrollPane);
+
+            // Footer preview bar
+            var footer = document.createElement('div');
+            footer.className = 'chat-emoji-footer';
+            footer.setAttribute('data-chat-emoji-footer', '1');
+            footer.innerHTML = '<div class="chat-emoji-footer-preview" data-chat-emoji-preview>✨</div>' +
+                '<div class="chat-emoji-footer-info">' +
+                '<div class="chat-emoji-footer-name" data-chat-emoji-name>:sparkles:</div>' +
+                '<div class="chat-emoji-footer-cat" data-chat-emoji-cat>SoulSync Animated</div>' +
+                '</div>';
+            pop.appendChild(footer);
+
+            function _renderRecent() {
+                var recent = _getRecentEmojis();
+                if (!recent.length) {
+                    recentGrid.innerHTML = '<span class="chat-emoji-hint">Your recently used emojis will appear here</span>';
+                    return;
+                }
+                recentGrid.innerHTML = recent.map(function (n) {
+                    var isAnim = !!ANIMATED_EMOJI[n];
+                    var pickVal = isAnim ? ':' + n + ': ' : (EMOJI[n] || n);
+                    var catInfo = _emojiCatFor(n);
+                    if (isAnim) {
+                        return '<button type="button" class="chat-emoji chat-emoji--anim" data-chat-emoji-pick="' +
+                            attr(pickVal) + '" data-emoji-name="' + attr(n) + '" data-emoji-cat="' + attr(catInfo.title) + '" title=":' + n + ':"><img class="chat-anim-preview" src="' +
+                            _animEmojiStaticUrl(n) + '" data-anim-src="' + _animEmojiUrl(n) + '" data-static-src="' + _animEmojiStaticUrl(n) + '" alt="' + attr(ANIMATED_EMOJI[n].u) + '" loading="lazy"></button>';
+                    }
+                    var glyph = EMOJI[n] || n;
+                    return '<button type="button" class="chat-emoji" data-chat-emoji-pick="' +
+                        attr(pickVal) + '" data-emoji-name="' + attr(n) + '" data-emoji-cat="' + attr(catInfo.title) + '" title=":' + n + ':">' + glyph + '</button>';
+                }).join('');
+            }
+
+            function _setActiveTab(slug) {
+                var all = tabs.querySelectorAll('.chat-emoji-tab');
+                for (var i = 0; i < all.length; i++) {
+                    if (all[i].getAttribute('data-emoji-cat') === slug) all[i].classList.add('chat-emoji-tab--active');
+                    else all[i].classList.remove('chat-emoji-tab--active');
+                }
+            }
+
+            var _currentPreviewName = null;
+            var _previewRaf = null;
+
+            function _updatePreview(name, catTitle, btnEl) {
+                if (_currentPreviewName === name) return;
+                _currentPreviewName = name;
+
+                if (_previewRaf) cancelAnimationFrame(_previewRaf);
+                _previewRaf = requestAnimationFrame(function () {
+                    var prevEl = footer.querySelector('[data-chat-emoji-preview]');
+                    var nameEl = footer.querySelector('[data-chat-emoji-name]');
+                    var catEl = footer.querySelector('[data-chat-emoji-cat]');
+                    if (!prevEl || !nameEl || !catEl) return;
+                    if (!name) {
+                        prevEl.textContent = '✨';
+                        nameEl.textContent = 'SoulSync Emojis';
+                        catEl.textContent = 'Hover to preview';
+                        return;
+                    }
+                    if (ANIMATED_EMOJI[name]) {
+                        var img = prevEl.querySelector('img');
+                        var url = _animEmojiUrl(name);
+                        if (img) {
+                            if (img.getAttribute('data-src') !== url) {
+                                img.setAttribute('data-src', url);
+                                img.src = url;
+                                img.alt = ANIMATED_EMOJI[name].u;
+                            }
+                        } else {
+                            prevEl.innerHTML = '<img class="chat-anim-preview chat-anim-preview--lg" data-src="' + url + '" src="' + url + '" alt="' + attr(ANIMATED_EMOJI[name].u) + '">';
+                        }
+                    } else {
+                        prevEl.textContent = EMOJI[name] || (btnEl ? btnEl.textContent.trim() : '✨');
+                    }
+                    nameEl.textContent = ':' + name + ':';
+                    catEl.textContent = catTitle || 'Emoji';
+                });
+            }
+
+            tabs.addEventListener('click', function (e2) {
+                var btn = e2.target.closest('[data-emoji-cat]');
+                if (!btn) return;
+                var slug = btn.getAttribute('data-emoji-cat');
+                var targetSec = pop.querySelector('[data-emoji-section="' + slug + '"]');
+                if (targetSec && scrollPane) {
+                    search.value = '';
+                    clearBtn.hidden = true;
+                    searchSec.hidden = true;
+                    var allSecs = scrollPane.querySelectorAll('.chat-emoji-section:not([data-emoji-section="search"])');
+                    for (var j = 0; j < allSecs.length; j++) allSecs[j].hidden = false;
+                    var top = targetSec.offsetTop - scrollPane.offsetTop;
+                    scrollPane.scrollTo({ top: top, behavior: 'smooth' });
+                    _setActiveTab(slug);
+                }
+            });
+
+            var _scrollSpyTimer = null;
+            scrollPane.addEventListener('scroll', function () {
+                if (!searchSec.hidden) return;
+                if (_scrollSpyTimer) return;
+                _scrollSpyTimer = setTimeout(function () {
+                    _scrollSpyTimer = null;
+                    var st = scrollPane.scrollTop;
+                    var secs = scrollPane.querySelectorAll('.chat-emoji-section:not([hidden])');
+                    var currentSlug = 'recent';
+                    for (var i = 0; i < secs.length; i++) {
+                        var sec = secs[i];
+                        var diff = sec.offsetTop - scrollPane.offsetTop;
+                        if (diff <= st + 24) {
+                            currentSlug = sec.getAttribute('data-emoji-section');
+                        } else {
+                            break;
+                        }
+                    }
+                    _setActiveTab(currentSlug);
+                }, 40);
+            }, { passive: true });
+
+            search.addEventListener('input', function () {
+                var v = search.value.trim().toLowerCase();
+                clearBtn.hidden = !v;
+                var allSecs = scrollPane.querySelectorAll('.chat-emoji-section:not([data-emoji-section="search"])');
+                if (!v) {
+                    searchSec.hidden = true;
+                    for (var i = 0; i < allSecs.length; i++) allSecs[i].hidden = false;
+                    return;
+                }
+                for (var j = 0; j < allSecs.length; j++) allSecs[j].hidden = true;
+                searchSec.hidden = false;
+                var hits = _searchEmojis(v);
+                sHdr.textContent = hits.length ? 'Search Results (' + hits.length + ')' : 'No matching emojis';
+                sGrid.innerHTML = hits.map(function (n) {
+                    var isAnim = !!ANIMATED_EMOJI[n];
+                    var pickVal = isAnim ? ':' + n + ': ' : (EMOJI[n] || ':' + n + ': ');
+                    var catInfo = _emojiCatFor(n);
+                    if (isAnim) {
+                        return '<button type="button" class="chat-emoji chat-emoji--anim" data-chat-emoji-pick="' +
+                            attr(pickVal) + '" data-emoji-name="' + attr(n) + '" data-emoji-cat="' + attr(catInfo.title) + '" title=":' + n + ':"><img class="chat-anim-preview" src="' +
+                            _animEmojiStaticUrl(n) + '" data-anim-src="' + _animEmojiUrl(n) + '" data-static-src="' + _animEmojiStaticUrl(n) + '" alt="' + attr(ANIMATED_EMOJI[n].u) + '" loading="lazy"></button>';
+                    }
+                    var e2 = EMOJI[n];
+                    if (!e2) return '';
+                    return '<button type="button" class="chat-emoji" data-chat-emoji-pick="' +
+                        attr(pickVal) + '" data-emoji-name="' + attr(n) + '" data-emoji-cat="' + attr(catInfo.title) + '" title=":' + n + ':">' + e2 + '</button>';
+                }).join('');
+                if (hits.length) {
+                    var first = hits[0];
+                    _updatePreview(first, _emojiCatFor(first).title);
+                }
+            });
+
+            clearBtn.addEventListener('click', function () {
+                search.value = '';
+                clearBtn.hidden = true;
+                searchSec.hidden = true;
+                var allSecs = scrollPane.querySelectorAll('.chat-emoji-section:not([data-emoji-section="search"])');
+                for (var i = 0; i < allSecs.length; i++) allSecs[i].hidden = false;
+                search.focus();
+            });
+
+            search.addEventListener('keydown', function (e2) {
+                if (e2.key === 'Enter') {
+                    e2.preventDefault();
+                    var pickBtn = pop.querySelector('.chat-emoji-section:not([hidden]) [data-chat-emoji-pick]');
+                    if (pickBtn) {
+                        var em = pickBtn.getAttribute('data-chat-emoji-pick');
+                        var name = pickBtn.getAttribute('data-emoji-name');
+                        insertAtCursor(em);
+                        _pushRecentEmoji(name || em);
+                        toggleEmojiPicker(true);
+                        var cinp = q('[data-chat-input]');
+                        if (cinp) cinp.focus();
+                    }
+                } else if (e2.key === 'Escape') {
+                    e2.preventDefault();
+                    toggleEmojiPicker(true);
+                    var cinp2 = q('[data-chat-input]');
+                    if (cinp2) cinp2.focus();
+                }
+            });
+
+            var _activeHoverBtn = null;
+            function _deactivateHoverBtn() {
+                if (!_activeHoverBtn) return;
+                var img = _activeHoverBtn.querySelector('img[data-static-src]');
+                if (img) {
+                    var s = img.getAttribute('data-static-src');
+                    if (img.src !== s) img.src = s;
+                }
+                _activeHoverBtn = null;
+            }
+
+            pop.addEventListener('mouseover', function (e2) {
+                var btn = e2.target.closest('[data-chat-emoji-pick]');
+                if (btn) {
+                    if (_activeHoverBtn && _activeHoverBtn !== btn) {
+                        _deactivateHoverBtn();
+                    }
+                    _activeHoverBtn = btn;
+                    var curImg = btn.querySelector('img[data-anim-src]');
+                    if (curImg) {
+                        var a = curImg.getAttribute('data-anim-src');
+                        if (curImg.src !== a) curImg.src = a;
+                    }
+                    var n = btn.getAttribute('data-emoji-name');
+                    var c = btn.getAttribute('data-emoji-cat');
+                    _updatePreview(n, c, btn);
+                } else if (e2.target.closest('.chat-emoji-tabs') || e2.target.closest('.chat-emoji-header')) {
+                    _deactivateHoverBtn();
+                }
+            });
+
+            pop.addEventListener('mouseleave', function () {
+                _deactivateHoverBtn();
+                _currentPreviewName = null;
+                _updatePreview(null);
+            });
+
+            pop.addEventListener('click', function (e2) {
+                var btn = e2.target.closest('[data-chat-emoji-pick]');
+                if (btn) {
+                    var em = btn.getAttribute('data-chat-emoji-pick');
+                    var name = btn.getAttribute('data-emoji-name');
+                    insertAtCursor(em);
+                    _pushRecentEmoji(name || em);
+                    toggleEmojiPicker(true);
+                    var cinp = q('[data-chat-input]');
+                    if (cinp) cinp.focus();
+                }
+            });
+
+            pop._renderRecent = _renderRecent;
+            _renderRecent();
         }
+
         pop.hidden = !pop.hidden;
+        if (!pop.hidden) {
+            toggleGifPicker(true); toggleAttachPanel(true); togglePollPop(true);
+            if (pop._renderRecent) pop._renderRecent();
+            if (!pop._warmed) {
+                pop._warmed = true;
+                setTimeout(function () {
+                    var warmIdx = 0;
+                    function warmNext() {
+                        if (warmIdx >= _animKeys.length) return;
+                        var img = new Image();
+                        img.src = _animEmojiUrl(_animKeys[warmIdx++]);
+                        setTimeout(warmNext, 60);
+                    }
+                    warmNext();
+                }, 300);
+            }
+            var searchInp = pop.querySelector('.chat-emoji-search');
+            var clr = pop.querySelector('.chat-emoji-search-clear');
+            var sSec = pop.querySelector('[data-emoji-section="search"]');
+            var sPane = pop.querySelector('.chat-emoji-scroll');
+            if (searchInp) { searchInp.value = ''; searchInp.focus(); }
+            if (clr) clr.hidden = true;
+            if (sSec) sSec.hidden = true;
+            if (sPane) {
+                var allS = sPane.querySelectorAll('.chat-emoji-section:not([data-emoji-section="search"])');
+                for (var k = 0; k < allS.length; k++) allS[k].hidden = false;
+                sPane.scrollTop = 0;
+            }
+        }
+    }
+
+    function _renderEmojiGrid(grid, names) {
+        if (!grid || !names) return;
+        grid.innerHTML = names.map(function (n) {
+            if (ANIMATED_EMOJI[n]) {
+                return '<button type="button" class="chat-emoji chat-emoji--anim" data-chat-emoji-pick=":' +
+                    n + ': " data-emoji-name="' + attr(n) + '" title=":' + n + ':"><img class="chat-anim-preview" src="' +
+                    _animEmojiStaticUrl(n) + '" data-anim-src="' + _animEmojiUrl(n) + '" data-static-src="' + _animEmojiStaticUrl(n) + '" alt="' + attr(ANIMATED_EMOJI[n].u) + '" loading="lazy"></button>';
+            }
+            var e2 = EMOJI[n];
+            if (!e2) return '';
+            return '<button type="button" class="chat-emoji" data-chat-emoji-pick="' +
+                e2 + '" data-emoji-name="' + attr(n) + '" title=":' + n + ':">' + e2 + '</button>';
+        }).join('');
     }
 
     function renderProblem(msg) {
@@ -4175,7 +7551,7 @@
     // set and is bounds-checked everywhere it crosses the wire — it must never
     // be interpolated into a path. Unknown/absent falls back to initials, so a
     // missing file or an old client never renders broken.
-    var CHAT_AVATARS = 100;
+    var CHAT_AVATARS = 244;   // 1-99 cartoons, 100 reserved, 101-244 games. api/chat.py AVATAR_COUNT too
     // Avatars only their owner may wear (id -> slskd username, casefolded).
     // Hidden from everyone else's picker AND refused at render, because the
     // envelope is client-controlled — otherwise anyone could forge the id and
@@ -4199,10 +7575,22 @@
 
     // username -> avatar id, from the hello beacons AND from anything they've
     // said (messages carry the id, so history alone is enough to paint faces).
+    // Discovered avatars are persisted to localStorage so silent peers who
+    // have spoken previously keep their faces across reloads.
     function _avatarMap() {
         var out = {};
+        try {
+            var cached = JSON.parse(localStorage.getItem('chat_avatar_cache') || '{}');
+            if (cached && typeof cached === 'object') {
+                Object.keys(cached).forEach(function (u) {
+                    var cid = _avatarId(cached[u]);
+                    if (cid) out[u] = cid;
+                });
+            }
+        } catch (e) { /* ignore parse errors */ }
         if (window.ChatProtocol && window.ChatProtocol.reduceAvatars) {
-            out = window.ChatProtocol.reduceAvatars(_roomEvents(), CHAT_AVATARS);
+            var reduced = window.ChatProtocol.reduceAvatars(_roomEvents(), CHAT_AVATARS);
+            Object.keys(reduced || {}).forEach(function (u) { out[u] = reduced[u]; });
         }
         (state.msgs || []).forEach(function (m) {
             var n = _avatarId(m && m.av);
@@ -4214,6 +7602,9 @@
         Object.keys(out).forEach(function (u) {
             if (!_avatarAllowed(out[u], u)) delete out[u];
         });
+        try {
+            localStorage.setItem('chat_avatar_cache', JSON.stringify(out));
+        } catch (e) { /* quota exceeded or private mode */ }
         return out;
     }
 
@@ -4258,6 +7649,11 @@
                 '<img src="/static/avatar/' + i + '.png" alt="" loading="lazy"></button>');
         }
         host.innerHTML = cells.join('');
+        // the big "this is you" card at the top of the profile tab
+        var prev = q('[data-chat-avpreview]');
+        if (prev) prev.innerHTML = _avatarHtml(state.selfName || '?', cur, 'chat-av--xl');
+        var nm = q('[data-chat-avname]');
+        if (nm) nm.textContent = state.selfName || 'You';
         // Show which Soulseek identity the picker is using. Reserved avatars are
         // gated on this exact name, so when one is missing this line says why
         // instead of the option just silently not being there.
@@ -4363,21 +7759,49 @@
             var k = _msgKey(m);
             var existing = byKey[k];
             if (!existing) {
-                byKey[k] = m; state.msgs.push(m); added++;
-                if (_pingWorthy(m)) _chatPing();
+                // Check if this incoming message confirms an optimistic pending send
+                var pendingIdx = -1;
+                for (var pi = 0; pi < state.msgs.length; pi++) {
+                    var pm = state.msgs[pi];
+                    if (pm && pm._pending && pm.message === m.message) {
+                        var sameUser = (pm.username === m.username) ||
+                                       (pm.self && (m.self || m.direction === 'Out' || m.username === state.selfName));
+                        if (sameUser) {
+                            pendingIdx = pi;
+                            break;
+                        }
+                    }
+                }
+                if (pendingIdx > -1) {
+                    var oldKey = _msgKey(state.msgs[pendingIdx]);
+                    delete byKey[oldKey];
+                    state.msgs[pendingIdx] = m;
+                    byKey[k] = m;
+                    added++;
+                    reactionsChanged = true;
+                } else {
+                    byKey[k] = m; state.msgs.push(m); added++;
+                    if (_pingWorthy(m)) _chatPing();
+                }
             } else {
-                // Reactions are server-side aggregate state that changes over a
-                // message's life. mergeMessages used to only ADD new messages,
-                // so a reaction added after we first saw a message never showed
-                // without a full page reload. Reconcile the authoritative server
-                // reactions onto the copy we already hold, then re-assert our own
-                // just-sent reaction until slskd echoes it (avoids a flicker
-                // where the optimistic chip vanishes then returns).
+                // Upgrade card metadata or clear pending flag on existing message
+                if (existing._pending || (m.np && !existing.np) || (m.want && !existing.want) || (m.overlay && !existing.overlay)) {
+                    Object.assign(existing, m);
+                    delete existing._pending;
+                    reactionsChanged = true;
+                }
                 var was = JSON.stringify(existing.reactions || []);
                 existing.reactions = m.reactions || [];
                 _reapplyPendingReactions(existing);
                 if (JSON.stringify(existing.reactions || []) !== was) reactionsChanged = true;
             }
+        });
+        // Expire stale pending messages older than 45 seconds so failed sends don't hang indefinitely
+        var nowMs = Date.now();
+        state.msgs = state.msgs.filter(function (m) {
+            if (!m._pending) return true;
+            var msgTs = Date.parse(m.timestamp) || 0;
+            return (nowMs - msgTs) < 45000;
         });
         if (added) {
             state.msgs.sort(function (a, b) {
@@ -4456,10 +7880,15 @@
         if (inp) { inp.hidden = false; inp.focus(); }
     }
 
+    var _searchHits = [];
+    var _searchIdx = -1;
+
     function exitSearch() {
         if (!state.searchMode) return;
         state.searchMode = false;
         state.lastStamp = null;
+        _searchHits = [];
+        _searchIdx = -1;
         renderHead();
         renderMessages(state.msgs);
         var host = q('[data-chat-messages]');
@@ -4475,15 +7904,42 @@
                 '&q=' + encodeURIComponent(qstr)).then(function (res) {
             if (!state.searchMode || !res.ok) return;
             var msgs = (res.body.messages || []).slice().reverse();   // oldest-first for render
+            _searchHits = msgs;
+            _searchIdx = msgs.length ? 0 : -1;
+            var navHtml = msgs.length > 1
+                ? '<span class="chat-search-nav">' +
+                    '<button type="button" class="chat-filter-btn chat-search-nav-btn" data-chat-search-prev title="Previous result">▲</button>' +
+                    '<span class="chat-search-pos" data-chat-search-pos>1 of ' + msgs.length + '</span>' +
+                    '<button type="button" class="chat-filter-btn chat-search-nav-btn" data-chat-search-next title="Next result">▼</button>' +
+                  '</span>'
+                : '';
             host.innerHTML =
-                '<div class="chat-search-banner">' + msgs.length + ' result' +
-                    (msgs.length === 1 ? '' : 's') + ' for “' + esc(qstr) + '”' +
+                '<div class="chat-search-banner">' +
+                    '<span class="chat-search-count">' + msgs.length + ' result' +
+                        (msgs.length === 1 ? '' : 's') + ' for “' + esc(qstr) + '”</span>' +
+                    navHtml +
                     '<button type="button" class="chat-filter-btn" data-chat-search-exit>Back to live</button>' +
                 '</div>' +
                 (msgs.length ? renderGroups(msgs)
                              : '<div class="chat-empty">Nothing in the archive matches.</div>');
             host.scrollTop = 0;
+            _unfurlPendingLinks(host);
+            if (msgs.length) _highlightSearchResult(0);
         });
+    }
+
+    function _highlightSearchResult(idx) {
+        var host = q('[data-chat-messages]');
+        if (!host || !_searchHits.length) return;
+        _searchIdx = ((idx % _searchHits.length) + _searchHits.length) % _searchHits.length;
+        var posEl = q('[data-chat-search-pos]');
+        if (posEl) posEl.textContent = (_searchIdx + 1) + ' of ' + _searchHits.length;
+        var lines = host.querySelectorAll('.chat-line');
+        for (var i = 0; i < lines.length; i++) lines[i].classList.remove('chat-line--highlighted');
+        if (lines[_searchIdx]) {
+            lines[_searchIdx].scrollIntoView({ behavior: 'smooth', block: 'center' });
+            lines[_searchIdx].classList.add('chat-line--highlighted');
+        }
     }
 
     // ── refresh loop ─────────────────────────────────────────────────────────
@@ -4500,12 +7956,16 @@
         if (state.view === 'room') {
             work = getJSON('/api/chat/room?room=' + encodeURIComponent(state.room || '')).then(function (res) {
                 if (!res.ok) {
+                    state.connectionError = res.body && res.body.error || 'Chat connection unavailable';
+                    state.canSend = false;
+                    renderComposer();
                     pollProblem(res.body && res.body.error
                         ? res.body.error
                         : 'Chat is unavailable right now.', state.renderedOk);
                     return;
                 }
                 pollRecovered();
+                state.connectionError = null;
                 state.canSend = !!res.body.can_send;
                 // auto-join OFF → the server no longer joins for us; show the
                 // join gate instead of the room (popwaffle9000's leave fix).
@@ -4527,14 +7987,34 @@
             work = getJSON('/api/chat/conversations/' + encodeURIComponent(state.pmUser))
                 .then(function (res) {
                     if (!res.ok) {
+                        state.connectionError = res.body && res.body.error || 'Chat connection unavailable';
+                        state.canSend = false;
+                        renderComposer();
                         pollProblem(res.body && res.body.error || 'Conversation unavailable.',
                             state.renderedOk);
                         return;
                     }
                     pollRecovered();
+                    state.connectionError = null;
                     state.canSend = !!res.body.can_send;
                     renderHead(); renderComposer();
-                    renderMessages(res.body.messages);
+                    var incoming = res.body.messages || [];
+                    var nowMs = Date.now();
+                    var pending = (state.pmMsgs || []).filter(function (m) {
+                        if (!m || !m._pending) return false;
+                        var msgTs = Date.parse(m.timestamp) || 0;
+                        return (nowMs - msgTs) < 45000;
+                    });
+                    var unconfirmed = [];
+                    pending.forEach(function (pm) {
+                        var found = incoming.some(function (im) {
+                            var selfMsg = im.self === true || im.direction === 'Out' || im.username === (state.selfName || 'you');
+                            return selfMsg && im.message === pm.message;
+                        });
+                        if (!found) unconfirmed.push(pm);
+                    });
+                    state.pmMsgs = incoming.concat(unconfirmed);
+                    renderMessages(state.pmMsgs);
                     state.renderedOk = true;
                     renderUsers(null);
                 });
@@ -4564,7 +8044,6 @@
             state.jukebox.lastRendered = '';
             state.jukebox.nowSeen = null;   // new room, new event stream, new clock base
             state.pinsOpen = false;
-            state.pollDismissedAt = null;
         }
         state.room = nextRoom;
         state.thread = null;         // threads are per-room (and home-room only)
@@ -4597,8 +8076,337 @@
         });
     }
 
-    // ── room browser (join any public Soulseek room) ─────────────────────────
+    // ── rich link unfurling & inline web preview ─────────────────────────────
+    var _linkPreviewCache = {};
+
+    function _unfurlCardHtml(p) {
+        // it lands in a style attribute: a plain hex colour or the default
+        var theme = /^#[0-9a-f]{3,8}$/i.test(String(p.theme_color || '')) ? p.theme_color : '#6366f1';
+        var domain = p.domain || '';
+        var site = p.site_name || domain || 'Website';
+        var title = p.title || p.url;
+        var desc = p.description ? String(p.description).slice(0, 260) : '';
+        var thumb = p.image || '';
+
+        return '<div class="chat-unfurl-card" data-unfurl-url="' + attr(p.url) + '" style="--unfurl-color:' + attr(theme) + '">' +
+            '<div class="chat-unfurl-bar"></div>' +
+            '<div class="chat-unfurl-main">' +
+                '<div class="chat-unfurl-head">' +
+                    '<span class="chat-unfurl-site">' +
+                        (domain ? '<img class="chat-unfurl-favicon" src="https://www.google.com/s2/favicons?domain=' + attr(domain) + '&sz=32" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()">' : '') +
+                        '<span>' + esc(site) + '</span>' +
+                    '</span>' +
+                    '<div class="chat-unfurl-actions">' +
+                        // most big sites refuse to be framed and the iframe still fires
+                        // onload, so offering it there only ever opened a dead box
+                        (p.frameable === false ? '' :
+                        '<button type="button" class="chat-unfurl-btn chat-unfurl-btn--preview" data-chat-preview-url="' + attr(p.url) + '" title="Open interactive inline preview">👁 Preview</button>') +
+                        '<a href="' + attr(p.url) + '" target="_blank" rel="noopener noreferrer" class="chat-unfurl-btn" title="Open in browser">↗ Open</a>' +
+                        '<button type="button" class="chat-unfurl-btn chat-unfurl-btn--close" data-chat-unfurl-close title="Dismiss preview">✕</button>' +
+                    '</div>' +
+                '</div>' +
+                '<a href="' + attr(p.url) + '" target="_blank" rel="noopener noreferrer" class="chat-unfurl-title">' + esc(title) + '</a>' +
+                (desc ? '<div class="chat-unfurl-desc">' + esc(desc) + '</div>' : '') +
+                (thumb ? '<div class="chat-unfurl-thumb-wrap"><img class="chat-unfurl-thumb" src="' + attr(thumb) + '" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="var w=this.closest(\'.chat-unfurl-thumb-wrap\'); if(w) w.remove();"></div>' : '') +
+            '</div>' +
+        '</div>';
+    }
+
+    function _attachUnfurlCard(line, p, container) {
+        if (!line || !p || !p.url) return;
+        if (line.querySelector('.chat-unfurl-card[data-unfurl-url="' + attr(p.url) + '"]')) return;
+        var div = document.createElement('div');
+        div.innerHTML = _unfurlCardHtml(p);
+        var card = div.firstElementChild;
+        if (card) {
+            line.appendChild(card);
+            if (state.stickBottom && container) {
+                container.scrollTop = container.scrollHeight;
+            }
+        }
+    }
+
+    function _unfurlPendingLinks(container) {
+        if (!container) return;
+        var links = container.querySelectorAll('a.chat-link:not([data-unfurl-checked])');
+        if (!links.length) return;
+
+        links.forEach(function (link) {
+            link.setAttribute('data-unfurl-checked', '1');
+            var href = link.getAttribute('href') || '';
+            if (!href || href.charAt(0) === '/' || href.indexOf('javascript:') === 0) return;
+            if (IMG_RE.test(href)) return;
+            if (_ytId(href) || _spotifyEmbedInfo(href) || _deezerEmbedInfo(href) || _soundcloudEmbedInfo(href)) return;
+
+            var line = link.closest('.chat-line');
+            if (!line) return;
+
+            if (_linkPreviewCache[href]) {
+                var cached = _linkPreviewCache[href];
+                if (cached.ok && cached.preview && (cached.preview.title || cached.preview.description)) {
+                    _attachUnfurlCard(line, cached.preview, container);
+                }
+                return;
+            }
+
+            getJSON('/api/chat/link-preview?url=' + encodeURIComponent(href)).then(function (res) {
+                if (!res.ok || !res.body || !res.body.ok) {
+                    _linkPreviewCache[href] = { ok: false };
+                    return;
+                }
+                var p = res.body.preview || res.body;
+                if (!p || (!p.title && !p.description)) {
+                    _linkPreviewCache[href] = { ok: false };
+                    return;
+                }
+                _linkPreviewCache[href] = { ok: true, preview: p };
+                _attachUnfurlCard(line, p, container);
+            }).catch(function () {
+                _linkPreviewCache[href] = { ok: false };
+            });
+        });
+    }
+
+    function openWebPreviewModal(url) {
+        var modal = document.getElementById('chat-web-preview-modal');
+        if (!modal) {
+            modal = document.createElement('div');
+            modal.id = 'chat-web-preview-modal';
+            modal.className = 'chat-web-modal-overlay';
+            modal.innerHTML =
+                '<div class="chat-web-modal-dialog">' +
+                    '<div class="chat-web-modal-header">' +
+                        '<div class="chat-web-modal-title">' +
+                            '<span class="chat-web-modal-lock">🔒</span>' +
+                            '<span class="chat-web-modal-url"></span>' +
+                        '</div>' +
+                        '<div class="chat-web-modal-actions">' +
+                            '<button type="button" class="chat-web-modal-btn" data-chat-web-modal-copy title="Copy Link">📋 Copy</button>' +
+                            '<a href="#" target="_blank" rel="noopener noreferrer" class="chat-web-modal-btn chat-web-modal-ext" title="Open in External Tab">↗ External</a>' +
+                            '<button type="button" class="chat-web-modal-btn chat-web-modal-close" title="Close Preview">✕</button>' +
+                        '</div>' +
+                    '</div>' +
+                    '<div class="chat-web-modal-body">' +
+                        '<iframe class="chat-web-modal-iframe" sandbox="allow-scripts allow-same-origin allow-forms allow-popups" referrerpolicy="no-referrer"></iframe>' +
+                    '</div>' +
+                '</div>';
+            document.body.appendChild(modal);
+
+            modal.querySelector('.chat-web-modal-close').addEventListener('click', function () {
+                closeWebPreviewModal();
+            });
+            modal.addEventListener('click', function (e) {
+                if (e.target === modal) closeWebPreviewModal();
+            });
+            modal.querySelector('[data-chat-web-modal-copy]').addEventListener('click', function () {
+                var currUrl = modal.getAttribute('data-url');
+                if (currUrl && navigator.clipboard) {
+                    navigator.clipboard.writeText(currUrl);
+                    _ovToast('Copied link to clipboard!', 'success');
+                }
+            });
+        }
+        modal.setAttribute('data-url', url);
+        var domain = '';
+        try { domain = new URL(url).hostname; } catch (e) { domain = url; }
+        modal.querySelector('.chat-web-modal-url').textContent = domain + ' (' + url.slice(0, 50) + (url.length > 50 ? '…' : '') + ')';
+        modal.querySelector('.chat-web-modal-ext').href = url;
+        var ifr = modal.querySelector('.chat-web-modal-iframe');
+        if (ifr) ifr.src = url;
+        modal.classList.add('chat-web-modal-overlay--open');
+    }
+
+    function closeWebPreviewModal() {
+        var modal = document.getElementById('chat-web-preview-modal');
+        if (modal) {
+            modal.classList.remove('chat-web-modal-overlay--open');
+            var ifr = modal.querySelector('.chat-web-modal-iframe');
+            if (ifr) ifr.src = 'about:blank';
+        }
+    }
     var _availRooms = null;
+
+    // ── Discord-style Social & Lists Drawer (Friends, Blocklist, Bookmarks) ──
+    var _socialTab = 'friends';
+    var _socialFilter = '';
+
+    function openSocialModal(tab) {
+        if (tab) _socialTab = tab;
+        closeUserCard();
+        var drawer = q('[data-chat-social-drawer]');
+        var backdrop = q('[data-chat-social-backdrop]');
+        if (!drawer) return;
+        drawer.hidden = false;
+        if (backdrop) backdrop.hidden = false;
+        requestAnimationFrame(function () {
+            drawer.classList.add('visible');
+            if (backdrop) backdrop.classList.add('visible');
+        });
+        _socialFilter = '';
+        var fInp = drawer.querySelector('[data-chat-social-filter]');
+        if (fInp) fInp.value = '';
+        var aInp = drawer.querySelector('[data-chat-social-input]');
+        if (aInp) {
+            aInp.value = '';
+            aInp.focus();
+        }
+        renderSocialList();
+        _updateSocialBadges();
+    }
+
+    function closeSocialModal() {
+        var drawer = q('[data-chat-social-drawer]');
+        var backdrop = q('[data-chat-social-backdrop]');
+        if (drawer) {
+            drawer.classList.remove('visible');
+            setTimeout(function () { drawer.hidden = true; }, 320);
+        }
+        if (backdrop) {
+            backdrop.classList.remove('visible');
+            setTimeout(function () { backdrop.hidden = true; }, 320);
+        }
+    }
+
+    function renderSocialList() {
+        var drawer = q('[data-chat-social-drawer]');
+        if (!drawer || drawer.hidden) return;
+
+        var friends = friendsSet();
+        var blocked = blockedSet();
+        var bookmarks = peerBookmarksSet();
+
+        // Update tab navigation active state
+        drawer.querySelectorAll('[data-chat-social-tab]').forEach(function (tabEl) {
+            var tabId = tabEl.getAttribute('data-chat-social-tab');
+            tabEl.classList.toggle('chat-social-nav-tab--active', tabId === _socialTab);
+        });
+
+        // Update add banner label & placeholder
+        var addLabel = drawer.querySelector('[data-chat-social-add-label]');
+        var addInp = drawer.querySelector('[data-chat-social-input]');
+        if (_socialTab === 'friends') {
+            if (addLabel) addLabel.textContent = 'ADD FRIEND';
+            if (addInp) addInp.placeholder = 'Enter Soulseek username to add as friend…';
+        } else if (_socialTab === 'blocked') {
+            if (addLabel) addLabel.textContent = 'BLOCK USER';
+            if (addInp) addInp.placeholder = 'Enter Soulseek username to block…';
+        } else {
+            if (addLabel) addLabel.textContent = 'BOOKMARK PEER';
+            if (addInp) addInp.placeholder = 'Enter Soulseek username to bookmark…';
+        }
+
+        var listEl = drawer.querySelector('[data-chat-social-list]');
+        if (!listEl) return;
+
+        var items = [];
+        if (_socialTab === 'friends') items = friends;
+        else if (_socialTab === 'blocked') items = blocked;
+        else items = bookmarks;
+
+        var f = String(_socialFilter || '').trim().toLowerCase();
+        if (f) {
+            items = items.filter(function (u) { return String(u).toLowerCase().indexOf(f) > -1; });
+        }
+
+        var totalEl = drawer.querySelector('[data-chat-social-total]');
+        if (totalEl) {
+            var unit = _socialTab === 'friends' ? 'friend' : (_socialTab === 'blocked' ? 'blocked' : 'peer');
+            totalEl.textContent = items.length + ' ' + unit + (items.length === 1 ? '' : 's');
+        }
+
+        if (!items.length) {
+            var emptyIcon = _socialTab === 'friends' ? '⭐' : (_socialTab === 'blocked' ? '🚫' : '📚');
+            var emptyTitle = _socialTab === 'friends' ? 'No friends yet' : (_socialTab === 'blocked' ? 'No blocked users' : 'No saved peers yet');
+            var emptyDesc = _socialTab === 'friends'
+                ? 'Add friends using the input above or click ⭐ Add Friend on any user in chat!'
+                : (_socialTab === 'blocked'
+                    ? 'Blocked users have their room messages and private messages completely hidden.'
+                    : 'Click ⭐ Bookmark while exploring peer files or add their username above to save them.');
+            if (f) {
+                emptyTitle = 'No matches found';
+                emptyDesc = 'No ' + _socialTab + ' match "' + esc(f) + '"';
+            }
+            listEl.innerHTML = '<div class="chat-social-empty">' +
+                '<div style="font-size:32px;margin-bottom:8px;opacity:0.8;">' + emptyIcon + '</div>' +
+                '<div style="font-weight:700;font-size:15px;color:#fff;margin-bottom:4px;">' + emptyTitle + '</div>' +
+                '<div>' + emptyDesc + '</div>' +
+            '</div>';
+            return;
+        }
+
+        var avMap = _avatarMap();
+        var onlineUsers = state.users || [];
+        var onlineMap = {};
+        onlineUsers.forEach(function (u) { onlineMap[String(u).toLowerCase()] = true; });
+
+        listEl.innerHTML = items.map(function (u) {
+            var av = avMap && avMap[u];
+            var isOnline = !!onlineMap[String(u).toLowerCase()];
+
+            var subText = '';
+            if (_socialTab === 'friends') {
+                subText = isOnline ? '⭐ Friend • Online in room' : '⭐ Friend • Soulseek user';
+            } else if (_socialTab === 'blocked') {
+                subText = '🚫 Blocked • Chat & PMs suppressed';
+            } else {
+                subText = isOnline ? '📚 Saved Peer • Online in room' : '📚 Saved Peer';
+            }
+
+            var html = '<div class="chat-social-row">' +
+                '<div class="chat-social-row-av">' +
+                    '<span class="chat-user-av" style="width:36px;height:36px;font-size:13px;">' +
+                        _avatarHtml(u, av, 'chat-av--fill') +
+                        '<span class="chat-user-dot' + (isOnline ? ' chat-user-dot--tuned' : '') + '"></span>' +
+                    '</span>' +
+                '</div>' +
+                '<div class="chat-social-row-info">' +
+                    '<div class="chat-social-row-name" data-chat-user="' + attr(u) + '" title="View user card">' + esc(u) + '</div>' +
+                    '<div class="chat-social-row-sub">' + subText + '</div>' +
+                '</div>' +
+                '<div class="chat-social-row-actions">';
+
+            if (_socialTab === 'friends') {
+                html += '<button type="button" class="chat-social-action-btn" data-chat-browse-user="' + attr(u) + '" title="Browse their files">📁 Browse</button>' +
+                        '<button type="button" class="chat-social-action-btn" data-chat-open-pm="' + attr(u) + '" title="Send direct message">💬 Message</button>' +
+                        '<button type="button" class="chat-social-action-btn chat-social-action-btn--danger" data-chat-social-remove-friend="' + attr(u) + '" title="Remove from friends">✕ Remove</button>';
+            } else if (_socialTab === 'blocked') {
+                html += '<button type="button" class="chat-social-action-btn chat-social-action-btn--danger" data-chat-social-unblock="' + attr(u) + '" title="Unblock user">Unblock</button>';
+            } else {
+                html += '<button type="button" class="chat-social-action-btn" data-chat-browse-user="' + attr(u) + '" title="Browse their files">📁 Browse</button>' +
+                        '<button type="button" class="chat-social-action-btn" data-chat-open-pm="' + attr(u) + '" title="Send direct message">💬 Message</button>' +
+                        '<button type="button" class="chat-social-action-btn chat-social-action-btn--danger" data-chat-social-remove-bookmark="' + attr(u) + '" title="Remove bookmark">★ Remove</button>';
+            }
+            html += '</div></div>';
+            return html;
+        }).join('');
+    }
+
+    function addSocialUser() {
+        var drawer = q('[data-chat-social-drawer]');
+        if (!drawer) return;
+        var inp = drawer.querySelector('[data-chat-social-input]');
+        if (!inp) return;
+        var val = String(inp.value || '').trim();
+        if (!val) return;
+
+        if (_socialTab === 'friends') {
+            if (!isFriend(val)) toggleFriend(val);
+            if (typeof showToast === 'function') showToast('Added ' + val + ' to friends', 'success');
+        } else if (_socialTab === 'blocked') {
+            if (!isBlocked(val)) toggleBlocked(val);
+            if (typeof showToast === 'function') showToast('Blocked ' + val, 'info');
+        } else {
+            if (!isPeerBookmarked(val)) togglePeerBookmark(val);
+            if (typeof showToast === 'function') showToast('Bookmarked peer ' + val, 'success');
+        }
+        inp.value = '';
+        _updateSocialBadges();
+        renderSocialList();
+    }
+
+    function _openSavedPeersPicker() {
+        openSocialModal('bookmarks');
+    }
 
     function openRoomBrowser() {
         var overlay = q('[data-chat-rooms-modal]');
@@ -4697,8 +8505,10 @@
 
     function openPm(username) {
         if (!username) return;
+        unhideDm(username);
         state.view = 'pm'; state.pmUser = username; state.lastStamp = null; state.stickBottom = true;
         state.searchMode = false; state.renderedOk = false;
+        state.pmMsgs = [];
         state.renderedCount = 0; hideJumpPill(); state.newMarker = null;
         cancelReply();
         cancelEdit();
@@ -4707,6 +8517,7 @@
         var host = q('[data-chat-messages]');
         if (host) host.innerHTML = '<div class="chat-empty">Loading…</div>';
         refresh();
+        if (state.convos) renderSide(state.convos);
     }
 
     function send() {
@@ -4753,27 +8564,47 @@
                 if (typeof showToast === 'function') {
                     showToast(res.body && res.body.error || 'Message not sent', 'error');
                 }
-                input.value = text;     // give the words back
+                input.value = input.value ? text + '\n' + input.value : text; // preserve newer typing too
+                if (res.body && (res.body.code === 'slskd_disconnected' || res.body.code === 'slskd_unavailable')) {
+                    state.connectionError = res.body.error; state.canSend = false; renderComposer();
+                }
                 return;
             }
-            // Optimistic echo: slskd takes a beat to include a just-sent message,
-            // and the poll adds up to 4s more — paint it NOW, then let the next
-            // authoritative render replace it (lastStamp reset forces that).
-            // Except edits: their echo would paint as a stray ✏ line under the
-            // original — the authoritative render folds it in place instead.
-            var host = q('[data-chat-messages]');
-            if (host && !sentEdit) {
-                var empty = host.querySelector('.chat-empty');
-                if (empty) empty.remove();
-                host.insertAdjacentHTML('beforeend', renderGroups([{
-                    username: 'you', message: text,
-                    timestamp: new Date().toISOString(), self: true,
-                    reply: sentReply || undefined,
-                    // room sends ride the envelope → render the echo rich too
-                    rich: state.view === 'room',
-                }]));
-                host.scrollTop = host.scrollHeight;
+            // Optimistic echo: store in state.msgs (room) or state.pmMsgs (PM) with _pending: true.
+            // When renderMessages is called by refresh(), the message remains rendered in state
+            // and does NOT vanish from the screen while waiting for the server echo.
+            var myName = state.selfName || 'you';
+            var nowIso = new Date().toISOString();
+            if (state.view === 'room') {
+                if (!sentEdit) {
+                    var optMsg = {
+                        username: myName,
+                        message: text,
+                        timestamp: nowIso,
+                        self: true,
+                        reply: sentReply || undefined,
+                        rich: state.view === 'room' && !_plainOn(),
+                        chan: state.channel || 'general',
+                        _pending: true,
+                    };
+                    state.msgs = state.msgs || [];
+                    state.msgs.push(optMsg);
+                    state.lastStamp = null;
+                    renderMessages(state.msgs);
+                }
+            } else if (state.view === 'pm') {
+                var optPm = {
+                    username: myName,
+                    message: text,
+                    timestamp: nowIso,
+                    self: true,
+                    direction: 'Out',
+                    _pending: true,
+                };
+                state.pmMsgs = state.pmMsgs || [];
+                state.pmMsgs.push(optPm);
                 state.lastStamp = null;
+                renderMessages(state.pmMsgs);
             }
             state.stickBottom = true;
             cancelReply();
@@ -4793,6 +8624,10 @@
             if (!e.target.closest('[data-chat-emoji-btn]') &&
                     !e.target.closest('[data-chat-emoji-pop]')) {
                 toggleEmojiPicker(true);
+            }
+            if (!e.target.closest('[data-chat-attach-btn]') &&
+                    !e.target.closest('[data-chat-attach-pop]')) {
+                toggleAttachPanel(true);
             }
             if (!e.target.closest('[data-chat-poll-btn]') &&
                     !e.target.closest('[data-chat-poll-pop]')) {
@@ -4814,10 +8649,222 @@
             if (g) { sendGif(g.getAttribute('data-chat-gif-send')); return; }
             var t = e.target.closest('[data-chat-embed-yt]');
             if (t) {
-                t.outerHTML = '<span class="chat-embed-frame"><iframe src="https://www.youtube-nocookie.com/embed/' +
-                    t.getAttribute('data-chat-embed-yt') +
-                    '" allow="encrypted-media; picture-in-picture" allowfullscreen ' +
-                    'referrerpolicy="no-referrer" loading="lazy"></iframe></span>';
+                var vid = t.getAttribute('data-chat-embed-yt');
+                var jbxBtn = t.nextElementSibling && t.nextElementSibling.matches('[data-chat-jbx-add]') ? t.nextElementSibling : null;
+                if (jbxBtn) jbxBtn.remove();
+                t.outerHTML = '<div class="chat-embed-card chat-embed-card--yt" data-embed-yt="' + attr(vid) + '">' +
+                    '<div class="chat-embed-card-head">' +
+                        '<div class="chat-embed-card-brand">' +
+                            '<span class="chat-embed-dot chat-embed-dot--yt"></span>' +
+                            '<span class="chat-embed-brand-label">YouTube Video</span>' +
+                        '</div>' +
+                        '<div class="chat-embed-card-actions">' +
+                            '<button type="button" class="chat-embed-card-btn chat-embed-card-btn--jbx" data-chat-jbx-add="' + attr(vid) + '" title="Queue to Room Jukebox">🎵 Jukebox</button>' +
+                            '<a href="https://www.youtube.com/watch?v=' + encodeURIComponent(vid) + '" target="_blank" rel="noopener noreferrer" class="chat-embed-card-btn" title="Open on YouTube">↗ Watch</a>' +
+                            '<button type="button" class="chat-embed-card-btn chat-embed-card-btn--close" data-chat-embed-close title="Close Player">✕</button>' +
+                        '</div>' +
+                    '</div>' +
+                    '<div class="chat-embed-card-body">' +
+                        '<span class="chat-embed-frame"><iframe src="https://www.youtube-nocookie.com/embed/' +
+                        attr(vid) +
+                        '?autoplay=1&rel=0&playsinline=1" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen ' +
+                        'referrerpolicy="strict-origin-when-cross-origin" loading="lazy"></iframe></span>' +
+                    '</div>' +
+                '</div>';
+                return;
+            }
+            t = e.target.closest('[data-chat-jbx-add]');
+            if (t) {
+                var jvid = t.getAttribute('data-chat-jbx-add');
+                if (jvid) _jbxPick({ id: jvid, title: 'YouTube Video' });
+                return;
+            }
+            t = e.target.closest('[data-chat-embed-spotify]');
+            if (t) {
+                var spPath = t.getAttribute('data-chat-embed-spotify');
+                var isAlbum = spPath.indexOf('album') === 0 || spPath.indexOf('playlist') === 0;
+                var sph = isAlbum ? 352 : 152;
+                t.outerHTML = '<div class="chat-embed-card chat-embed-card--spotify">' +
+                    '<div class="chat-embed-card-head">' +
+                        '<div class="chat-embed-card-brand">' +
+                            '<span class="chat-embed-dot chat-embed-dot--sp"></span>' +
+                            '<span class="chat-embed-brand-label">Spotify Player</span>' +
+                        '</div>' +
+                        '<div class="chat-embed-card-actions">' +
+                            '<a href="https://open.spotify.com/' + attr(spPath) + '" target="_blank" rel="noopener noreferrer" class="chat-embed-card-btn" title="Open on Spotify">↗ Open</a>' +
+                            '<button type="button" class="chat-embed-card-btn chat-embed-card-btn--close" data-chat-embed-close title="Close Player">✕</button>' +
+                        '</div>' +
+                    '</div>' +
+                    '<div class="chat-embed-card-body">' +
+                        '<iframe class="chat-embed-spotify-frame" src="https://open.spotify.com/embed/' + attr(spPath) + '?utm_source=generator&theme=0" ' +
+                        'width="100%" height="' + sph + '" frameborder="0" allowfullscreen="" ' +
+                        'allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture" ' +
+                        'loading="lazy" referrerpolicy="no-referrer"></iframe>' +
+                    '</div>' +
+                '</div>';
+                return;
+            }
+            t = e.target.closest('[data-chat-embed-deezer]');
+            if (t) {
+                var dzPath = t.getAttribute('data-chat-embed-deezer');
+                var isDzAlb = dzPath.indexOf('album') === 0 || dzPath.indexOf('playlist') === 0;
+                var dzh = isDzAlb ? 300 : 150;
+                t.outerHTML = '<div class="chat-embed-card chat-embed-card--deezer">' +
+                    '<div class="chat-embed-card-head">' +
+                        '<div class="chat-embed-card-brand">' +
+                            '<span class="chat-embed-dot chat-embed-dot--dz"></span>' +
+                            '<span class="chat-embed-brand-label">Deezer Player</span>' +
+                        '</div>' +
+                        '<div class="chat-embed-card-actions">' +
+                            '<a href="https://www.deezer.com/' + attr(dzPath) + '" target="_blank" rel="noopener noreferrer" class="chat-embed-card-btn" title="Open on Deezer">↗ Open</a>' +
+                            '<button type="button" class="chat-embed-card-btn chat-embed-card-btn--close" data-chat-embed-close title="Close Player">✕</button>' +
+                        '</div>' +
+                    '</div>' +
+                    '<div class="chat-embed-card-body">' +
+                        '<iframe class="chat-embed-deezer-frame" src="https://widget.deezer.com/widget/dark/' + attr(dzPath) + '" ' +
+                        'width="100%" height="' + dzh + '" frameborder="0" allowtransparency="true" ' +
+                        'allow="encrypted-media; clipboard-write" loading="lazy" referrerpolicy="no-referrer"></iframe>' +
+                    '</div>' +
+                '</div>';
+                return;
+            }
+            t = e.target.closest('[data-chat-embed-sc]');
+            if (t) {
+                var scRaw = decodeURIComponent(t.getAttribute('data-chat-embed-sc'));
+                t.outerHTML = '<div class="chat-embed-card chat-embed-card--sc">' +
+                    '<div class="chat-embed-card-head">' +
+                        '<div class="chat-embed-card-brand">' +
+                            '<span class="chat-embed-dot chat-embed-dot--sc"></span>' +
+                            '<span class="chat-embed-brand-label">SoundCloud Player</span>' +
+                        '</div>' +
+                        '<div class="chat-embed-card-actions">' +
+                            '<a href="' + attr(scRaw) + '" target="_blank" rel="noopener noreferrer" class="chat-embed-card-btn" title="Open on SoundCloud">↗ Open</a>' +
+                            '<button type="button" class="chat-embed-card-btn chat-embed-card-btn--close" data-chat-embed-close title="Close Player">✕</button>' +
+                        '</div>' +
+                    '</div>' +
+                    '<div class="chat-embed-card-body">' +
+                        '<iframe class="chat-embed-sc-frame" width="100%" height="166" scrolling="no" frameborder="no" allow="autoplay" ' +
+                        'src="https://w.soundcloud.com/player/?url=' + encodeURIComponent(scRaw) + '&color=%23ff5500&auto_play=true&hide_related=true&show_comments=false&show_user=true&show_reposts=false&show_teaser=false" ' +
+                        'loading="lazy" referrerpolicy="no-referrer"></iframe>' +
+                    '</div>' +
+                '</div>';
+                return;
+            }
+            t = e.target.closest('[data-chat-embed-close]');
+            if (t) {
+                var card = t.closest('.chat-embed-card');
+                if (card) {
+                    var ytid = card.getAttribute('data-embed-yt');
+                    if (ytid) {
+                        card.outerHTML = '<button type="button" class="chat-embed-chip chat-embed-chip--yt" data-chat-embed-yt="' +
+                            attr(ytid) + '" title="Play YouTube video inline in chat">▶ play</button>' +
+                            ' <button type="button" class="chat-embed-action chat-embed-action--jbx" data-chat-jbx-add="' +
+                            attr(ytid) + '" title="Queue to Room Jukebox">🎵 jukebox</button>';
+                    } else {
+                        card.remove();
+                    }
+                }
+                return;
+            }
+            t = e.target.closest('[data-chat-preview-url]');
+            if (t) {
+                var pUrl = t.getAttribute('data-chat-preview-url');
+                var uCard = t.closest('.chat-unfurl-card');
+                if (uCard) {
+                    var existingFrame = uCard.querySelector('.chat-inline-web-frame');
+                    if (existingFrame) {
+                        existingFrame.remove();
+                        t.classList.remove('chat-unfurl-btn--active');
+                        t.textContent = '👁 Preview';
+                        return;
+                    }
+                    t.classList.add('chat-unfurl-btn--active');
+                    t.textContent = '✕ Close';
+
+                    var pDomain = '';
+                    try { pDomain = new URL(pUrl).hostname; } catch (err) { pDomain = pUrl; }
+
+                    var frameContainer = document.createElement('div');
+                    frameContainer.className = 'chat-inline-web-frame';
+                    frameContainer.innerHTML =
+                        '<div class="chat-inline-web-toolbar">' +
+                            '<div class="chat-inline-web-ssl" title="Secure web preview"><span class="chat-inline-ssl-lock">🔒</span> ' + esc(pDomain) + '</div>' +
+                            '<div class="chat-inline-web-actions">' +
+                                '<button type="button" class="chat-inline-web-btn" data-chat-web-reload title="Reload frame">⟳</button>' +
+                                '<button type="button" class="chat-inline-web-btn" data-chat-web-expand="' + attr(pUrl) + '" title="Expand to slide-over modal">⛶</button>' +
+                                '<a href="' + attr(pUrl) + '" target="_blank" rel="noopener noreferrer" class="chat-inline-web-btn" title="Open in browser tab">↗</a>' +
+                                '<button type="button" class="chat-inline-web-btn chat-inline-web-btn--close" data-chat-web-close title="Close inline preview">✕</button>' +
+                            '</div>' +
+                        '</div>' +
+                        '<div class="chat-inline-web-body">' +
+                            '<div class="chat-inline-web-loader">Loading preview…</div>' +
+                            '<iframe src="' + attr(pUrl) + '" sandbox="allow-scripts allow-same-origin allow-forms allow-popups" ' +
+                                'loading="lazy" referrerpolicy="no-referrer"></iframe>' +
+                            '<div class="chat-inline-web-fallback" style="display:none;">' +
+                                '<span>If this site restricts inline frame viewing (X-Frame-Options), </span>' +
+                                '<a href="' + attr(pUrl) + '" target="_blank" rel="noopener noreferrer" class="chat-inline-fallback-btn">Open in New Tab ↗</a>' +
+                            '</div>' +
+                        '</div>';
+                    uCard.appendChild(frameContainer);
+
+                    var ifr = frameContainer.querySelector('iframe');
+                    var loader = frameContainer.querySelector('.chat-inline-web-loader');
+                    var fallback = frameContainer.querySelector('.chat-inline-web-fallback');
+
+                    var loadTimer = setTimeout(function () {
+                        if (loader) loader.style.display = 'none';
+                        if (fallback) fallback.style.display = 'flex';
+                    }, 4500);
+
+                    ifr.onload = function () {
+                        clearTimeout(loadTimer);
+                        if (loader) loader.style.display = 'none';
+                    };
+                    ifr.onerror = function () {
+                        clearTimeout(loadTimer);
+                        if (loader) loader.style.display = 'none';
+                        if (fallback) fallback.style.display = 'flex';
+                    };
+                }
+                return;
+            }
+            t = e.target.closest('[data-chat-web-close]');
+            if (t) {
+                var fr = t.closest('.chat-inline-web-frame');
+                if (fr) {
+                    var pc = fr.closest('.chat-unfurl-card');
+                    if (pc) {
+                        var pb = pc.querySelector('[data-chat-preview-url]');
+                        if (pb) {
+                            pb.classList.remove('chat-unfurl-btn--active');
+                            pb.textContent = '👁 Preview';
+                        }
+                    }
+                    fr.remove();
+                }
+                return;
+            }
+            t = e.target.closest('[data-chat-web-reload]');
+            if (t) {
+                var rf = t.closest('.chat-inline-web-frame');
+                var rifr = rf && rf.querySelector('iframe');
+                if (rifr) {
+                    var osrc = rifr.src;
+                    rifr.src = '';
+                    rifr.src = osrc;
+                }
+                return;
+            }
+            t = e.target.closest('[data-chat-web-expand]');
+            if (t) {
+                var expUrl = t.getAttribute('data-chat-web-expand');
+                if (expUrl) openWebPreviewModal(expUrl);
+                return;
+            }
+            t = e.target.closest('[data-chat-unfurl-close]');
+            if (t) {
+                var uc = t.closest('.chat-unfurl-card');
+                if (uc) uc.remove();
                 return;
             }
             t = e.target.closest('[data-chat-embed-img]');
@@ -4852,8 +8899,24 @@
             }
             t = e.target.closest('[data-chat-file-save]');
             if (t) { _saveFileToLibrary(t); return; }
+            t = e.target.closest('[data-chat-overlay-add]');
+            if (t) { _adoptSharedOverlay(t); return; }
             t = e.target.closest('[data-chat-attach-btn]');
             if (t) { toggleAttachPanel(); return; }
+            t = e.target.closest('[data-chat-attach-overlay]');
+            if (t) { _pickOverlayToShare(); return; }
+            t = e.target.closest('[data-chat-ovl-pick]');
+            if (t) {
+                _shareOverlayById(t.getAttribute('data-chat-ovl-pick'),
+                                  t.getAttribute('data-chat-ovl-name'));
+                return;
+            }
+            t = e.target.closest('[data-chat-ovl-close]');
+            if (t) { _closeOverlayPicker(); return; }
+            // Click the backdrop to dismiss, like every other chat modal.
+            if (e.target.matches && e.target.matches('[data-chat-ovl-modal]')) {
+                _closeOverlayPicker(); return;
+            }
             t = e.target.closest('[data-chat-spoiler]');
             if (t) { t.classList.add('chat-spoiler--shown'); return; }
             t = e.target.closest('[data-chat-fmt]');
@@ -4861,7 +8924,19 @@
             t = e.target.closest('[data-chat-emoji-btn]');
             if (t) { toggleEmojiPicker(); return; }
             t = e.target.closest('[data-chat-emoji-pick]');
-            if (t) { insertAtCursor(t.getAttribute('data-chat-emoji-pick')); toggleEmojiPicker(true); return; }
+            if (t) {
+                var emVal = t.getAttribute('data-chat-emoji-pick');
+                insertAtCursor(emVal);
+                _pushRecentEmoji(t.getAttribute('data-emoji-name') || emVal);
+                toggleEmojiPicker(true);
+                return;
+            }
+            t = e.target.closest('[data-chat-jump-reply]');
+            if (t) {
+                _jumpToRepliedMessage(t.getAttribute('data-chat-jump-reply'),
+                                      t.getAttribute('data-chat-jump-x'));
+                return;
+            }
             t = e.target.closest('[data-chat-reply-user]');
             if (t) {
                 cancelEdit();
@@ -5081,6 +9156,8 @@
                 if (first && (first.username || first.name)) openPm(first.username || first.name);
                 return;
             }
+            t = e.target.closest('[data-chat-settab]');
+            if (t) { _setSettingsTab(t.getAttribute('data-chat-settab')); return; }
             t = e.target.closest('[data-chat-settings-save]');
             if (t) { saveSettings(); return; }
             t = e.target.closest('[data-chat-settings-cancel]');
@@ -5093,7 +9170,10 @@
                 try { localStorage.setItem('chat_ss_only', state.ssOnly ? '1' : '0'); } catch (err) { /* ignore */ }
                 state.lastStamp = null;
                 state.renderedCount = 0; hideJumpPill();   // a filter flip isn't 'new messages'
-                renderHead(); refresh();
+                // the filter also picks the SEND format, so a half-built rich
+                // message cannot survive the flip to plain
+                if (_plainOn()) { cancelReply(); cancelEdit(); toggleAttachPanel(true); closeWantedModal(); }
+                renderHead(); renderComposer(); refresh();
                 return;
             }
             t = e.target.closest('[data-chat-browse-retry]');
@@ -5170,6 +9250,8 @@
             if (t) { _trivAsk(); return; }
             t = e.target.closest('[data-chat-poll-btn]');
             if (t) { togglePollPop(); return; }
+            t = e.target.closest('[data-chat-poll-add-opt]');
+            if (t) { _pollAddOption(); return; }
             t = e.target.closest('[data-chat-poll-start]');
             if (t) { _pollStart(); return; }
             t = e.target.closest('[data-chat-poll-vote]');
@@ -5179,7 +9261,7 @@
             t = e.target.closest('[data-chat-poll-dismiss]');
             if (t) {
                 var pd = window.ChatProtocol ? window.ChatProtocol.reducePoll(_roomEvents()) : null;
-                state.pollDismissedAt = pd ? pd.at : null;
+                _dismissPoll(pd);
                 renderPoll();
                 return;
             }
@@ -5255,6 +9337,121 @@
                 if (ph) ph.classList.toggle('chat-jbx-player--audio', state.jukebox.videoHidden);
                 state.jukebox.lastRendered = '';
                 renderJukebox();
+                return;
+            }
+            // ── Now Playing & Wanted action buttons ──
+            t = e.target.closest('[data-chat-np-btn]') || e.target.closest('[data-chat-np-quick]');
+            if (t) { shareNowPlaying(); return; }
+            t = e.target.closest('[data-chat-want-btn]');
+            if (t) { openWantedModal(); return; }
+            t = e.target.closest('[data-chat-want-close]');
+            if (t) { closeWantedModal(); return; }
+            var wantOv = e.target.closest('[data-chat-want-backdrop]');
+            if (wantOv) { closeWantedModal(); return; }
+            t = e.target.closest('[data-want-src]');
+            if (t) {
+                document.querySelectorAll('[data-want-src]').forEach(function (b) {
+                    b.classList.remove('chat-want-src-btn--active');
+                });
+                t.classList.add('chat-want-src-btn--active');
+                _wantActiveSource = t.getAttribute('data-want-src') || 'auto';
+                searchWanted();
+                return;
+            }
+            t = e.target.closest('[data-chat-want-clear]');
+            if (t) {
+                var wInp = q('[data-chat-want-input]');
+                if (wInp) { wInp.value = ''; wInp.focus(); }
+                searchWanted();
+                return;
+            }
+            t = e.target.closest('[data-chat-want-post-idx]');
+            if (t) {
+                var idx = parseInt(t.getAttribute('data-chat-want-post-idx'), 10);
+                var resEl = q('[data-chat-want-results]');
+                if (resEl && resEl._items && resEl._items[idx]) {
+                    postWantedCard(resEl._items[idx]);
+                }
+                return;
+            }
+            t = e.target.closest('[data-chat-card-stream]');
+            if (t) {
+                var c1 = t.closest('.chat-np-card');
+                if (c1) {
+                    _streamFromCard(
+                        c1.getAttribute('data-np-title') || '',
+                        c1.getAttribute('data-np-artist') || '',
+                        c1.getAttribute('data-np-album') || ''
+                    );
+                }
+                return;
+            }
+            t = e.target.closest('[data-chat-card-dl]');
+            if (t) {
+                var c2 = t.closest('.chat-np-card') || t.closest('.chat-wanted-card');
+                if (c2) {
+                    _openDownloadForCard(
+                        c2.getAttribute('data-np-artist') || c2.getAttribute('data-wanted-artist') || '',
+                        c2.getAttribute('data-np-title') || c2.getAttribute('data-wanted-title') || '',
+                        c2.getAttribute('data-np-album') || c2.getAttribute('data-wanted-album') || '',
+                        c2.getAttribute('data-np-id') || c2.getAttribute('data-wanted-id') || '',
+                        c2.getAttribute('data-np-src') || c2.getAttribute('data-wanted-src') || '',
+                        parseInt(c2.getAttribute('data-np-dur') || c2.getAttribute('data-wanted-dur') || '0', 10),
+                        c2.getAttribute('data-np-img') || c2.getAttribute('data-wanted-img') || '',
+                        c2.getAttribute('data-wanted-type') || (c2.classList.contains('chat-wanted-card') ? 'album' : 'single')
+                    );
+                }
+                return;
+            }
+            t = e.target.closest('[data-chat-card-artist]');
+            if (t) {
+                var c3 = t.closest('.chat-np-card') || t.closest('.chat-wanted-card');
+                if (c3) {
+                    _openArtistPage(
+                        c3.getAttribute('data-np-artist') || c3.getAttribute('data-wanted-artist') || '',
+                        c3.getAttribute('data-np-id') || c3.getAttribute('data-wanted-id') || '',
+                        c3.getAttribute('data-np-src') || c3.getAttribute('data-wanted-src') || ''
+                    );
+                }
+                return;
+            }
+            t = e.target.closest('[data-chat-card-search]');
+            if (t) {
+                var c4 = t.closest('.chat-np-card') || t.closest('.chat-wanted-card');
+                if (c4) {
+                    _searchFromCard(
+                        c4.getAttribute('data-np-artist') || c4.getAttribute('data-wanted-artist') || '',
+                        c4.getAttribute('data-np-title') || c4.getAttribute('data-wanted-title') || ''
+                    );
+                }
+                return;
+            }
+            t = e.target.closest('[data-chat-wanted-have]');
+            if (t) {
+                _onHaveWanted(
+                    t.getAttribute('data-wanted-user') || '',
+                    t.getAttribute('data-wanted-title') || '',
+                    t.getAttribute('data-wanted-artist') || ''
+                );
+                return;
+            }
+            t = e.target.closest('[data-chat-wanted-wishlist]') || e.target.closest('[data-chat-card-wishlist]');
+            if (t) {
+                var c5 = t.closest('.chat-wanted-card') || t.closest('.chat-np-card');
+                if (c5) {
+                    var isWanted = c5.classList.contains('chat-wanted-card');
+                    _addWantedToWishlist({
+                        t: c5.getAttribute(isWanted ? 'data-wanted-title' : 'data-np-title') || '',
+                        a: c5.getAttribute(isWanted ? 'data-wanted-artist' : 'data-np-artist') || '',
+                        al: c5.getAttribute(isWanted ? 'data-wanted-album' : 'data-np-album') || '',
+                        id: c5.getAttribute(isWanted ? 'data-wanted-id' : 'data-np-id') || '',
+                        src: c5.getAttribute(isWanted ? 'data-wanted-src' : 'data-np-src') || '',
+                        img: c5.getAttribute(isWanted ? 'data-wanted-img' : 'data-np-img') || '',
+                        ty: isWanted ? (c5.getAttribute('data-wanted-type') || 'album') : 'track',
+                        dur: c5.getAttribute(isWanted ? 'data-wanted-dur' : 'data-np-dur') || 0,
+                        y: c5.getAttribute(isWanted ? 'data-wanted-year' : 'data-np-year') || ''
+                    });
+                }
                 return;
             }
             // ── movie night ──
@@ -5349,6 +9546,10 @@
             }
             t = e.target.closest('[data-chat-search-btn]');
             if (t) { state.searchMode ? exitSearch() : enterSearch(); return; }
+            t = e.target.closest('[data-chat-search-prev]');
+            if (t) { _highlightSearchResult(_searchIdx - 1); return; }
+            t = e.target.closest('[data-chat-search-next]');
+            if (t) { _highlightSearchResult(_searchIdx + 1); return; }
             t = e.target.closest('[data-chat-search-exit]');
             if (t) { exitSearch(); return; }
             t = e.target.closest('[data-chat-copy]');
@@ -5373,14 +9574,55 @@
             if (t) { var rm = q('[data-chat-rooms-modal]'); if (rm) rm.hidden = true; return; }
             var rmo = e.target.closest('[data-chat-rooms-modal]');
             if (rmo && e.target === rmo) { rmo.hidden = true; return; }
+            t = e.target.closest('[data-chat-close-pm]');
+            if (t) {
+                var userToClose = t.getAttribute('data-chat-close-pm');
+                if (userToClose) {
+                    hideDm(userToClose);
+                    if (state.view === 'pm' && state.pmUser === userToClose) {
+                        openRoom(state.room || undefined);
+                    }
+                    if (state.convos) renderSide(state.convos);
+                    if (typeof showToast === 'function') showToast('Conversation closed', 'info');
+                }
+                return;
+            }
+            t = e.target.closest('[data-chat-head-close-pm]');
+            if (t) {
+                if (state.view === 'pm' && state.pmUser) {
+                    var uClosed = state.pmUser;
+                    hideDm(uClosed);
+                    openRoom(state.room || undefined);
+                    if (state.convos) renderSide(state.convos);
+                    if (typeof showToast === 'function') showToast('Conversation closed', 'info');
+                }
+                return;
+            }
             t = e.target.closest('[data-chat-open-pm]');
             if (t) { openPm(t.getAttribute('data-chat-open-pm')); return; }
+            t = e.target.closest('[data-chat-react-quick]');
+            if (t) {
+                var qu = t.getAttribute('data-chat-react-user');
+                var qtx = t.getAttribute('data-chat-react-text');
+                var qem = t.getAttribute('data-chat-react-quick');
+                if (qu && qtx && qem) {
+                    sendReaction({ user: qu, text: qtx }, qem);
+                }
+                return;
+            }
+            t = e.target.closest('[data-chat-emoji-ac-pick]');
+            if (t) {
+                pickEmojiAutocomplete(t.getAttribute('data-chat-emoji-ac-pick'));
+                return;
+            }
             t = e.target.closest('[data-chat-react-user]');
             if (t) {
                 showReactRow(t, t.getAttribute('data-chat-react-user'),
                              t.getAttribute('data-chat-react-text'));
                 return;
             }
+            t = e.target.closest('[data-chat-react-expand]');
+            if (t) { _showReactFullPicker(t); return; }
             t = e.target.closest('[data-chat-react-do]');
             if (t) {
                 var rowEl = t.closest('[data-chat-react-pick-row]');
@@ -5393,6 +9635,46 @@
                 var ov = q('[data-chat-user-card]');
                 closeUserCard();
                 if (ov) openPm(ov.getAttribute('data-chat-user-card-for'));
+                return;
+            }
+            t = e.target.closest('[data-chat-card-friend]');
+            if (t) {
+                var fCard = q('[data-chat-user-card]');
+                var uFor = fCard && fCard.getAttribute('data-chat-user-card-for');
+                if (uFor) {
+                    var isNowF = toggleFriend(uFor);
+                    t.textContent = isNowF ? '⭐ Remove Friend' : '⭐ Add Friend';
+                    if (typeof showToast === 'function') {
+                        showToast(isNowF ? 'Added ' + uFor + ' to friends' : 'Removed from friends', 'info');
+                    }
+                }
+                return;
+            }
+            t = e.target.closest('[data-chat-card-block]');
+            if (t) {
+                var bCard = q('[data-chat-user-card]');
+                var uToBlk = bCard && bCard.getAttribute('data-chat-user-card-for');
+                if (uToBlk) {
+                    var isNowBlk = toggleBlocked(uToBlk);
+                    t.textContent = isNowBlk ? 'Unblock' : '🚫 Block';
+                    if (typeof showToast === 'function') {
+                        showToast(isNowBlk ? 'Blocked ' + uToBlk : 'Unblocked ' + uToBlk, 'info');
+                    }
+                }
+                return;
+            }
+            t = e.target.closest('[data-chat-card-bookmark]');
+            if (t) {
+                var bmCard = q('[data-chat-user-card]');
+                var uToBm = bmCard && bmCard.getAttribute('data-chat-user-card-for');
+                if (uToBm) {
+                    var isNowBm = togglePeerBookmark(uToBm);
+                    t.textContent = isNowBm ? '★ Bookmarked' : '⭐ Bookmark';
+                    _updateSavedPeersBtn();
+                    if (typeof showToast === 'function') {
+                        showToast(isNowBm ? 'Bookmarked ' + uToBm : 'Bookmark removed', 'info');
+                    }
+                }
                 return;
             }
             t = e.target.closest('[data-chat-card-challenge-v]');
@@ -5414,37 +9696,191 @@
                 if (cOv) _arcChallengeRow(cOv);
                 return;
             }
+            t = e.target.closest('[data-chat-browse-user]');
+            if (t) {
+                openBrowse(t.getAttribute('data-chat-browse-user'));
+                return;
+            }
             t = e.target.closest('[data-chat-card-browse]');
             if (t) {
                 var bOv = q('[data-chat-user-card]');
                 openBrowse(bOv && bOv.getAttribute('data-chat-user-card-for'));
                 return;
             }
-            t = e.target.closest('[data-chat-browse-dir]');
-            if (t) { openBrowseDir(t.getAttribute('data-chat-browse-dir')); return; }
-            t = e.target.closest('[data-chat-browse-back]');
+            t = e.target.closest('[data-chat-peer-bookmark]');
             if (t) {
-                var bsIn = q('[data-chat-browse-search]');
-                if (bsIn) bsIn.value = '';
-                renderBrowseDirs('');
+                if (_browse.user) {
+                    var isBm2 = togglePeerBookmark(_browse.user);
+                    t.textContent = isBm2 ? '★ Bookmarked' : '⭐ Bookmark';
+                    t.classList.toggle('chat-peer-bm-btn--active', isBm2);
+                    _updateSavedPeersBtn();
+                    if (typeof showToast === 'function') {
+                        showToast(isBm2 ? 'Peer bookmarked' : 'Bookmark removed', 'info');
+                    }
+                }
+                return;
+            }
+            t = e.target.closest('[data-chat-open-social]');
+            if (t) {
+                var tabChoice = t.getAttribute('data-chat-open-social') || 'friends';
+                openSocialModal(tabChoice);
+                return;
+            }
+            t = e.target.closest('[data-chat-social-close]');
+            if (t) { closeSocialModal(); return; }
+            t = e.target.closest('[data-chat-social-backdrop]');
+            if (t) { closeSocialModal(); return; }
+            t = e.target.closest('[data-chat-social-tab]');
+            if (t) {
+                _socialTab = t.getAttribute('data-chat-social-tab') || 'friends';
+                renderSocialList();
+                return;
+            }
+            t = e.target.closest('[data-chat-social-add-btn]');
+            if (t) {
+                addSocialUser();
+                return;
+            }
+            t = e.target.closest('[data-chat-social-remove-friend]');
+            if (t) {
+                var rf = t.getAttribute('data-chat-social-remove-friend');
+                if (rf) {
+                    toggleFriend(rf);
+                    renderSocialList();
+                    if (typeof showToast === 'function') showToast('Removed ' + rf + ' from friends', 'info');
+                }
+                return;
+            }
+            t = e.target.closest('[data-chat-social-unblock]');
+            if (t) {
+                var ub = t.getAttribute('data-chat-social-unblock');
+                if (ub) {
+                    toggleBlocked(ub);
+                    renderSocialList();
+                    if (typeof showToast === 'function') showToast('Unblocked ' + ub, 'info');
+                }
+                return;
+            }
+            t = e.target.closest('[data-chat-social-remove-bookmark]');
+            if (t) {
+                var rb = t.getAttribute('data-chat-social-remove-bookmark');
+                if (rb) {
+                    togglePeerBookmark(rb);
+                    renderSocialList();
+                    if (typeof showToast === 'function') showToast('Removed bookmark for ' + rb, 'info');
+                }
+                return;
+            }
+            t = e.target.closest('[data-chat-browse-saved-peers]');
+            if (t) {
+                _openSavedPeersPicker();
+                return;
+            }
+            t = e.target.closest('[data-chat-saved-peer-remove]');
+            if (t) {
+                var pRem = t.getAttribute('data-chat-saved-peer-remove');
+                if (pRem) {
+                    togglePeerBookmark(pRem);
+                    _updateSavedPeersBtn();
+                    var pRow = t.closest('.chat-room-row');
+                    if (pRow) pRow.remove();
+                    if (typeof showToast === 'function') showToast('Bookmark removed', 'info');
+                }
+                return;
+            }
+            t = e.target.closest('[data-chat-browse-friend]');
+            if (t) {
+                if (_browse.user) {
+                    var isFrNow = toggleFriend(_browse.user);
+                    t.textContent = isFrNow ? '⭐ Friend (Remove)' : '⭐ Friend';
+                    if (typeof showToast === 'function') {
+                        showToast(isFrNow ? 'Added ' + _browse.user + ' to friends' : 'Removed from friends', 'info');
+                    }
+                }
+                return;
+            }
+            t = e.target.closest('[data-chat-browse-block]');
+            if (t) {
+                if (_browse.user) {
+                    var isBlkNow = toggleBlocked(_browse.user);
+                    t.textContent = isBlkNow ? 'Unblock' : '🚫 Block';
+                    if (typeof showToast === 'function') {
+                        showToast(isBlkNow ? 'Blocked ' + _browse.user : 'Unblocked ' + _browse.user, 'info');
+                    }
+                }
+                return;
+            }
+            t = e.target.closest('[data-chat-browse-fmt]');
+            if (t) {
+                var fmtChoice = t.getAttribute('data-chat-browse-fmt') || 'all';
+                _browse.formatFilter = fmtChoice;
+                var pBarEl = q('.chat-browse-format-filters');
+                if (pBarEl) {
+                    pBarEl.querySelectorAll('.chat-fmt-pill').forEach(function (pill) {
+                        pill.classList.toggle('chat-fmt-pill--active', pill === t);
+                    });
+                }
+                renderBrowseTree(_browse.filter);
+                return;
+            }
+            t = e.target.closest('[data-chat-browse-dl-single]');
+            if (t) {
+                downloadSingleTrack(t.getAttribute('data-chat-browse-dl-single'), t.getAttribute('data-chat-browse-size'));
+                return;
+            }
+            t = e.target.closest('[data-chat-browse-dl-folder]');
+            if (t) {
+                downloadFolder(t.getAttribute('data-chat-browse-dl-folder'));
+                return;
+            }
+            t = e.target.closest('[data-chat-browse-toggle]');
+            if (t) {
+                var folderItem = t.closest('.chat-folder-tree-item');
+                var dir = t.getAttribute('data-chat-browse-toggle') || (folderItem && folderItem.getAttribute('data-chat-folder-item'));
+                toggleBrowseFolder(dir, folderItem);
+                return;
+            }
+            t = e.target.closest('[data-chat-browse-expand-all]');
+            if (t) { expandAllBrowseFolders(); return; }
+            t = e.target.closest('[data-chat-browse-collapse-all]');
+            if (t) { collapseAllBrowseFolders(); return; }
+            t = e.target.closest('[data-chat-dock-clear]');
+            if (t) {
+                _browse.selected = {};
+                var bBody = q('[data-chat-browse-body]');
+                if (bBody) {
+                    bBody.querySelectorAll('[data-chat-browse-file], [data-chat-browse-folder-all]').forEach(function (cb) {
+                        cb.checked = false;
+                    });
+                    bBody.querySelectorAll('.chat-file-row--selected').forEach(function (r) {
+                        r.classList.remove('chat-file-row--selected');
+                    });
+                }
+                _syncBrowseDock();
+                return;
+            }
+            t = e.target.closest('[data-chat-browse-msg]');
+            if (t) {
+                var peerName = _browse.user;
+                closeBrowse();
+                if (peerName) openPm(peerName);
+                return;
+            }
+            t = e.target.closest('[data-chat-browse-challenge]');
+            if (t) {
+                var peerName2 = _browse.user;
+                closeBrowse();
+                if (peerName2) openUserCard(peerName2);
                 return;
             }
             t = e.target.closest('[data-chat-browse-dl]');
             if (t) { browseDownloadSelected(); return; }
             t = e.target.closest('[data-chat-browse-close]');
-            if (t) { var bm = q('[data-chat-browse-modal]'); if (bm) bm.hidden = true; return; }
+            if (t) { closeBrowse(); return; }
+            t = e.target.closest('[data-chat-browse-backdrop]');
+            if (t) { closeBrowse(); return; }
             var bmo = e.target.closest('[data-chat-browse-modal]');
-            if (bmo && e.target === bmo) { bmo.hidden = true; return; }
-            t = e.target.closest('[data-chat-browse-all]');
-            if (t) {
-                var bBody = q('[data-chat-browse-body]');
-                if (bBody) {
-                    bBody.querySelectorAll('[data-chat-browse-file]').forEach(function (cb) {
-                        cb.checked = t.checked;
-                    });
-                }
-                return;
-            }
+            if (bmo && e.target === bmo) { closeBrowse(); return; }
             t = e.target.closest('[data-chat-card-ignore]');
             if (t) {
                 var cardOv = q('[data-chat-user-card]');
@@ -5470,24 +9906,138 @@
         if (watchSearchForm) watchSearchForm.addEventListener('submit', function (e) { e.preventDefault(); _watchSearchSubmit(); });
         var watchSearchIn = q('[data-chat-watch-searchinput]');
         if (watchSearchIn) watchSearchIn.addEventListener('input', _watchQueueSearch);
+        var socFilterIn = q('[data-chat-social-filter]');
+        if (socFilterIn) {
+            socFilterIn.addEventListener('input', function (e) {
+                _socialFilter = e.target.value;
+                renderSocialList();
+            });
+        }
         // The trivia answer input is re-rendered with its card, so Enter is
         // caught by delegation on the page rather than a per-render listener.
         var chatPageEl = document.getElementById('chat-page');
         if (chatPageEl) {
             chatPageEl.addEventListener('keydown', function (e) {
-                if (e.key === 'Enter' && e.target && e.target.matches &&
-                        e.target.matches('[data-chat-triv-guess]')) {
-                    e.preventDefault();
-                    _trivGuess();
+                if (e.key === 'Enter' && e.target && e.target.matches) {
+                    if (e.target.matches('[data-chat-triv-guess]')) {
+                        e.preventDefault();
+                        _trivGuess();
+                    } else if (e.target.matches('[data-chat-social-input]')) {
+                        e.preventDefault();
+                        addSocialUser();
+                    }
                 }
             });
         }
+
+        document.addEventListener('change', function (e) {
+            if (e.target && e.target.matches('[data-chat-browse-file]')) {
+                var fn = e.target.getAttribute('data-chat-browse-file');
+                var sz = Number(e.target.getAttribute('data-chat-browse-size')) || 0;
+                var row = e.target.closest('.chat-file-row');
+                if (e.target.checked) {
+                    _browse.selected[fn] = { size: sz };
+                    if (row) row.classList.add('chat-file-row--selected');
+                } else {
+                    delete _browse.selected[fn];
+                    if (row) row.classList.remove('chat-file-row--selected');
+                }
+                _syncBrowseDock();
+            } else if (e.target && e.target.matches('[data-chat-browse-folder-all]')) {
+                var dir = e.target.getAttribute('data-chat-browse-folder-all');
+                var files = _browse.cache[dir] || [];
+                var chk = e.target.checked;
+                var container = e.target.closest('.chat-folder-children');
+                files.forEach(function (x) {
+                    if (chk) {
+                        _browse.selected[x.filename] = { size: x.size || 0 };
+                    } else {
+                        delete _browse.selected[x.filename];
+                    }
+                });
+                if (container) {
+                    container.querySelectorAll('[data-chat-browse-file]').forEach(function (cb) {
+                        cb.checked = chk;
+                        var r = cb.closest('.chat-file-row');
+                        if (r) {
+                            if (chk) r.classList.add('chat-file-row--selected');
+                            else r.classList.remove('chat-file-row--selected');
+                        }
+                    });
+                }
+                _syncBrowseDock();
+            }
+        });
+
+        document.addEventListener('keydown', function (e) {
+            if (e.key === 'Escape') {
+                var setM = q('[data-chat-settings-modal]');
+                if (setM && !setM.hidden) { setM.hidden = true; }
+                var bm = q('[data-chat-browse-modal]');
+                if (bm && !bm.hidden) { closeBrowse(); }
+                var socD = q('[data-chat-social-drawer]');
+                if (socD && !socD.hidden) { closeSocialModal(); }
+                var wantD = q('[data-chat-want-modal]');
+                if (wantD && !wantD.hidden) { closeWantedModal(); }
+            }
+        });
+
+        var wantInputEl = q('[data-chat-want-input]');
+        if (wantInputEl) {
+            wantInputEl.addEventListener('input', function () {
+                clearTimeout(_wantSearchTimer);
+                _wantSearchTimer = setTimeout(searchWanted, 350);
+            });
+            wantInputEl.addEventListener('keydown', function (e) {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    clearTimeout(_wantSearchTimer);
+                    searchWanted();
+                }
+            });
+        }
+        _bindChatDragAndDrop();
+
+        window.addEventListener('popstate', function () {
+            var bm = q('[data-chat-browse-modal]');
+            if (bm && !bm.hidden && (!window.location.hash || window.location.hash.indexOf('#browse') !== 0)) {
+                closeBrowse();
+            }
+        });
 
         var inputEl = q('[data-chat-input]');
         if (inputEl) {
             // Discord composer: Enter sends, Shift+Enter newlines (the block
             // syntax — code fences, quotes, lists — NEEDS real newlines)
             inputEl.addEventListener('keydown', function (e) {
+                var acPop = q('[data-chat-emoji-autocomplete]');
+                if (acPop && !acPop.hidden && _emojiAcHits.length) {
+                    if (e.key === 'ArrowDown') {
+                        e.preventDefault();
+                        _emojiAcActiveIndex = (_emojiAcActiveIndex + 1) % _emojiAcHits.length;
+                        _renderEmojiAcSelection(acPop);
+                        return;
+                    }
+                    if (e.key === 'ArrowUp') {
+                        e.preventDefault();
+                        _emojiAcActiveIndex = (_emojiAcActiveIndex - 1 + _emojiAcHits.length) % _emojiAcHits.length;
+                        _renderEmojiAcSelection(acPop);
+                        return;
+                    }
+                    if (e.key === 'Enter' || e.key === 'Tab') {
+                        e.preventDefault();
+                        var pickName = _emojiAcHits[_emojiAcActiveIndex] || _emojiAcHits[0];
+                        pickEmojiAutocomplete(pickName);
+                        return;
+                    }
+                    if (e.key === 'Escape') {
+                        e.preventDefault();
+                        acPop.hidden = true;
+                        acPop.innerHTML = '';
+                        _emojiAcHits = [];
+                        return;
+                    }
+                }
                 if (e.key === 'Enter' && !e.shiftKey) {
                     // inside an unclosed ``` fence Enter newlines (Discord
                     // behavior) — otherwise typing a code block is impossible
@@ -5499,6 +10049,7 @@
                     cancelReply();
                     var mp = q('[data-chat-mention-pop]');
                     if (mp) mp.hidden = true;
+                    if (acPop) acPop.hidden = true;
                 }
                 if (e.key === 'Tab') {
                     var sp = q('[data-chat-mention-pop]');
@@ -5514,6 +10065,7 @@
                 inputEl.style.height = Math.min(inputEl.scrollHeight, 132) + 'px';
                 updateMentionPop(inputEl);
                 updateSlashPop(inputEl);
+                updateEmojiAutocomplete(inputEl);
                 _maybeSendTyping(inputEl);
             });
         }
@@ -5564,9 +10116,60 @@
                 }
             }
             if (e.target && e.target.matches('[data-chat-browse-search]')) {
-                var v = e.target.value.trim();
-                if (_browse.dir != null) renderBrowseFiles(v);
-                else renderBrowseDirs(v);
+                renderBrowseTree(e.target.value.trim());
+            }
+        });
+
+        document.addEventListener('change', function (e) {
+            var cb = e.target.closest('[data-chat-browse-file]');
+            if (cb) {
+                var fn = cb.getAttribute('data-chat-browse-file');
+                var sz = Number(cb.getAttribute('data-chat-browse-size')) || 0;
+                var row = cb.closest('.chat-file-row');
+                if (cb.checked) {
+                    _browse.selected[fn] = { filename: fn, size: sz };
+                    if (row) row.classList.add('chat-file-row--selected');
+                } else {
+                    delete _browse.selected[fn];
+                    if (row) row.classList.remove('chat-file-row--selected');
+                }
+                var dir = cb.getAttribute('data-chat-browse-dir');
+                if (dir) {
+                    var folderAll = q('[data-chat-browse-folder-all="' + attr(dir) + '"]');
+                    if (folderAll) {
+                        var cached = _browse.cache[dir] || [];
+                        folderAll.checked = cached.length > 0 && cached.every(function (x) { return !!_browse.selected[x.filename]; });
+                    }
+                }
+                _syncBrowseDock();
+                return;
+            }
+
+            var fAll = e.target.closest('[data-chat-browse-folder-all]');
+            if (fAll) {
+                var dirName = fAll.getAttribute('data-chat-browse-folder-all');
+                var files = _browse.cache[dirName] || [];
+                var checked = fAll.checked;
+                files.forEach(function (x) {
+                    if (checked) {
+                        _browse.selected[x.filename] = { filename: x.filename, size: x.size };
+                    } else {
+                        delete _browse.selected[x.filename];
+                    }
+                });
+                var chEl = q('[data-chat-browse-children="' + attr(dirName) + '"]');
+                if (chEl) {
+                    chEl.querySelectorAll('[data-chat-browse-file]').forEach(function (c) {
+                        c.checked = checked;
+                        var r = c.closest('.chat-file-row');
+                        if (r) {
+                            if (checked) r.classList.add('chat-file-row--selected');
+                            else r.classList.remove('chat-file-row--selected');
+                        }
+                    });
+                }
+                _syncBrowseDock();
+                return;
             }
         });
 
@@ -5638,11 +10241,13 @@
 
     function open() {
         bind();
+        _updateSocialBadges();
         if (state.configured !== true) {
             getJSON('/api/chat/status').then(function (res) {
                 state.configured = !!(res.ok && res.body.configured);
                 state.homeRoom = (res.body && res.body.room) || 'SoulSync';
                 state.room = state.room || state.homeRoom;
+                state.connectionError = res.body && res.body.connected === false ? res.body.error || 'Soulseek is not connected' : null;
                 state.canSend = !!(res.body && res.body.can_send);
                 state.isAdmin = !!(res.body && res.body.is_admin);
                 state.selfName = String((res.body && res.body.username) || '');
@@ -5783,7 +10388,10 @@
     function _sendJoinBeacon() {
         // Announce capability ONCE per room per session — powers the
         // assume-SoulSync presence for users who haven't typed anything.
+        // Suppressed in Plain Mode (All Messages view) and when the user
+        // has no custom avatar to announce, stopping empty noise lines.
         if (!state.canSend || !state.room || state.beaconed[state.room]) return;
+        if (_plainOn() || !_myAvatar()) return;
         state.beaconed[state.room] = 1;
         // carry the avatar so we get a face before we've said anything
         sendProtocol('hello', _myAvatar() ? { av: _myAvatar() } : {}).then(function (r) {
@@ -5802,7 +10410,7 @@
     var _TYP_TTL = 25000;      // matches the ≤20s re-emit cadence + slack
 
     function _maybeSendTyping(input) {
-        if (state.view !== 'room' || !state.canSend) return;
+        if (state.view !== 'room' || !state.canSend || _plainOn()) return;
         if (!input || !(input.value || '').trim()) return;
         if ((input.value || '')[0] === '/') return;      // commands aren't messages
         if (Date.now() - state.lastTypSentAt < 20000) return;
@@ -5886,35 +10494,92 @@
     }
 
     // ── the room poll (poll.start / poll.vote / poll.end on the bus) ────
+    // Dismissal is local to this viewer and room, but survives history replay.
+    // Store the poll identity, not just a flag, so the next poll stays visible.
+    function _pollDismissalKey() {
+        return 'chat_poll_dismissed:' + JSON.stringify([state.selfName || '', state.room || '']);
+    }
+    function _pollIdentity(poll) {
+        return JSON.stringify([poll.at, poll.by, poll.q, poll.options]);
+    }
+    function _dismissPoll(poll) {
+        if (!poll || !poll.closed) return;
+        var key = _pollDismissalKey(), identity = _pollIdentity(poll);
+        state.pollDismissals[key] = identity;
+        try { localStorage.setItem(key, identity); } catch (e) { /* private mode */ }
+    }
+    function _pollDismissed(poll) {
+        var key = _pollDismissalKey(), identity = _pollIdentity(poll);
+        if (state.pollDismissals[key] === identity) return true;
+        try { return localStorage.getItem(key) === identity; } catch (e) { return false; }
+    }
     function renderPoll() {
         var host = q('[data-chat-poll]');
         if (!host) return;
         var CP = window.ChatProtocol;
         var poll = (CP && state.view === 'room') ? CP.reducePoll(_roomEvents()) : null;
-        if (!poll || (poll.closed && state.pollDismissedAt === poll.at)) {
+        if (!poll || (poll.closed && _pollDismissed(poll))) {
             host.hidden = true; host.innerHTML = ''; return;
         }
         host.hidden = false;
         var total = poll.tally.total;
+        // Find which option the current user voted for.
+        var myVote = null;
+        if (state.selfName && poll.tally.voters) {
+            Object.keys(poll.tally.voters).forEach(function (idx) {
+                if (poll.tally.voters[idx].indexOf(state.selfName) > -1) myVote = idx;
+            });
+        }
         var rows = poll.options.map(function (opt, i) {
             var idx = String(i + 1);
             var n = poll.tally.counts[idx] || 0;
             var pct = total ? Math.round(n * 100 / total) : 0;
             var winner = poll.closed && poll.tally.winner === idx;
-            return '<div class="chat-poll-opt' + (winner ? ' chat-poll-opt--win' : '') + '">' +
+            var isMine = myVote === idx;
+            var voterList = (poll.sv && poll.tally.voters && poll.tally.voters[idx]) || [];
+            return '<div class="chat-poll-opt' + (winner ? ' chat-poll-opt--win' : '') +
+                (isMine ? ' chat-poll-opt--mine' : '') + '">' +
                 (poll.closed || !state.canSend
-                    ? '<span class="chat-poll-label">' + esc(opt) + '</span>'
+                    ? '<span class="chat-poll-label">' +
+                        (isMine ? '<span class="chat-poll-check">✓</span> ' : '') + esc(opt) + '</span>'
                     : '<button class="chat-poll-vote" type="button" data-chat-poll-vote="' + idx + '">' +
-                          esc(opt) + '</button>') +
+                          (isMine ? '<span class="chat-poll-check">✓</span> ' : '') + esc(opt) + '</button>') +
                 '<span class="chat-poll-n">' + n + (total ? ' · ' + pct + '%' : '') + '</span>' +
                 '<span class="chat-poll-bar" style="width:' + pct + '%"></span>' +
+                (voterList.length
+                    ? '<span class="chat-poll-voters" title="' + attr(voterList.join(', ')) + '">' +
+                        voterList.slice(0, 3).map(function (u) { return esc(u); }).join(', ') +
+                        (voterList.length > 3 ? ' +' + (voterList.length - 3) : '') + '</span>'
+                    : '') +
             '</div>';
         }).join('');
+        // Countdown for timed polls
+        var countdownHtml = '';
+        if (poll.endsAt && !poll.closed) {
+            var remain = Math.max(0, Math.ceil((poll.endsAt - Date.now()) / 1000));
+            var mins = Math.floor(remain / 60);
+            var secs = remain % 60;
+            countdownHtml = ' · <span class="chat-poll-countdown" title="Time remaining">⏱ ' +
+                mins + ':' + (secs < 10 ? '0' : '') + secs + '</span>';
+            if (!state.pollCountdownTimer) {
+                state.pollCountdownTimer = setInterval(function () {
+                    renderPoll();
+                }, 1000);
+            }
+        } else if (state.pollCountdownTimer) {
+            clearInterval(state.pollCountdownTimer);
+            state.pollCountdownTimer = null;
+        }
+        // End-poll access: creator or moderator
+        var canEnd = !poll.closed && state.selfName &&
+            (poll.by === state.selfName || _selfIsMod());
         host.innerHTML =
             '<div class="chat-poll-head">📊 <b>' + esc(poll.q) + '</b>' +
                 '<span class="chat-jbx-meta">' + (poll.closed ? 'final — ' : '') +
-                    total + ' vote' + (total === 1 ? '' : 's') + ' · by ' + esc(poll.by) + '</span>' +
-                (!poll.closed && state.selfName && poll.by === state.selfName
+                    total + ' vote' + (total === 1 ? '' : 's') + ' · by ' + esc(poll.by) +
+                    countdownHtml +
+                    (poll.sv ? ' · voters visible' : '') + '</span>' +
+                (canEnd
                     ? '<button class="chat-fmt-btn" type="button" data-chat-poll-end>End poll</button>' : '') +
                 (poll.closed
                     ? '<button class="chat-pin-del" type="button" title="Dismiss" data-chat-poll-dismiss>×</button>' : '') +
@@ -5926,7 +10591,7 @@
         if (!qEl) return;
         var fields = { q: String(qEl.value || '').trim() };
         var opts = 0;
-        for (var i = 1; i <= 4; i++) {
+        for (var i = 1; i <= 8; i++) {
             var o = q('[data-chat-poll-o' + i + ']');
             var v = o ? String(o.value || '').trim() : '';
             if (v) { opts += 1; fields['o' + opts] = v; }   // compact gaps
@@ -5935,11 +10600,31 @@
             if (typeof showToast === 'function') showToast('A poll needs a question and at least 2 options', 'error');
             return;
         }
+        // Duration (timed poll)
+        var durEl = q('[data-chat-poll-dur]');
+        if (durEl) {
+            var dur = parseInt(durEl.value, 10);
+            if (dur > 0) fields.dur = dur;
+        }
+        // Show voters toggle
+        var svEl = q('[data-chat-poll-sv]');
+        if (svEl && svEl.checked) fields.sv = 1;
         sendProtocol('poll.start', fields);
-        [qEl].concat([1, 2, 3, 4].map(function (i2) { return q('[data-chat-poll-o' + i2 + ']'); }))
-            .forEach(function (el) { if (el) el.value = ''; });
+        [qEl].concat([1, 2, 3, 4, 5, 6, 7, 8].map(function (i2) { return q('[data-chat-poll-o' + i2 + ']'); }))
+            .forEach(function (el) {
+                if (el) {
+                    el.value = '';
+                    if (el.hasAttribute('data-chat-poll-o5') || el.hasAttribute('data-chat-poll-o6') ||
+                        el.hasAttribute('data-chat-poll-o7') || el.hasAttribute('data-chat-poll-o8')) {
+                        el.hidden = true;
+                    }
+                }
+            });
+        if (durEl) durEl.value = '0';
+        if (svEl) svEl.checked = false;
+        var addBtn = q('[data-chat-poll-add-opt]');
+        if (addBtn) addBtn.hidden = false;
         togglePollPop(true);
-        state.pollDismissedAt = null;
     }
 
     // ── trivia (trv.ask / trv.guess / trv.end — the stream is the buzzer) ──
@@ -6094,6 +10779,28 @@
             toggleEmojiPicker(true); toggleGifPicker(true); toggleAttachPanel(true);
             var qEl = q('[data-chat-poll-q]');
             if (qEl) qEl.focus();
+        } else {
+            for (var i = 5; i <= 8; i++) {
+                var optEl = q('[data-chat-poll-o' + i + ']');
+                if (optEl && !optEl.value) optEl.hidden = true;
+            }
+            var addBtn = q('[data-chat-poll-add-opt]');
+            if (addBtn) addBtn.hidden = false;
+        }
+    }
+
+    function _pollAddOption() {
+        for (var i = 5; i <= 8; i++) {
+            var el = q('[data-chat-poll-o' + i + ']');
+            if (el && el.hidden) {
+                el.hidden = false;
+                el.focus();
+                if (i === 8) {
+                    var btn = q('[data-chat-poll-add-opt]');
+                    if (btn) btn.hidden = true;
+                }
+                break;
+            }
         }
     }
 
@@ -7248,7 +11955,13 @@
                 ' mentioned you in # ' + (state.room || 'chat'), 'info');
         }
         if (pageVisible() && state.view === 'room') {
-            refresh();               // live update, nothing to badge
+            if (d && d.messages && d.messages.length) {
+                mergeMessages(d.messages);
+                _clearTypingFor(d.messages);
+                renderMessages(state.msgs);
+            } else {
+                refresh();               // live update fallback
+            }
             return;
         }
         unread.room += (d && d.messages ? d.messages.length : 0);
@@ -7315,7 +12028,11 @@
                         _bsPlaceAt: _bsPlaceAt, _bsDraft: _bsDraft,
                         _slotPayout: function (r, s2) { return _slotPayout(r, s2); },
                         renderUserPanel: renderUserPanel, renderGuilds: renderGuilds,
+                        openWebPreviewModal: openWebPreviewModal, closeWebPreviewModal: closeWebPreviewModal,
                         _testSetSelf: function (n) { state.selfName = n; },
+                        // send format: the filter/channel rules that decide
+                        // envelope vs plain (tests/js/chat_send_format_harness.mjs)
+                        _plainOn: _plainOn, _tagRoomPayload: _tagRoomPayload,
                         _testSetState: function (patch) {
                             Object.keys(patch || {}).forEach(function (k) { state[k] = patch[k]; });
                         } };

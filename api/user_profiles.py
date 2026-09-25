@@ -17,7 +17,7 @@ from flask import Blueprint, jsonify, request, session
 
 from core.metadata import registry as metadata_registry
 from core.metadata.status import invalidate_metadata_status_caches
-from core.profile_context import admin_only
+from core.profile_context import admin_only, is_admin_request
 
 from utils.logging_config import get_logger
 
@@ -41,12 +41,16 @@ clear_profile_tidal_client = None
 _download_orchestrator = lambda: None   # noqa: E731 - rebindable boot global
 _media_server_engine = lambda: None     # noqa: E731
 _spotify_client = lambda: None          # noqa: E731 - rebound on reconnect
+_listenbrainz_import_workers = lambda: None  # noqa: E731
+_lastfm_import_workers = lambda: None  # noqa: E731
 
 
 def configure(*, get_database, config_manager, get_current_profile_id, VALID_PAGE_IDS,
               _login_limiter, _launch_pin_limiter, _require_login_enabled,
               metadata_fallback_source, download_orchestrator_getter,
-              media_server_engine_getter, spotify_client_getter, tidal_client_clearer):
+              media_server_engine_getter, spotify_client_getter, tidal_client_clearer,
+              listenbrainz_import_workers_getter=lambda: None,
+              lastfm_import_workers_getter=lambda: None):
     globals()['get_database'] = get_database
     globals()['config_manager'] = config_manager
     globals()['get_current_profile_id'] = get_current_profile_id
@@ -59,6 +63,8 @@ def configure(*, get_database, config_manager, get_current_profile_id, VALID_PAG
     globals()['_media_server_engine'] = media_server_engine_getter
     globals()['_spotify_client'] = spotify_client_getter
     globals()['clear_profile_tidal_client'] = tidal_client_clearer
+    globals()['_listenbrainz_import_workers'] = listenbrainz_import_workers_getter
+    globals()['_lastfm_import_workers'] = lastfm_import_workers_getter
 
 
 def create_blueprint():
@@ -174,17 +180,63 @@ def _disconnect_profile_tidal(pid):
     clear_profile_tidal_client(pid)
 
 
+def _listening_import_workers(service):
+    return _lastfm_import_workers() if service == 'lastfm' else _listenbrainz_import_workers()
+
+
+def _listening_import_connected(pid, previous_username, username, service='listenbrainz'):
+    """their own listenbrainz or last.fm makes their listening history their
+    own (#1293), start importing it now. never fails the save."""
+    try:
+        workers = _listening_import_workers(service)
+        if workers is not None:
+            workers.on_connected(pid, previous_username, username)
+    except Exception as e:
+        logger.warning("could not start %s listening import for profile %s: %s", service, pid, e)
+
+
+def _listening_import_disconnected(pid, service='listenbrainz'):
+    try:
+        workers = _listening_import_workers(service)
+        if workers is not None:
+            workers.on_disconnected(pid)
+    except Exception as e:
+        logger.debug("could not stop %s listening import for profile %s: %s", service, pid, e)
+
+
+def _profile_lastfm_connection(profile_id):
+    """(connected, username) for a profile's OWN last.fm."""
+    if not profile_id or profile_id == 1:
+        return (False, None)
+    try:
+        name = (get_database().get_profile_lastfm(profile_id) or {}).get('username')
+        return (bool(name), name or None)
+    except Exception as e:
+        logger.debug("profile %s last.fm connection check failed: %s", profile_id, e)
+        return (False, None)
+
+
+def _disconnect_profile_lastfm(pid):
+    try:
+        get_database().clear_profile_lastfm(pid)
+    except Exception as e:
+        logger.debug("could not clear profile last.fm: %s", e)
+    _listening_import_disconnected(pid, 'lastfm')
+
+
 def _disconnect_profile_listenbrainz(pid):
     try:
         get_database().clear_profile_listenbrainz(pid)
     except Exception as e:
         logger.debug("could not clear profile listenbrainz: %s", e)
+    _listening_import_disconnected(pid)
 
 
 _PROFILE_DISCONNECTORS = {
     'spotify': _disconnect_profile_spotify,
     'tidal': _disconnect_profile_tidal,
     'listenbrainz': _disconnect_profile_listenbrainz,
+    'lastfm': _disconnect_profile_lastfm,
 }
 
 
@@ -304,8 +356,23 @@ def _qs_metadata_sources():
     sources += [name for name in EXPERIMENTAL_SOURCES if is_source_enabled(name)]
     return sources
 _QS_MEDIA_SERVERS = ['plex', 'jellyfin', 'navidrome', 'soulsync']
-# Single download sources (everything the mode accepts except 'hybrid').
-_QS_DOWNLOAD_SOURCES = ['soulseek', 'youtube', 'tidal', 'qobuz', 'hifi', 'torrent', 'usenet']
+
+
+def _qs_download_chain(mode, hybrid_order):
+    """The music download chain as settings saved it, each source with whether
+    it's set up (None when that can't be told). one source is single-source
+    mode, two or more is hybrid, same as the settings chain editor."""
+    if mode == 'hybrid':
+        order = [hybrid_order] if isinstance(hybrid_order, str) else (hybrid_order or [])
+        ids = [s for s in order if isinstance(s, str) and s]
+    else:
+        ids = [mode] if mode else []
+    try:
+        orchestrator = _download_orchestrator()
+        status = orchestrator.get_source_status() if orchestrator else {}
+    except Exception:
+        status = {}
+    return [{'id': s, 'ready': status.get(s)} for s in ids]
 
 
 def _qs_metadata_available(source):
@@ -338,7 +405,14 @@ def list_profiles():
     try:
         database = get_database()
         profiles = database.get_all_profiles()
-        return jsonify({'success': True, 'profiles': profiles})
+        return jsonify({'success': True, 'profiles': profiles,
+                        # where an own-library folder goes on this install (#1199):
+                        # a mount under /app in docker, anywhere otherwise
+                        'own_library_root_hint': _own_library_root_hint(),
+                        'own_library_supported': config_manager.get_active_media_server() in ('plex', 'jellyfin'),
+                        # supported != available: the server may be right and the
+                        # feature still parked, and the UI must say which
+                        'own_library_available': not _own_library_parked()})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -484,7 +558,43 @@ def update_profile(profile_id):
                 sides = data['allowed_sides']
                 kwargs['allowed_sides'] = sides if sides in ('music', 'video', 'both') else None
 
-        success = database.update_profile(profile_id, **kwargs)
+        # own library (#1199): admin only, never on the admin profile itself
+        library_result = None
+        if current['is_admin'] and ('library_mode' in data or 'library_root' in data):
+            if int(profile_id) == 1:
+                return jsonify({'success': False, 'error': 'The admin profile is the shared library'}), 400
+            mode = 'own' if data.get('library_mode') == 'own' else 'shared'
+            root = str(data.get('library_root') or '').strip()
+            if mode == 'own':
+                if config_manager.get_active_media_server() not in ('plex', 'jellyfin'):
+                    existing_lib = database.get_profile_library(profile_id)
+                    is_already_own = (existing_lib.get('mode') == 'own' and
+                                      str(existing_lib.get('root') or '').strip() == root)
+                    if not is_already_own:
+                        return jsonify({'success': False, 'error': 'Own libraries require Plex or Jellyfin. Switch this profile to the shared library for Navidrome or Standalone.'}), 400
+                if not root:
+                    return jsonify({'success': False, 'error': 'An own library needs an output folder'}), 400
+                shared_root = str(config_manager.get('soulseek.transfer_path', '') or '').strip().rstrip('/\\')
+                if shared_root and root.rstrip('/\\') == shared_root:
+                    return jsonify({'success': False, 'error': 'That is the shared library folder; pick a different one'}), 400
+                problem = _own_library_root_problem(root)
+                if problem:
+                    return jsonify({'success': False, 'error': problem}), 400
+                problem = _own_library_root_overlap(root, shared_root, database, profile_id)
+                if problem:
+                    return jsonify({'success': False, 'error': problem}), 400
+            library_result = database.set_profile_library(profile_id, mode, root or None)
+            from core.library_scope import library_config_changed
+            library_config_changed()
+            try:
+                from core.imports.paths import reset_own_library_fallback_notifications
+                reset_own_library_fallback_notifications()
+            except Exception:  # noqa: S110 — resetting notification state is best-effort
+                pass
+
+        success = database.update_profile(profile_id, **kwargs) if kwargs else True
+        if library_result is False:
+            return jsonify({'success': False, 'error': 'Failed to save the library setting'}), 500
         return jsonify({'success': success})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -510,6 +620,9 @@ def delete_profile(profile_id):
         if success:
             from api.profiles import _sweep_video_profile_data
             _sweep_video_profile_data(profile_id)
+            # its folder is no library any more (#1199)
+            from core.library_scope import library_config_changed
+            library_config_changed()
         return jsonify({'success': success})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -792,9 +905,11 @@ def save_profile_listenbrainz():
         username = result
         profile_id = get_current_profile_id()
         db = get_database()
+        previous_username = (db.get_profile_listenbrainz(profile_id) or {}).get('username') or ''
         success = db.set_profile_listenbrainz(profile_id, token, base_url, username)
 
         if success:
+            _listening_import_connected(profile_id, previous_username, username)
             return jsonify({'success': True, 'username': username})
         return jsonify({'success': False, 'error': 'Failed to save credentials'}), 500
     except Exception as e:
@@ -807,9 +922,74 @@ def delete_profile_listenbrainz():
         profile_id = get_current_profile_id()
         db = get_database()
         db.clear_profile_listenbrainz(profile_id)
+        _listening_import_disconnected(profile_id)
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
+
+# --- Per-Profile Last.fm (#1293) ---
+# just a username. scrobbles are public, the app's api key reads them, so
+# there's no login and nothing secret to store.
+
+def _check_lastfm_user(username):
+    """(ok, canonical name or error). reads one page of their scrobbles, which
+    proves the name exists AND that their listening isn't hidden."""
+    api_key = config_manager.get('lastfm.api_key', '')
+    if not api_key:
+        return False, "Last.fm isn't set up on this server yet, ask the admin to add an API key in Settings."
+    try:
+        from core.lastfm_client import LastFMClient
+        data = LastFMClient(api_key=api_key).get_user_recent_tracks(username, limit=1)
+    except Exception as e:
+        return False, f"Couldn't reach Last.fm: {e}"
+    recent = (data or {}).get('recenttracks')
+    if not isinstance(recent, dict):
+        return False, "Couldn't read that Last.fm user's scrobbles. Check the name, and that recent listening isn't hidden."
+    return True, (recent.get('@attr') or {}).get('user') or username
+
+
+@bp.route('/api/profiles/me/lastfm', methods=['GET'])
+def get_profile_lastfm():
+    try:
+        connected, username = _profile_lastfm_connection(get_current_profile_id())
+        return jsonify({'success': True, 'connected': connected, 'username': username})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/profiles/me/lastfm', methods=['POST'])
+def save_profile_lastfm():
+    try:
+        data = request.json or {}
+        username = str(data.get('username') or data.get('token') or '').strip()
+        if not username:
+            return jsonify({'success': False, 'error': 'Last.fm username is required'}), 400
+        profile_id = get_current_profile_id()
+        if not profile_id or profile_id == 1:
+            return jsonify({'success': False, 'error': 'The admin account is managed in Settings'}), 400
+        ok, result = _check_lastfm_user(username)
+        if not ok:
+            return jsonify({'success': False, 'error': result}), 400
+        db = get_database()
+        previous = (db.get_profile_lastfm(profile_id) or {}).get('username') or ''
+        if not db.set_profile_lastfm(profile_id, result):
+            return jsonify({'success': False, 'error': 'Failed to save'}), 500
+        _listening_import_connected(profile_id, previous, result, 'lastfm')
+        return jsonify({'success': True, 'username': result})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/profiles/me/lastfm', methods=['DELETE'])
+def delete_profile_lastfm():
+    try:
+        profile_id = get_current_profile_id()
+        if profile_id and profile_id != 1:
+            _disconnect_profile_lastfm(profile_id)
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 
 @bp.route('/api/profiles/me/listenbrainz/test', methods=['POST'])
 def test_profile_listenbrainz():
@@ -838,13 +1018,21 @@ def get_my_connections():
         sp_connected, sp_account = _profile_spotify_connection(pid)
         td_connected, td_account = _profile_tidal_connection(pid)
         lb_connected, lb_account = _profile_listenbrainz_connection(pid)
+        fm_connected, fm_account = _profile_lastfm_connection(pid)
         return jsonify({
             'success': True,
             'is_admin': pid == 1,
+            # whose listening this profile's stats read (#1293), for the card
+            # at the top of My Account
+            'listening': {
+                'scope': get_database().listening_history_scope(pid),
+                'sources': [s for s, on in (('listenbrainz', lb_connected), ('lastfm', fm_connected)) if on],
+            },
             'connections': {
                 'spotify': {'connected': sp_connected, 'account': sp_account},
                 'tidal': {'connected': td_connected, 'account': td_account},
                 'listenbrainz': {'connected': lb_connected, 'account': lb_account},
+                'lastfm': {'connected': fm_connected, 'account': fm_account},
             },
         })
     except Exception as e:
@@ -963,6 +1151,161 @@ def save_profile_server_library():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+def _is_docker() -> bool:
+    return os.path.exists('/.dockerenv')
+
+
+def _own_library_parked() -> bool:
+    """Whether own libraries are switched off in this build (SCOPE_PARKED)."""
+    try:
+        from core.library_scope import SCOPE_PARKED
+        return bool(SCOPE_PARKED)
+    except Exception:  # noqa: BLE001 - unreadable means treat it as off
+        return True
+
+
+def _own_library_root_hint(name: str = '<name>') -> str:
+    """the folder an own library is prefilled with. in docker that is a mount
+    the compose file has to provide (same rule as /app/Transfer). outside
+    docker the same shape is prefilled and the admin corrects it to a real
+    folder; the save-time check refuses one that is not there."""
+    return f"/app/libraries/{name}"
+
+
+def _same_or_inside(a: str, b: str) -> bool:
+    """a is b or lies under b, after both are resolved"""
+    try:
+        from core.imports.paths import config_root_path
+        ra = os.path.realpath(config_root_path(a))
+        rb = os.path.realpath(config_root_path(b))
+    except Exception:  # noqa: BLE001
+        ra, rb = os.path.realpath(a), os.path.realpath(b)
+    return ra == rb or ra.startswith(rb.rstrip(os.sep) + os.sep)
+
+
+def _own_library_root_overlap(root: str, shared_root: str, database, profile_id):
+    """None when the folder is nobody else's, else why not. a folder inside
+    the shared one (or holding it) is scanned into both libraries, and two
+    profiles on one folder write the same files and race each other's scan."""
+    if shared_root and (_same_or_inside(root, shared_root) or _same_or_inside(shared_root, root)):
+        return 'That folder overlaps the shared library folder; pick one outside it'
+    try:
+        others = database.get_own_library_profiles()
+    except Exception:  # noqa: BLE001
+        others = []
+    for other in others:
+        if int(other.get('id', 0)) == int(profile_id) or not other.get('root'):
+            continue
+        if _same_or_inside(root, other['root']) or _same_or_inside(other['root'], root):
+            return f"That folder is {other.get('name', 'another profile')}'s library; pick a different one"
+    return None
+
+
+def _own_library_root_problem(root: str):
+    """None when the folder is usable, else the message to show. the folder
+    has to exist and be writable HERE, inside the container when there is
+    one: a path that only exists on the host is the usual mistake."""
+    try:
+        from core.imports.paths import config_root_path
+        resolved = config_root_path(root)
+    except Exception:  # noqa: BLE001
+        resolved = root
+    if not os.path.isdir(resolved):
+        if _is_docker():
+            return (f"{root} does not exist inside the container. Mount it in docker-compose.yml "
+                    f"(e.g. - /path/on/host:{root}) and restart, then save again.")
+        return f"{root} does not exist. Create the folder first."
+    if not os.access(resolved, os.W_OK):
+        return f"{root} is not writable by the app."
+    return None
+
+
+@bp.route('/api/profiles/me/navidrome-login', methods=['POST'])
+def save_profile_navidrome_login():
+    """save the current profile's own navidrome login. the login is checked
+    with one ping as that user first, so a wrong password is refused here
+    and not found out by a failing sync. a profile with a login of its own
+    gets its playlists written as that user (#1265)."""
+    try:
+        data = request.json or {}
+        username = str(data.get('username') or '').strip()
+        password = str(data.get('password') or '')
+        if not username or not password:
+            return jsonify({'success': False, 'error': 'Username and password are required'}), 400
+        engine = _media_server_engine()
+        client = engine.client('navidrome') if engine is not None else None
+        if client is None:
+            return jsonify({'success': False, 'error': 'Navidrome is not connected'}), 503
+        ok, error = client.verify_user_login(username, password)
+        if not ok:
+            return jsonify({'success': False, 'error': f'Navidrome refused this login: {error}'}), 400
+        if not get_database().set_profile_navidrome_login(get_current_profile_id(), username, password):
+            return jsonify({'success': False, 'error': 'Failed to save login'}), 500
+        return jsonify({'success': True, 'username': username})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/profiles/me/navidrome-login', methods=['DELETE'])
+def clear_profile_navidrome_login():
+    """back to the app account for this profile."""
+    try:
+        get_database().set_profile_navidrome_login(get_current_profile_id(), None, None)
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/profiles/me/plex-home-users', methods=['GET'])
+def list_plex_home_users():
+    """the plex home users a profile can link itself to. names and ids only,
+    and only the flag saying whether one needs a pin."""
+    try:
+        engine = _media_server_engine()
+        client = engine.client('plex') if engine is not None else None
+        if client is None or not hasattr(client, 'list_home_users'):
+            return jsonify({'success': False, 'error': 'Plex is not connected', 'users': []}), 503
+        return jsonify({'success': True, 'users': client.list_home_users()})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e), 'users': []}), 500
+
+
+@bp.route('/api/profiles/me/plex-home-user', methods=['POST'])
+def link_plex_home_user():
+    """link the current profile to a plex home user (#1265). the admin token
+    switches to that user once (with their profile pin when they have one,
+    which is used for that call and not kept) and the user's own server
+    access token is stored; the profile's playlists are then theirs."""
+    try:
+        data = request.json or {}
+        user_id = str(data.get('user_id') or '').strip()
+        pin = str(data.get('pin') or '').strip() or None
+        if not user_id:
+            return jsonify({'success': False, 'error': 'Pick a Plex user'}), 400
+        engine = _media_server_engine()
+        client = engine.client('plex') if engine is not None else None
+        if client is None or not hasattr(client, 'mint_home_user_server_token'):
+            return jsonify({'success': False, 'error': 'Plex is not connected'}), 503
+        token, title, error = client.mint_home_user_server_token(user_id, pin)
+        if not token:
+            return jsonify({'success': False, 'error': error or 'Could not link that Plex user'}), 400
+        if not get_database().set_profile_plex_home_user(get_current_profile_id(), user_id, title, token):
+            return jsonify({'success': False, 'error': 'Failed to save the link'}), 500
+        return jsonify({'success': True, 'title': title})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/profiles/me/plex-home-user', methods=['DELETE'])
+def unlink_plex_home_user():
+    """back to the app account for this profile."""
+    try:
+        get_database().set_profile_plex_home_user(get_current_profile_id(), None, None, None)
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @bp.route('/api/profiles/me/services', methods=['GET'])
 def get_my_service_selections():
     """For the current profile: the available credential sets per service (id +
@@ -1038,7 +1381,7 @@ def get_active_sources():
         meta_effective = 'spotify_free' if meta_active == 'spotify_free' else _get_metadata_fallback_source()
         return jsonify({
             'success': True,
-            'editable': get_current_profile_id() == 1,  # admin writes the global default
+            'editable': is_admin_request(),  # admins write the global default, same gate as the POST
             'metadata': {
                 # `active` = the configured choice (what the user picked / edits).
                 # `effective` = what's actually used after auth/availability
@@ -1053,10 +1396,12 @@ def get_active_sources():
                 'active': config_manager.get_active_media_server(),
                 'options': [{'id': s, 'available': _qs_server_available(s)} for s in _QS_MEDIA_SERVERS],
             },
+            # read-only here (#1301): the chain is edited in settings, where one
+            # source is single mode and two or more is hybrid
             'download': {
                 'mode': mode,
                 'hybrid_order': hybrid_order,
-                'options': [{'id': s} for s in _QS_DOWNLOAD_SOURCES],
+                'chain': _qs_download_chain(mode, hybrid_order),
             },
         })
     except Exception as e:
@@ -1066,13 +1411,24 @@ def get_active_sources():
 @bp.route('/api/profiles/active-sources', methods=['POST'])
 @admin_only
 def set_active_sources():
-    """Set the GLOBAL active metadata source / media server / download mode +
-    hybrid order (whichever fields are present). Admin-only; reuses the same
-    setters + client reloads the Settings save performs so changes take effect
-    immediately."""
+    """Set the GLOBAL active metadata source. Admin-only; reuses the same setter
+    the Settings save performs so the change takes effect immediately.
+
+    the media server and the download chain used to be switchable here too, one
+    click with no questions (#1301). switching servers means a fresh library
+    scan, and the download chain has its own editor in settings that this one
+    kept drifting from. both are changed in settings now; asking here says so.
+    """
     try:
         data = request.json or {}
         changed = []
+
+        if 'media_server' in data:
+            return jsonify({'success': False,
+                            'error': 'Change the media server in Settings, under Connections'}), 400
+        if 'download_mode' in data or 'hybrid_order' in data:
+            return jsonify({'success': False,
+                            'error': 'Change download sources in Settings, under Downloads'}), 400
 
         if 'metadata_source' in data:
             src = data['metadata_source']
@@ -1087,35 +1443,6 @@ def set_active_sources():
                 return jsonify({'success': False, 'error': _primary_err}), 400
             invalidate_metadata_status_caches()
             changed.append('metadata')
-
-        if 'media_server' in data:
-            srv = data['media_server']
-            if srv not in _QS_MEDIA_SERVERS:
-                return jsonify({'success': False, 'error': 'Unknown media server'}), 400
-            config_manager.set_active_media_server(srv)
-            for s in ('plex', 'jellyfin', 'navidrome'):
-                c = _media_server_engine().client(s)
-                if c:
-                    if s == 'plex':
-                        c.server = None
-                    else:
-                        c.reload_config()
-            changed.append('server')
-
-        if 'download_mode' in data:
-            mode = data['download_mode']
-            if mode not in (_QS_DOWNLOAD_SOURCES + ['hybrid']):
-                return jsonify({'success': False, 'error': 'Unknown download mode'}), 400
-            config_manager.set('download_source.mode', mode)
-            changed.append('download')
-
-        if 'hybrid_order' in data and isinstance(data['hybrid_order'], list):
-            clean = [s for s in data['hybrid_order'] if s in _QS_DOWNLOAD_SOURCES]
-            config_manager.set('download_source.hybrid_order', clean)
-            changed.append('download')
-
-        if 'download' in changed and _download_orchestrator():
-            _download_orchestrator().reload_settings()
 
         return jsonify({'success': True, 'changed': sorted(set(changed))})
     except Exception as e:

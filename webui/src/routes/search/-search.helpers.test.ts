@@ -16,6 +16,8 @@ import {
   formatVideoDuration,
   formatViewCount,
   hasAnyResults,
+  inLibraryArtistPath,
+  libraryV2DiscoveryArtistPath,
   isIdLookupQuery,
   labelDetailPath,
   labelMetaLine,
@@ -28,8 +30,17 @@ import {
   trackMetaLine,
   visibleSources,
 } from './-search.helpers';
-import { emptySourceResults } from './-search.helpers';
+import {
+  compactCount,
+  emptySourceResults,
+  foundArtistLine,
+  mergeArtistFaces,
+  rankPlaylists,
+  shelfAlbums,
+  splitTitleExtra,
+} from './-search.helpers';
 import { SOURCE_LABELS, SOURCE_ORDER } from './-search.types';
+import { shelfColumns } from './-search.use-shelf-columns';
 
 const album = (over: Partial<SearchAlbum> = {}): SearchAlbum => ({
   id: 'a1',
@@ -72,6 +83,13 @@ describe('isIdLookupQuery', () => {
   it('is not fooled by a near-miss', () => {
     expect(isIdLookupQuery('770a1e6b-2d17-4bbe-a0c2-a3c4f77e9bc')).toBe(false);
     expect(isIdLookupQuery('not-a-uuid')).toBe(false);
+  });
+
+  it('treats a pasted link as a lookup, text with a link in it as a search', () => {
+    expect(isIdLookupQuery('https://open.spotify.com/album/4LH4d3cOWNNsVw41Gqt2kv')).toBe(true);
+    expect(isIdLookupQuery('  http://www.deezer.com/album/302127 ')).toBe(true);
+    expect(isIdLookupQuery('daft punk https://open.spotify.com/album/x')).toBe(false);
+    expect(isIdLookupQuery('spotify.com/album/x')).toBe(false);
   });
 });
 
@@ -278,11 +296,19 @@ describe('meta lines', () => {
     expect(trackMetaLine({})).toBe('');
   });
 
-  it('gives an album its year, or the vanilla N/A', () => {
+  it('gives an album its year, the track count without one, never N/A', () => {
     expect(albumMetaLine({ artist: 'Aphex Twin', release_date: '2001-10-22' })).toBe(
       'Aphex Twin • 2001',
     );
-    expect(albumMetaLine({ artist: 'Aphex Twin' })).toBe('Aphex Twin • N/A');
+    expect(albumMetaLine({ artist: 'Aphex Twin', total_tracks: 30 })).toBe(
+      'Aphex Twin • 30 tracks',
+    );
+    expect(albumMetaLine({ artist: 'Aphex Twin' })).toBe('Aphex Twin');
+    expect(
+      albumMetaLine({ artist: 'U2', album_type: 'ep', release_date: '2004' }, { withKind: true }),
+    ).toBe('U2 • EP • 2004');
+    // an album row never names its kind, even when asked
+    expect(albumMetaLine({ artist: 'U2', album_type: 'album' }, { withKind: true })).toBe('U2');
   });
 
   it('joins a label type and area, or says what it is', () => {
@@ -378,6 +404,66 @@ describe('detail paths', () => {
     expect(artistDetailPath(42, '   ')).toBe('/artist-detail/library/42');
   });
 
+  /**
+   * The "In Your Library" section is the one place a search result points at
+   * something the user already owns, so it opens the page that can manage it.
+   * The old vanilla search sent every one of them to the legacy artist page,
+   * which is the bug this replaces (docs/library-v2-issues.md §10/§11).
+   */
+  it('opens an "In Your Library" hit in Library v2 when v2 knows the artist', () => {
+    // ldp-05 (iss29-B05): a search arrival lands on the legacy artist page's
+    // shape — full discography, cards, rich header. Without these params the
+    // deep link fell back to the in-library defaults, so the same artist looked
+    // different depending on whether v2 had mapped it.
+    expect(inLibraryArtistPath({ id: 42, library_v2_id: 7 })).toBe(
+      '/library?artist=7&releases=all&releaseView=cards&header=rich',
+    );
+  });
+
+  /**
+   * The other half of the same decision: a result the library does NOT have
+   * opens Library V2's discovery view directly. It used to point at
+   * `/artist-detail/<source>/<id>` and lean on that route redirecting a second
+   * time — which still works, and is what a bookmark hits, but search holds
+   * every value V2 needs and should link to the real destination.
+   */
+  it('sends a provider artist straight into Library V2 discovery', () => {
+    expect(libraryV2DiscoveryArtistPath('sp1', 'spotify', 'Found Artist')).toBe(
+      '/library?discover=spotify%3Asp1&discoverName=Found%20Artist' +
+        '&releases=all&releaseView=cards&header=rich',
+    );
+  });
+
+  it('carries no name when there is none, and never an empty one', () => {
+    // The name is a fallback identity for sources with no id lookup; an empty
+    // one is not an identity and must not become `discoverName=`.
+    expect(libraryV2DiscoveryArtistPath('sp1', 'spotify')).toBe(
+      '/library?discover=spotify%3Asp1&releases=all&releaseView=cards&header=rich',
+    );
+    expect(libraryV2DiscoveryArtistPath('sp1', 'spotify', '')).toBe(
+      '/library?discover=spotify%3Asp1&releases=all&releaseView=cards&header=rich',
+    );
+  });
+
+  it('lowercases the source and encodes the pair, so the route can split it', () => {
+    // `discover` is parsed as `<source>:<id>`; an unencoded colon or slash in
+    // either half would split it somewhere else entirely.
+    expect(libraryV2DiscoveryArtistPath('a/b', 'Deezer')).toBe(
+      '/library?discover=deezer%3Aa%2Fb&releases=all&releaseView=cards&header=rich',
+    );
+    expect(libraryV2DiscoveryArtistPath(311, 'bandcamp', 'AC/DC')).toBe(
+      '/library?discover=bandcamp%3A311&discoverName=AC%2FDC' +
+        '&releases=all&releaseView=cards&header=rich',
+    );
+  });
+
+  it('falls back to artist detail when v2 has not mapped the artist', () => {
+    // No v2 id means no v2 row — routing there would open an artist that does
+    // not exist. Both an absent and an explicitly null id take the fallback.
+    expect(inLibraryArtistPath({ id: 42 })).toBe('/artist-detail/library/42');
+    expect(inLibraryArtistPath({ id: 42, library_v2_id: null })).toBe('/artist-detail/library/42');
+  });
+
   it('lowercases the source, as _normalizeArtistDetailSource does', () => {
     expect(artistDetailPath('x', 'Deezer')).toBe('/artist-detail/deezer/x');
   });
@@ -399,5 +485,88 @@ describe('detail paths', () => {
   it('builds a label path with its optional name', () => {
     expect(labelDetailPath('l1')).toBe('/label-detail/l1');
     expect(labelDetailPath('l1', 'Warp')).toBe('/label-detail/l1?name=Warp');
+  });
+});
+
+describe('the results layout helpers', () => {
+  it('drops the found twin of a library artist, keeps real namesakes', () => {
+    // deezer's first "U2" is the U2 already in the library
+    const faces = mergeArtistFaces(
+      [{ id: 7, name: 'U2' }],
+      [
+        { id: 'd1', name: 'U2' },
+        { id: 'd2', name: 'u2' },
+        { id: 'd3', name: 'J2' },
+      ],
+    );
+    expect(faces.map((f) => [f.artist.id, f.inLibrary])).toEqual([
+      [7, true],
+      ['d2', false],
+      ['d3', false],
+    ]);
+  });
+
+  it('merges nothing when the library has no namesake', () => {
+    const faces = mergeArtistFaces([], [{ id: 'd1', name: 'U2' }]);
+    expect(faces).toEqual([{ artist: { id: 'd1', name: 'U2' }, inLibrary: false }]);
+  });
+
+  it('tells same-named artists apart by their fan count', () => {
+    expect(foundArtistLine({ followers: 9_812_345, source: 'deezer' })).toBe('9.8M fans');
+    expect(foundArtistLine({ followers: 12_400, source: 'spotify' })).toBe('12.4K followers');
+    expect(foundArtistLine({ source: 'deezer' })).toBe('Artist');
+    expect(compactCount(640)).toBe('640');
+    expect(compactCount(250_000)).toBe('250K');
+  });
+
+  it('folds a lone single into the albums, keeps a real singles shelf', () => {
+    const lp = { id: 1, album_type: 'album' };
+    const single = (id: number) => ({ id, album_type: 'single' });
+    expect(shelfAlbums([lp, single(2)])).toEqual({ albums: [lp, single(2)], singlesAndEps: [] });
+    expect(shelfAlbums([lp, single(2), single(3), single(4)]).singlesAndEps).toHaveLength(3);
+    // with no albums to fold into, the singles keep their own shelf
+    expect(shelfAlbums([single(2)]).singlesAndEps).toHaveLength(1);
+  });
+
+  it('puts playlists that name the query, and editorial ones, first', () => {
+    const ranked = rankPlaylists(
+      [
+        { name: 'Joe Joe Vault II', creator: 'jaws2u4' },
+        { name: 'Hits acoustiques (U2, Sting)', creator: 'Digster France' },
+        { name: 'Happy 2 c u', creator: 'thecliftonstking' },
+        { name: '100% U2', creator: 'Deezer Artist Editor' },
+        { name: 'Rock Classics', creator: 'Deezer Rock Editor' },
+      ],
+      'u2',
+    );
+    expect(ranked.map((p) => p.name)).toEqual([
+      '100% U2',
+      'Hits acoustiques (U2, Sting)',
+      'Rock Classics',
+      'Joe Joe Vault II',
+      'Happy 2 c u',
+    ]);
+  });
+
+  it('dims a release-note suffix, never part of the name', () => {
+    expect(splitTitleExtra('Pride (In The Name Of Love) (Remastered 2009)')).toEqual({
+      main: 'Pride (In The Name Of Love)',
+      extra: '(Remastered 2009)',
+    });
+    expect(splitTitleExtra('Come Together - Remastered 2009')).toEqual({
+      main: 'Come Together',
+      extra: 'Remastered 2009',
+    });
+    expect(splitTitleExtra('Pride (In The Name Of Love)').extra).toBe('');
+    expect(splitTitleExtra('One').extra).toBe('');
+    expect(splitTitleExtra('(Live)').extra).toBe('');
+  });
+
+  it('counts columns the way repeat(auto-fill, minmax(min, 1fr)) does', () => {
+    // 168px cards, 14px gap: 1920 fits 10, 1000 fits 5, anything fits 1
+    expect(shelfColumns(1920, 168, 14)).toBe(10);
+    expect(shelfColumns(1000, 168, 14)).toBe(5);
+    expect(shelfColumns(168 * 3 + 14 * 2, 168, 14)).toBe(3);
+    expect(shelfColumns(80, 168, 14)).toBe(1);
   });
 });

@@ -14,7 +14,16 @@ from core.exports.mbid_resolver import SRC_CACHE, SRC_DB, SRC_MUSICBRAINZ
 MBID = "e8f9b188-f819-4e43-ab0f-4bd26ce9ff56"
 
 
-def _wire(db=None, file=None, mb=None, cache=None):
+def _wire(db=None, file=None, mb=None, cache=None, flagged=None, track_lookup=None):
+    """Wire a resolve_fn from fakes. ``flagged``/``track_lookup`` default to "nothing is
+    flagged, no track identity" so the existing waterfall-order tests below don't have to
+    know about the repair-finding gate at all — only the gate-specific tests pass
+    non-default fakes for them.
+
+    ``flagged`` is ``(track_id, file_path) -> bool`` (matching the real
+    ``mbid_flagged_fn`` contract) — ``track_lookup`` is what supplies those ids, keeping
+    the DB/file rung fakes (plain artist/title -> mbid dicts) decoupled from track
+    identity."""
     recorded = {}
     store = dict(cache or {})
     fn = build_resolve_fn(
@@ -23,6 +32,8 @@ def _wire(db=None, file=None, mb=None, cache=None):
         mb_fn=lambda a, t: (mb or {}).get((a, t)),
         cache_lookup=lambda k: store.get(k),
         cache_record=lambda k, m: recorded.__setitem__(k, m) or True,
+        mbid_flagged_fn=flagged if flagged is not None else (lambda tid, fp: False),
+        track_lookup_fn=track_lookup if track_lookup is not None else (lambda a, t: (None, None)),
     )
     return fn, recorded
 
@@ -59,17 +70,154 @@ def test_all_miss_returns_none_and_no_write():
     assert recorded == {}
 
 
+# ── DB/file rungs are gated by the mbid_mismatch repair job's pending findings — a
+# flagged MBID makes the rung a miss so the waterfall falls through instead of exporting
+# the wrong recording ──
+
+OTHER_MBID = "11111111-2222-3333-4444-555555555555"
+
+
+def test_db_hit_flagged_by_pending_finding_falls_through_to_musicbrainz():
+    """The repair job already has a pending mbid_mismatch finding for this track -> the
+    DB rung's MBID is a miss, so the waterfall goes on to the file rung. Since the file
+    rung resolves the SAME (still-flagged) track, that's a miss too -> falls all the way
+    to the live MusicBrainz rung, proving both later rungs were actually consulted."""
+    fn, _ = _wire(
+        db={("A", "T"): MBID},
+        file={("A", "T"): OTHER_MBID},
+        mb={("A", "T"): "99999999-8888-7777-6666-555555555555"},
+        flagged=lambda tid, fp: True,
+    )
+    assert fn("A", "T") == ("99999999-8888-7777-6666-555555555555", SRC_MUSICBRAINZ)
+
+
+def test_file_hit_flagged_by_pending_finding_falls_through_to_musicbrainz():
+    """DB rung misses outright; the file rung's MBID is flagged -> falls through to the
+    live MusicBrainz rung."""
+    fn, _ = _wire(
+        db={},
+        file={("A", "T"): MBID},
+        mb={("A", "T"): OTHER_MBID},
+        flagged=lambda tid, fp: True,
+    )
+    assert fn("A", "T") == (OTHER_MBID, SRC_MUSICBRAINZ)
+
+
+def test_flagged_predicate_is_per_track_not_global():
+    """The flagged predicate receives (track_id, file_path) resolved by track_lookup_fn
+    — here keyed by title, so only the flagged track is rejected."""
+    fn, _ = _wire(
+        db={("A", "T"): MBID, ("A", "Other"): MBID},
+        track_lookup=lambda a, t: (f"tid-{t}", None),
+        flagged=lambda tid, fp: tid == "tid-T",
+    )
+    assert fn("A", "T") == (None, None)
+    assert fn("A", "Other") == (MBID, SRC_DB)
+
+
+def test_flagged_fn_called_once_across_db_and_file_rung_for_same_track():
+    """Both the DB and file rungs resolve to (different) MBIDs for the same track, and
+    both get rejected by the flagged predicate -> the per-run memo means BOTH the track
+    lookup and the flagged predicate are only actually invoked once for ('A', 'T'), not
+    once per rung ."""
+    lookup_calls = []
+    flagged_calls = []
+
+    def track_lookup(a, t):
+        lookup_calls.append((a, t))
+        return ("tid-1", "/music/t.mp3")
+
+    def flagged(tid, fp):
+        flagged_calls.append((tid, fp))
+        return True
+
+    fn, _ = _wire(db={("A", "T"): MBID}, file={("A", "T"): OTHER_MBID},
+                  track_lookup=track_lookup, flagged=flagged)
+    assert fn("A", "T") == (None, None)
+    assert lookup_calls == [("A", "T")]
+    assert flagged_calls == [("tid-1", "/music/t.mp3")]
+
+
+def test_mbid_flagged_by_repair_finding_real_sql(tmp_path, monkeypatch):
+    """Run the ACTUAL query against a real (temp) repair_findings schema — a pending
+    mbid_mismatch finding keyed on the track's id (or file path) must flag it; a resolved
+    one, a finding for a different track, or no id/path at all, must not. Signature is
+    (track_id, file_path) — the caller (build_resolve_fn) resolves those once and passes
+    them in."""
+    import sqlite3
+    import types
+    import core.exports.export_sources as es
+
+    dbfile = tmp_path / "lib.db"
+    con = sqlite3.connect(str(dbfile))
+    con.executescript(
+        "CREATE TABLE repair_findings (finding_type TEXT, status TEXT, "
+        "entity_type TEXT, entity_id TEXT, file_path TEXT);"
+        "INSERT INTO repair_findings VALUES "
+        "('mbid_mismatch','pending','track','t1','/music/track1.mp3'),"
+        "('mbid_mismatch','resolved','track','t2','/music/track2.mp3');"
+    )
+    con.commit()
+    con.close()
+
+    fake_db = types.SimpleNamespace(_get_connection=lambda: sqlite3.connect(str(dbfile)))
+    monkeypatch.setattr("database.music_database.get_database", lambda: fake_db)
+
+    assert es.mbid_flagged_by_repair_finding("t1", "/music/track1.mp3") is True
+    assert es.mbid_flagged_by_repair_finding("t1", None) is True          # matches by id alone
+    assert es.mbid_flagged_by_repair_finding(None, "/music/track1.mp3") is True  # matches by path alone
+    # resolved (not pending) finding -> not flagged
+    assert es.mbid_flagged_by_repair_finding("t2", "/music/track2.mp3") is False
+    # no matching track at all -> not flagged
+    assert es.mbid_flagged_by_repair_finding("t3", "/music/unknown.mp3") is False
+    assert es.mbid_flagged_by_repair_finding(None, None) is False
+
+
+def test_default_track_lookup_real_sql(tmp_path, monkeypatch):
+    """_default_track_lookup (the default track_lookup_fn) runs the real _db_match text
+    match against the Library v2 catalogue and hands back (lib2 track id, file_path)."""
+    import core.exports.export_sources as es
+
+    monkeypatch.setattr("database.music_database.get_database",
+                        lambda: _lib2_fixture(tmp_path))
+
+    track_id, path = es._default_track_lookup("Kendrick Lamar", "Not Like Us")
+    assert path == "/m/nlu.flac"
+    assert track_id is not None and str(track_id).isdigit()
+    assert es._default_track_lookup("Kendrick Lamar", "Unknown Song") == (None, None)
+
+
+def test_build_resolve_fn_no_kwargs_wires_real_default_gates(monkeypatch):
+    import core.exports.export_sources as es
+
+    monkeypatch.setattr(es, "_db_match", lambda a, t: (MBID, "/music/track.mp3", "tid-1"))
+
+    flagged_calls = []
+
+    def fake_flagged(track_id, file_path):
+        flagged_calls.append((track_id, file_path))
+        return False
+
+    monkeypatch.setattr(es, "mbid_flagged_by_repair_finding", fake_flagged)
+
+    fn = es.build_resolve_fn()   # no kwargs at all -> real db_fn/file_fn/mb_fn AND real gate
+    assert fn("A", "T") == (MBID, SRC_DB)
+    assert flagged_calls == [("tid-1", "/music/track.mp3")]
+
+
 # ── service track-id resolver (#945 export to Spotify/Deezer) ──
 
 from core.exports.export_sources import (
     db_service_track_id,
     build_service_resolve_fn,
-    _SERVICE_ID_COLUMNS,
+    _SERVICES,
 )
 
 
-def test_service_id_column_mapping():
-    assert _SERVICE_ID_COLUMNS == {'spotify': 'spotify_track_id', 'deezer': 'deezer_id'}
+def test_only_the_two_addressable_services_are_offered():
+    """Not a column map any more: lib2 keeps Spotify in its own column and every
+    other provider in external_ids, so the resolver names services, not columns."""
+    assert _SERVICES == ('spotify', 'deezer')
 
 
 def test_db_service_track_id_unknown_service_is_none():
@@ -90,33 +238,75 @@ def test_build_service_resolve_fn_returns_id_and_source(monkeypatch):
     assert fn('Artist', 'Miss') == (None, None)
 
 
-def test_db_service_track_id_real_sql_executes(tmp_path, monkeypatch):
-    """Run the ACTUAL query against a real (temp) tracks/artists schema — the broad
-    except→None in db_service_track_id would otherwise mask a column/join typo as
-    'no match' for every track (#945 verification)."""
+def _lib2_fixture(tmp_path, artist='Kendrick Lamar'):
+    """A real Library-v2 database with one matched, filed track."""
     import sqlite3
     import types
-    import core.exports.export_sources as es
+
+    from core.library2.importer import normalize_name
+    from core.library2.schema import ensure_library_v2_schema
 
     dbfile = tmp_path / "lib.db"
     con = sqlite3.connect(str(dbfile))
-    con.executescript(
-        "CREATE TABLE artists (id TEXT PRIMARY KEY, name TEXT);"
-        "CREATE TABLE tracks (id TEXT, artist_id TEXT, title TEXT, "
-        "spotify_track_id TEXT, deezer_id TEXT);"
-        "INSERT INTO artists VALUES ('a1','Kendrick Lamar');"
-        "INSERT INTO tracks VALUES ('t1','a1','Not Like Us','spid-NLU','dz-NLU');"
-    )
+    ensure_library_v2_schema(con)
+    aid = con.execute(
+        "INSERT INTO lib2_artists(name, name_key, sort_name) VALUES(?,?,?)",
+        (artist, normalize_name(artist), artist)).lastrowid
+    alb = con.execute(
+        "INSERT INTO lib2_albums(primary_artist_id, title) VALUES(?, 'GNX')",
+        (aid,)).lastrowid
+    tid = con.execute(
+        "INSERT INTO lib2_tracks(album_id, title, musicbrainz_id, spotify_id, external_ids) "
+        "VALUES(?, 'Not Like Us', 'mbid-NLU', 'spid-NLU', '{\"deezer\": \"dz-NLU\"}')",
+        (alb,)).lastrowid
+    con.execute(
+        "INSERT INTO lib2_track_files(track_id, path, is_primary) VALUES(?, '/m/nlu.flac', 1)",
+        (tid,))
     con.commit()
     con.close()
 
-    # fresh connection per call (db_service_track_id closes it in finally)
-    fake_db = types.SimpleNamespace(_get_connection=lambda: sqlite3.connect(str(dbfile)))
-    monkeypatch.setattr("database.music_database.get_database", lambda: fake_db)
+    # fresh connection per call (the lookups close theirs in `finally`)
+    return types.SimpleNamespace(_get_connection=lambda: sqlite3.connect(str(dbfile)))
+
+
+def test_db_service_track_id_real_sql_executes(tmp_path, monkeypatch):
+    """Run the ACTUAL query against a real Library-v2 schema — the broad
+    except→None in the lookup would otherwise mask a column/join typo as
+    'no match' for every track (#945 verification)."""
+    import core.exports.export_sources as es
+
+    monkeypatch.setattr("database.music_database.get_database",
+                        lambda: _lib2_fixture(tmp_path))
 
     assert es.db_service_track_id("Kendrick Lamar", "Not Like Us", "spotify") == "spid-NLU"
-    assert es.db_service_track_id("kendrick lamar", "not like us", "deezer") == "dz-NLU"  # case-insensitive
+    # Deezer lives in external_ids, not a column of its own.
+    assert es.db_service_track_id("kendrick lamar", "not like us", "deezer") == "dz-NLU"
     assert es.db_service_track_id("Kendrick Lamar", "Unknown Song", "spotify") is None
+
+
+def test_db_match_returns_recording_id_and_the_primary_file(tmp_path, monkeypatch):
+    """The DB rung answers with both halves: the stored recording id, and the path
+    the file rung reads tags from when the row has no id."""
+    import core.exports.export_sources as es
+
+    monkeypatch.setattr("database.music_database.get_database",
+                        lambda: _lib2_fixture(tmp_path))
+
+    mbid, path, track_id = es._db_match("Kendrick Lamar", "Not Like Us")
+    assert (mbid, path) == ("mbid-NLU", "/m/nlu.flac")
+    assert track_id is not None
+    assert es.db_recording_mbid("Kendrick Lamar", "Not Like Us") == "mbid-NLU"
+
+
+def test_a_non_ascii_artist_reaches_the_db_rung(tmp_path, monkeypatch):
+    """``LOWER()`` is ASCII-only in SQLite, so the old comparison skipped the DB
+    step for every non-Latin artist and sent the row to the MusicBrainz tail."""
+    import core.exports.export_sources as es
+
+    monkeypatch.setattr("database.music_database.get_database",
+                        lambda: _lib2_fixture(tmp_path, artist='Björk'))
+
+    assert es.db_service_track_id("BJÖRK", "Not Like Us", "spotify") == "spid-NLU"
 
 
 # ── discovery-cache resolution (#945: use the already-discovered IDs, no API call) ──
@@ -236,3 +426,170 @@ def test_resolve_no_search_fn_leaves_tail_unmatched():
                                     db_fn=lambda a, t, s: None)   # search_id_fn omitted
     assert out['resolved'][0]['service_track_id'] is None
     assert out['stats']['unmatched'] == 1 and out['stats']['from_search'] == 0
+
+
+# ── ISRC rung (#903 review): use discovery's own matched Deezer id → ISRC → exact MBID ──
+
+from core.exports.export_sources import isrc_recording_mbid, build_resolve_fn
+from core.exports.mbid_resolver import SRC_DB, SRC_FILE, SRC_ISRC, SRC_MUSICBRAINZ
+
+ISRC = 'USUM71703861'
+MBID_A = 'e8f9b188-f819-4e43-ab0f-4bd26ce9ff56'
+MBID_B = '8f3471b5-7e6a-4c1f-9c1a-2b2b2b2b2b2b'
+
+
+def _isrc_track(provider='deezer', tid=111, isrc=None, discovered=True, title='Title'):
+    matched = {'id': tid}
+    if isrc is not None:
+        matched['isrc'] = isrc
+    return {
+        'extra_data': _json.dumps({'discovered': discovered, 'provider': provider,
+                                   'matched_data': matched}),
+        'title': title,
+    }
+
+
+def test_isrc_rung_deezer_provider_fetches_isrc_and_resolves():
+    track = _isrc_track(isrc=None)   # discovery didn't store isrc → must be fetched
+    fetched = {}
+    def deezer_track_fn(tid):
+        fetched['tid'] = tid
+        return {'isrc': ISRC}
+    def isrc_lookup_fn(code):
+        assert code == ISRC
+        return [{'id': MBID_A, 'title': 'Title'}]
+    mbid = isrc_recording_mbid(track, deezer_track_fn=deezer_track_fn, isrc_lookup_fn=isrc_lookup_fn)
+    assert mbid == MBID_A
+    assert fetched['tid'] == 111
+
+
+def test_isrc_rung_uses_isrc_already_in_matched_data_no_deezer_call():
+    track = _isrc_track(isrc=ISRC)
+    def deezer_track_fn(tid):
+        raise AssertionError('should not fetch — isrc was already on matched_data')
+    mbid = isrc_recording_mbid(
+        track, deezer_track_fn=deezer_track_fn,
+        isrc_lookup_fn=lambda code: [{'id': MBID_A, 'title': 'Title'}],
+    )
+    assert mbid == MBID_A
+
+
+def test_isrc_rung_spotify_provider_is_skipped_no_deezer_call():
+    track = _isrc_track(provider='spotify', isrc=ISRC)
+    def deezer_track_fn(tid):
+        raise AssertionError('must never call Deezer for a non-Deezer id')
+    mbid = isrc_recording_mbid(track, deezer_track_fn=deezer_track_fn,
+                               isrc_lookup_fn=lambda code: [{'id': MBID_A}])
+    assert mbid is None
+
+
+def test_isrc_rung_wing_it_stub_is_skipped():
+    track = _isrc_track(provider='wing_it_fallback', tid='wing_it_12345', isrc=ISRC)
+    mbid = isrc_recording_mbid(track, isrc_lookup_fn=lambda code: [{'id': MBID_A}])
+    assert mbid is None
+
+
+def test_isrc_rung_not_discovered_is_skipped():
+    track = _isrc_track(discovered=False, isrc=ISRC)
+    mbid = isrc_recording_mbid(track, isrc_lookup_fn=lambda code: [{'id': MBID_A}])
+    assert mbid is None
+
+
+def test_isrc_rung_multiple_recordings_picks_title_closest():
+    track = _isrc_track(isrc=ISRC, title='Shape of You')
+    recordings = [
+        {'id': MBID_B, 'title': 'Shape of You (Extended Remaster)'},
+        {'id': MBID_A, 'title': 'Shape of You'},
+    ]
+    mbid = isrc_recording_mbid(track, isrc_lookup_fn=lambda code: recordings)
+    assert mbid == MBID_A
+
+
+def test_isrc_rung_no_recordings_returns_none():
+    track = _isrc_track(isrc=ISRC)
+    assert isrc_recording_mbid(track, isrc_lookup_fn=lambda code: []) is None
+
+
+def test_isrc_rung_exceptions_are_swallowed():
+    track = _isrc_track(isrc=ISRC)
+    def boom(code):
+        raise RuntimeError('musicbrainz flaked')
+    assert isrc_recording_mbid(track, isrc_lookup_fn=boom) is None
+
+    def deezer_boom(tid):
+        raise RuntimeError('deezer flaked')
+    assert isrc_recording_mbid(_isrc_track(isrc=None), deezer_track_fn=deezer_boom) is None
+
+
+def test_isrc_rung_malformed_track_returns_none():
+    assert isrc_recording_mbid(None) is None
+    assert isrc_recording_mbid({}) is None
+    assert isrc_recording_mbid({'extra_data': 'not json{'}) is None
+
+
+# ── waterfall ordering: ISRC rung sits after file, before live MusicBrainz ──
+
+def test_waterfall_isrc_rung_hit_short_circuits_musicbrainz():
+    track = _isrc_track(isrc=ISRC)
+    mb_called = {'n': 0}
+    def mb_fn(a, t):
+        mb_called['n'] += 1
+        return MBID_B
+    fn = build_resolve_fn(
+        db_fn=lambda a, t: None,
+        file_fn=lambda a, t: None,
+        isrc_fn=lambda trk: MBID_A,
+        mb_fn=mb_fn,
+        cache_lookup=lambda k: None,
+        cache_record=lambda k, m: True,
+    )
+    mbid, label = fn('Artist', 'Title', track)
+    assert (mbid, label) == (MBID_A, SRC_ISRC)
+    assert mb_called['n'] == 0   # ISRC hit -> MusicBrainz never queried
+
+
+def test_waterfall_isrc_rung_miss_falls_through_to_musicbrainz():
+    track = _isrc_track(isrc=ISRC)
+    fn = build_resolve_fn(
+        db_fn=lambda a, t: None,
+        file_fn=lambda a, t: None,
+        isrc_fn=lambda trk: None,
+        mb_fn=lambda a, t: MBID_B,
+        cache_lookup=lambda k: None,
+        cache_record=lambda k, m: True,
+    )
+    mbid, label = fn('Artist', 'Title', track)
+    assert (mbid, label) == (MBID_B, SRC_MUSICBRAINZ)
+
+
+def test_waterfall_db_hit_short_circuits_isrc_rung():
+    isrc_called = {'n': 0}
+    def isrc_fn(trk):
+        isrc_called['n'] += 1
+        return MBID_A
+    fn = build_resolve_fn(
+        db_fn=lambda a, t: MBID_B,
+        file_fn=lambda a, t: None,
+        isrc_fn=isrc_fn,
+        mb_fn=lambda a, t: None,
+        cache_lookup=lambda k: None,
+        cache_record=lambda k, m: True,
+    )
+    mbid, label = fn('Artist', 'Title', _isrc_track(isrc=ISRC))
+    assert (mbid, label) == (MBID_B, SRC_DB)
+    assert isrc_called['n'] == 0
+
+
+def test_waterfall_resolve_fn_still_callable_with_two_args():
+    """Every pre-existing caller/test calls resolve_fn(artist, title) — the ISRC rung
+    being track-aware must not break that; without a track it's simply skipped."""
+    fn = build_resolve_fn(
+        db_fn=lambda a, t: None,
+        file_fn=lambda a, t: None,
+        isrc_fn=lambda trk: MBID_A,   # would hit if ever called
+        mb_fn=lambda a, t: MBID_B,
+        cache_lookup=lambda k: None,
+        cache_record=lambda k, m: True,
+    )
+    mbid, label = fn('Artist', 'Title')
+    assert (mbid, label) == (MBID_B, SRC_MUSICBRAINZ)   # ISRC rung skipped, no track given

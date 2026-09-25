@@ -1,3 +1,32 @@
+// Shared lifecycle for every download-missing modal, including re-opened active jobs.
+function installDownloadModalScrollLock() {
+    const selector = '.download-missing-modal';
+    const sync = () => {
+        const open = [...document.querySelectorAll(selector)].some(modal =>
+            !modal.hidden && getComputedStyle(modal).display !== 'none');
+        document.documentElement.classList.toggle('download-modal-open', open);
+    };
+    const containsModal = node => node.nodeType === 1 &&
+        (node.matches(selector) || node.querySelector(selector));
+    const observer = new MutationObserver(records => {
+        if (records.some(record => record.type === 'attributes'
+            ? record.target.matches(selector)
+            : [...record.addedNodes, ...record.removedNodes].some(containsModal))) sync();
+    });
+    observer.observe(document.body, {childList: true, subtree: true, attributes: true,
+                                    attributeFilter: ['style', 'class', 'hidden']});
+    sync();
+    return () => {
+        observer.disconnect();
+        document.documentElement.classList.remove('download-modal-open');
+    };
+}
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', installDownloadModalScrollLock, {once: true});
+} else {
+    installDownloadModalScrollLock();
+}
+
 // WING IT — Download without metadata discovery
 // ==================================================================================
 
@@ -426,8 +455,12 @@ async function _wingItFromModal(urlHash) {
     wingItDownload(tracks, name, source);
 }
 
-async function openDownloadMissingModalForYouTube(virtualPlaylistId, playlistName, spotifyTracks, artist = null, album = null) {
-    showLoadingOverlay('Loading YouTube playlist...');
+// `sourceLabel` is the explicit answer to "who made this playlist". the name of
+// this function is a fossil - it serves every virtual playlist on the page - and
+// the prefix sniffing below is a guess that DEFAULTS to YouTube. callers that know
+// (a SoulSync station, a generated mix) pass the label and stop the guessing.
+async function openDownloadMissingModalForYouTube(virtualPlaylistId, playlistName, spotifyTracks, artist = null, album = null, sourceLabel = null) {
+    showLoadingOverlay('Loading playlist...');
     // Check if a process is already active for this virtual playlist
     if (activeDownloadProcesses[virtualPlaylistId]) {
         console.log(`Modal for ${virtualPlaylistId} already exists. Showing it.`);
@@ -478,7 +511,9 @@ async function openDownloadMissingModalForYouTube(virtualPlaylistId, playlistNam
     };
 
     // Generate hero section with dynamic source detection
-    const source = virtualPlaylistId.startsWith('beatport_') ? 'Beatport' :
+    const source = sourceLabel ? sourceLabel :
+        /^(daily_mix_|release_radar|discovery_weekly|popular_picks|hidden_gems|listening_mix|discovery_shuffle|station_)/.test(virtualPlaylistId) ? 'SoulSync' :
+        virtualPlaylistId.startsWith('beatport_') ? 'Beatport' :
         virtualPlaylistId.startsWith('tidal_') ? 'Tidal' :
             virtualPlaylistId.startsWith('listenbrainz_') ? 'ListenBrainz' :
                 virtualPlaylistId.startsWith('spotify_public_') ? 'Spotify' :
@@ -2742,7 +2777,7 @@ function _renderCandidatesModal(data) {
                 <input type="text"
                        class="candidates-manual-search-input"
                        id="candidates-manual-search-input"
-                       placeholder="Search, or paste a Tidal / Qobuz track link..."
+                       placeholder="Search, or paste a Tidal / Qobuz / Deezer link..."
                        maxlength="300" />
                 ${sourceControl}
                 <button class="candidates-manual-search-btn"
@@ -4534,7 +4569,16 @@ function updateModalSyncProgress(playlistId, progress) {
             const failed = progress.failed_tracks || 0;
 
             if (totalEl) totalEl.textContent = total;
-            if (matchedEl) matchedEl.textContent = matched;
+            if (matchedEl) {
+                if (progress.duplicate_tracks > 0) {
+                    const synced = progress.synced_tracks || (matched - progress.duplicate_tracks);
+                    matchedEl.textContent = `${matched} (${synced} synced)`;
+                    matchedEl.title = `${progress.duplicate_tracks} duplicate track${progress.duplicate_tracks === 1 ? '' : 's'} folded (already on playlist)`;
+                } else {
+                    matchedEl.textContent = matched;
+                    matchedEl.removeAttribute('title');
+                }
+            }
             if (failedEl) failedEl.textContent = failed;
 
             // Calculate percentage like GUI
@@ -4751,6 +4795,10 @@ let _musicSyncPulse = null;
 let _musicSyncClearTimer = null;
 let _lastfmImportTask = null;
 let _lastfmImportClearTimer = null;
+let _lastfmImportCompletion = null;
+let _listenbrainzImportTask = null;
+let _listenbrainzImportClearTimer = null;
+let _listenbrainzImportCompletion = null;
 
 function _taskClampPct(value, fallback = 0) {
     let pct = Number(value);
@@ -5098,12 +5146,35 @@ function _musicSyncActiveHTML() {
 function updateLastfmListeningImportTask(data) {
     if (!data) return;
     if (_lastfmImportClearTimer) { clearTimeout(_lastfmImportClearTimer); _lastfmImportClearTimer = null; }
-    const active = data.running === true;
+    const terminal = ['complete', 'error', 'cancelled'].includes(data.status);
+    const active = !terminal && (data.running === true || data.status === 'running');
     if (active) {
+        _lastfmImportCompletion = null;
         _lastfmImportTask = { ...data, updated_at: Date.now() };
-    } else if (_lastfmImportTask || data.status === 'complete' || data.status === 'error' || data.status === 'cancelled') {
-        _lastfmImportTask = { ...data, updated_at: Date.now() };
-        _lastfmImportClearTimer = setTimeout(() => { _lastfmImportTask = null; _updateOverlayBell(); _patchOverlayActive(); }, 10000);
+    } else if (terminal || _lastfmImportTask) {
+        // Status snapshots are persisted indefinitely and reloaded on panel open.
+        // Replays must not restart the grace period or resurrect an expired card.
+        const key = JSON.stringify([data.username, data.started_at, data.finished_at, data.status]);
+        if (!_lastfmImportCompletion || _lastfmImportCompletion.key !== key) {
+            // The importer writes naive UTC timestamps, not browser-local time.
+            let stamp = String(data.finished_at || '').replace(' ', 'T');
+            if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(stamp)) stamp += 'Z';
+            const finished = Date.parse(stamp);
+            _lastfmImportCompletion = {
+                key,
+                expiresAt: Math.min(Date.now(), Number.isFinite(finished) ? finished : Date.now()) + 10000,
+            };
+        }
+        const remaining = _lastfmImportCompletion.expiresAt - Date.now();
+        _lastfmImportTask = remaining > 0 ? { ...data, running: false, updated_at: Date.now() } : null;
+        if (remaining > 0) {
+            _lastfmImportClearTimer = setTimeout(() => {
+                _lastfmImportClearTimer = null;
+                _lastfmImportTask = null;
+                _updateOverlayBell();
+                _patchOverlayActive();
+            }, remaining);
+        }
     }
     _updateOverlayBell();
     _patchOverlayActive();
@@ -5134,15 +5205,74 @@ function _lastfmImportActiveHTML() {
     return _taskCardHTML('Importing Last.fm listening', pct, line, cls, _notifActionHTML('Open Stats', 'stats'));
 }
 
+function updateListenbrainzListeningImportTask(data) {
+    if (!data) return;
+    if (_listenbrainzImportClearTimer) { clearTimeout(_listenbrainzImportClearTimer); _listenbrainzImportClearTimer = null; }
+    const terminal = ['complete', 'error', 'cancelled'].includes(data.status);
+    const active = !terminal && (data.running === true || data.status === 'running');
+    if (active) {
+        _listenbrainzImportCompletion = null;
+        _listenbrainzImportTask = { ...data, updated_at: Date.now() };
+    } else if (terminal || _listenbrainzImportTask) {
+        const key = JSON.stringify([data.username, data.started_at, data.finished_at, data.status]);
+        if (!_listenbrainzImportCompletion || _listenbrainzImportCompletion.key !== key) {
+            let stamp = String(data.finished_at || '').replace(' ', 'T');
+            if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(stamp)) stamp += 'Z';
+            const finished = Date.parse(stamp);
+            _listenbrainzImportCompletion = {
+                key,
+                expiresAt: Math.min(Date.now(), Number.isFinite(finished) ? finished : Date.now()) + 10000,
+            };
+        }
+        const remaining = _listenbrainzImportCompletion.expiresAt - Date.now();
+        _listenbrainzImportTask = remaining > 0 ? { ...data, running: false, updated_at: Date.now() } : null;
+        if (remaining > 0) {
+            _listenbrainzImportClearTimer = setTimeout(() => {
+                _listenbrainzImportClearTimer = null;
+                _listenbrainzImportTask = null;
+                _updateOverlayBell();
+                _patchOverlayActive();
+            }, remaining);
+        }
+    }
+    _updateOverlayBell();
+    _patchOverlayActive();
+}
+
+function _listenbrainzImportActive() {
+    return !!(_listenbrainzImportTask && (_listenbrainzImportTask.running || _listenbrainzImportTask.status === 'running'));
+}
+
+function _listenbrainzImportActiveHTML() {
+    const t = _listenbrainzImportTask;
+    if (!t) return '';
+    const active = _listenbrainzImportActive();
+    const hasProgress = _taskHasPct(t.progress);
+    const pct = active
+        ? (hasProgress ? _taskClampPct(t.progress) : null)
+        : (t.status === 'complete' ? 100 : (hasProgress ? _taskClampPct(t.progress) : null));
+    const cls = t.status === 'error' ? 'error' : (!active ? 'done' : '');
+    const inserted = Number(t.inserted || 0);
+    const duplicates = Number(t.duplicates || 0);
+    const total = Number(t.total_scrobbles || t.total_listens || 0);
+    const page = Number(t.page || 0);
+    const totalPages = Number(t.total_pages || 0);
+    const pageLine = page && totalPages ? ` · page ${page.toLocaleString()}/${totalPages.toLocaleString()}` : '';
+    const line = active
+        ? `${inserted.toLocaleString()} added${duplicates ? `, ${duplicates.toLocaleString()} skipped` : ''}${total ? ` · ${total.toLocaleString()} total` : ''}${pageLine}`
+        : (t.status === 'error' ? _escToast(t.error || 'ListenBrainz import failed') : _escToast(t.phase || 'ListenBrainz listening is up to date'));
+    return _taskCardHTML('Importing ListenBrainz listening', pct, line, cls, _notifActionHTML('Open Stats', 'stats'));
+}
+
 function _musicTasksActive() {
     return _musicAutomationActive() || _musicRepairActive() || _musicWatchlistActive()
         || _musicMediaScanActive() || _musicWishlistActive() || _musicSyncActive()
-        || _lastfmImportActive();
+        || _lastfmImportActive() || _listenbrainzImportActive();
 }
 
 function _musicActiveHTML() {
     return _musicAutomationActiveHTML() + _musicSyncActiveHTML() + _musicWishlistActiveHTML()
-        + _lastfmImportActiveHTML() + _musicWatchlistActiveHTML() + _musicMediaScanActiveHTML() + _musicRepairActiveHTML();
+        + _lastfmImportActiveHTML() + _listenbrainzImportActiveHTML() + _musicWatchlistActiveHTML() + _musicMediaScanActiveHTML() + _musicRepairActiveHTML();
 }
 
 function _seedMusicAutomationTask() {
@@ -5184,6 +5314,13 @@ function _seedLastfmImportTask() {
         .catch(() => {});
 }
 
+function _seedListenbrainzImportTask() {
+    fetch('/api/listenbrainz/listening-import/status')
+        .then(r => r.ok ? r.json() : null)
+        .then(s => { if (s && s.success) updateListenbrainzListeningImportTask(s); })
+        .catch(() => {});
+}
+
 function _updateOverlayBell() {
     const btn = document.getElementById('notif-bell-btn');
     if (btn) btn.classList.toggle('notif-bell-working',
@@ -5208,6 +5345,7 @@ function _ensureTaskPolling() {
             _seedMusicRepairTask();
             _seedMusicMediaScanTask();
             _seedLastfmImportTask();
+            _seedListenbrainzImportTask();
         }, 12000);
     } else if (!active && _taskPollTimer) {
         clearInterval(_taskPollTimer);
@@ -5447,7 +5585,20 @@ function showToast(message, type = 'success', helpSection = null) {
 }
 
 function _escToast(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
-function _escAttr(s) { return _escToast(s).replace(/'/g, "\\'").replace(/\n/g, ' ').replace(/\r/g, ''); }
+// `_escAttr` used to be redefined here as a JS-string escaper. Both this file
+// and stats-automations.js declared a global `function _escAttr`, and
+// stats-automations.js loads SECOND (index.html), so its HTML-entity version
+// won for every call site in BOTH files. The onclick builders below therefore
+// got &#39; where they needed \' -- the attribute parser decoded it back to a
+// bare apostrophe, which terminated the JS string literal and threw a
+// SyntaxError that silently killed the whole handler. That is the
+// "Road trip-The Rolfe's" delete-button bug, and it was still live
+// (frontend-audit FE-07).
+//
+// There is no second definition now. `_escAttr` (HTML attribute content) and
+// `_escJs` (a JS string literal inside an HTML attribute -- the double-decoded
+// case) both live in stats-automations.js, and each call site below uses the
+// one that matches its context.
 
 function _updateNotifBadge() {
     const badge = document.getElementById('notif-bell-badge');
@@ -6023,7 +6174,7 @@ function _gsUpdateVisibility() {
     if (!bar) return;
     // Hide on pages where global search doesn't belong, and always on the
     // video side (the global/music search is music-only).
-    const _gsHidePages = new Set(['search', 'downloads', 'settings', 'help', 'issues', 'import']);
+    const _gsHidePages = new Set(['search', 'downloads', 'settings', 'help', 'issues', 'import', 'library']);
     const onVideoSide = document.body.getAttribute('data-side') === 'video';
     const onHidePage = onVideoSide || (typeof currentPage !== 'undefined' && _gsHidePages.has(currentPage));
     bar.style.display = onHidePage ? 'none' : '';
@@ -6192,7 +6343,7 @@ function _gsRenderFromState(state) {
 
     if (dbArtists.length) {
         h += '<div class="gsearch-section-header">📚 In Your Library</div><div class="gsearch-grid">';
-        h += dbArtists.map(a => `<a class="gsearch-item" href="${a.id ? buildArtistDetailPath(a.id, null) : '#'}" onclick="_gsDeactivate()" style="text-decoration:none;color:inherit;">${a.image_url ? `<div class="gsearch-item-art"><img src="${a.image_url}" loading="lazy" onerror="this.parentElement.textContent='🎤'"></div>` : '<div class="gsearch-item-art">🎤</div>'}<div class="gsearch-item-info"><div class="gsearch-item-title">${_escToast(a.name)}</div><div class="gsearch-item-sub">Library</div></div></a>`).join('');
+        h += dbArtists.map(a => `<a class="gsearch-item" href="${a.library_v2_id ? `/library?artist=${encodeURIComponent(a.library_v2_id)}` : (a.id ? buildArtistDetailPath(a.id, null) : '#')}" onclick="_gsDeactivate()" style="text-decoration:none;color:inherit;">${a.image_url ? `<div class="gsearch-item-art"><img src="${a.image_url}" loading="lazy" onerror="this.parentElement.textContent='🎤'"></div>` : '<div class="gsearch-item-art">🎤</div>'}<div class="gsearch-item-info"><div class="gsearch-item-title">${_escToast(a.name)}</div><div class="gsearch-item-sub">Library</div></div></a>`).join('');
         h += '</div>';
     }
 
@@ -6208,7 +6359,7 @@ function _gsRenderFromState(state) {
             const ar = a.artist || (a.artists ? a.artists.join(', ') : '');
             const yr = a.release_date ? a.release_date.substring(0, 4) : '';
             const img = (a.image_url || '').replace(/'/g, "\\'");
-            return `<div class="gsearch-item" onclick="_gsClickAlbum('${a.id}', '${_escAttr(a.name)}', '${_escAttr(ar)}', '${img}', '${activeSrc}')"><div class="gsearch-item-art">${a.image_url ? `<img src="${a.image_url}" loading="lazy" onerror="this.parentElement.textContent='💿'">` : '💿'}</div><div class="gsearch-item-info"><div class="gsearch-item-title">${_escToast(a.name)}</div><div class="gsearch-item-sub">${_escToast(ar)}${yr ? ` · ${yr}` : ''}</div></div></div>`;
+            return `<div class="gsearch-item" onclick="_gsClickAlbum('${a.id}', '${_escJs(a.name)}', '${_escJs(ar)}', '${img}', '${activeSrc}')"><div class="gsearch-item-art">${a.image_url ? `<img src="${a.image_url}" loading="lazy" onerror="this.parentElement.textContent='💿'">` : '💿'}</div><div class="gsearch-item-info"><div class="gsearch-item-title">${_escToast(a.name)}</div><div class="gsearch-item-sub">${_escToast(ar)}${yr ? ` · ${yr}` : ''}</div></div></div>`;
         }).join('');
         h += '</div>';
     }
@@ -6218,7 +6369,7 @@ function _gsRenderFromState(state) {
         h += singles.map(a => {
             const ar = a.artist || (a.artists ? a.artists.join(', ') : '');
             const img = (a.image_url || '').replace(/'/g, "\\'");
-            return `<div class="gsearch-item" onclick="_gsClickAlbum('${a.id}', '${_escAttr(a.name)}', '${_escAttr(ar)}', '${img}', '${activeSrc}')"><div class="gsearch-item-art">${a.image_url ? `<img src="${a.image_url}" loading="lazy" onerror="this.parentElement.textContent='🎶'">` : '🎶'}</div><div class="gsearch-item-info"><div class="gsearch-item-title">${_escToast(a.name)}</div><div class="gsearch-item-sub">${_escToast(ar)}</div></div></div>`;
+            return `<div class="gsearch-item" onclick="_gsClickAlbum('${a.id}', '${_escJs(a.name)}', '${_escJs(ar)}', '${img}', '${activeSrc}')"><div class="gsearch-item-art">${a.image_url ? `<img src="${a.image_url}" loading="lazy" onerror="this.parentElement.textContent='🎶'">` : '🎶'}</div><div class="gsearch-item-info"><div class="gsearch-item-title">${_escToast(a.name)}</div><div class="gsearch-item-sub">${_escToast(ar)}</div></div></div>`;
         }).join('');
         h += '</div>';
     }
@@ -6228,7 +6379,7 @@ function _gsRenderFromState(state) {
         h += tracks.map(t => {
             const ar = t.artist || (t.artists ? t.artists.join(', ') : '');
             const dur = t.duration_ms ? `${Math.floor(t.duration_ms / 60000)}:${String(Math.floor((t.duration_ms % 60000) / 1000)).padStart(2, '0')}` : '';
-            return `<div class="gsearch-track" onclick="_gsClickTrack('${_escAttr(ar)}', '${_escAttr(t.name)}', '${_escAttr(t.album || '')}', '${_escAttr(t.id || '')}', '${_escAttr(t.image_url || '')}', ${t.duration_ms || 0})"><div class="gsearch-item-art" style="width:32px;height:32px;border-radius:6px">${t.image_url ? `<img src="${t.image_url}" loading="lazy" onerror="this.parentElement.textContent='🎵'">` : '🎵'}</div><div class="gsearch-item-info"><div class="gsearch-item-title">${_escToast(t.name)}</div><div class="gsearch-item-sub">${_escToast(ar)}${t.album ? ` · ${_escToast(t.album)}` : ''}</div></div><div class="gsearch-track-dur">${dur}</div><button class="gsearch-play-btn" onclick="event.stopPropagation(); _gsPlayTrack('${_escAttr(t.name)}', '${_escAttr(ar)}', '${_escAttr(t.album || '')}')" title="Stream">▶</button></div>`;
+            return `<div class="gsearch-track" onclick="_gsClickTrack('${_escJs(ar)}', '${_escJs(t.name)}', '${_escJs(t.album || '')}', '${_escJs(t.id || '')}', '${_escJs(t.image_url || '')}', ${t.duration_ms || 0})"><div class="gsearch-item-art" style="width:32px;height:32px;border-radius:6px">${t.image_url ? `<img src="${t.image_url}" loading="lazy" onerror="this.parentElement.textContent='🎵'">` : '🎵'}</div><div class="gsearch-item-info"><div class="gsearch-item-title">${_escToast(t.name)}</div><div class="gsearch-item-sub">${_escToast(ar)}${t.album ? ` · ${_escToast(t.album)}` : ''}</div></div><div class="gsearch-track-dur">${dur}</div><button class="gsearch-play-btn" onclick="event.stopPropagation(); _gsPlayTrack('${_escJs(t.name)}', '${_escJs(ar)}', '${_escJs(t.album || '')}')" title="Stream">▶</button></div>`;
         }).join('');
         h += '</div>';
     }
@@ -6499,7 +6650,16 @@ async function _gsLibraryCheck() {
 function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
-    return div.innerHTML;
+    // textContent/innerHTML escapes & < > but NOT a double quote, because a
+    // text node does not need one. Almost every caller interpolates the
+    // result into a double-quoted ATTRIBUTE, where a raw quote closes the
+    // attribute early: a track called 'Crazy (12" mix)' reached MusicBrainz
+    // as 'Crazy (12' with everything after it dropped (#1230).
+    //
+    // Safe in both places: the output is always inserted via innerHTML, so
+    // &quot; renders as a plain quote in text and parses correctly in an
+    // attribute.
+    return div.innerHTML.replace(/"/g, '&quot;');
 }
 
 /**

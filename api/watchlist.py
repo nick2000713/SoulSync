@@ -8,9 +8,12 @@ from core.watchlist_sources import (
     ARTIST_ID_COLUMNS, SOURCE_COLUMNS, artist_id_match_sql, normalize_source,
 )
 from database.music_database import get_database
+from utils.logging_config import get_logger
 from .auth import require_api_key
 from .helpers import api_success, api_error, parse_fields, parse_profile_id
 from .serializers import serialize_watchlist_artist
+
+logger = get_logger("api.watchlist")
 
 
 def _parse_quality_profile_id(db, body):
@@ -108,8 +111,18 @@ def register_routes(bp):
         profile_id = parse_profile_id(request)
         try:
             db = get_database()
+            # §69.1 reverse edge: capture identity before delete, demonitor the
+            # matching lib2 artist afterwards (both-way sync).
+            descriptor = db.get_watchlist_artist_descriptor(artist_id, profile_id=profile_id)
             ok = db.remove_artist_from_watchlist(artist_id, profile_id=profile_id)
             if ok:
+                try:
+                    from core.settings import config_manager
+                    from core.library2.monitor_sync import sync_watchlist_removal
+                    sync_watchlist_removal(db, config_manager, descriptor,
+                                           profile_id=profile_id)
+                except Exception as sync_e:
+                    logger.debug("watchlist reverse-sync skipped: %s", sync_e)
                 return api_success({"message": "Artist removed from watchlist."})
             return api_error("NOT_FOUND", "Artist not found in watchlist.", 404)
         except Exception as e:
@@ -182,16 +195,22 @@ def register_routes(bp):
     @bp.route("/watchlist/scan", methods=["POST"])
     @require_api_key
     def trigger_scan():
-        """Trigger a watchlist scan for new releases."""
-        try:
-            from web_server import is_watchlist_actually_scanning
-            if is_watchlist_actually_scanning():
-                return api_error("CONFLICT", "Watchlist scan is already running.", 409)
+        """Trigger a watchlist scan for new releases.
 
-            from web_server import start_watchlist_scan
-            start_watchlist_scan()
+        Calls the app's own scan handler in this request context; it reads
+        no body, so the v1 request is a fine one to run it under. It used to
+        import from web_server, which stopped owning it (#1259 class).
+        """
+        try:
+            from api.artist_watchlist import start_watchlist_scan
+
+            result = start_watchlist_scan()
+            response, status = result if isinstance(result, tuple) else (result, 200)
+            if status == 409:
+                return api_error("CONFLICT", "Watchlist scan is already running.", 409)
+            if status != 200:
+                body = response.get_json(silent=True) or {}
+                return api_error("WATCHLIST_ERROR", body.get("error", "Could not start the scan."), status)
             return api_success({"message": "Watchlist scan started."})
-        except ImportError:
-            return api_error("NOT_AVAILABLE", "Watchlist scan function not available.", 501)
         except Exception as e:
             return api_error("WATCHLIST_ERROR", str(e), 500)

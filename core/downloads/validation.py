@@ -9,7 +9,14 @@ from utils.logging_config import get_logger
 import re
 
 from core.settings import config_manager
+from core.downloads.soulseek_identity import match_track
 from core.imports.file_integrity import resolve_duration_tolerance
+# One definition of "could this release satisfy the profile", shared with the
+# album-bundle picker. It lived here and the picker used the probed-file rule
+# instead, so the same release passed per-track and was refused as an album.
+from core.quality.model import (
+    satisfies_a_target_on_stated_facts as _satisfies_a_target_on_stated_facts,
+)
 
 logger = get_logger("downloads.validation")
 
@@ -260,6 +267,7 @@ def get_valid_candidates(results, spotify_track, query, profile_id=None):
         if scored:
             if any(getattr(r, 'username', None) == 'youtube' for r in scored):
                 scored = _filter_youtube_by_quality(scored, profile_id)
+            scored = _filter_prowlarr_by_quality(scored, profile_id)
             accepted.extend(scored)
         elif any(getattr(r, 'username', None) == 'youtube' for r in streaming):
             # YouTube artist data is unreliable; Tidal/Qobuz/etc. do not fall through.
@@ -277,6 +285,69 @@ def get_valid_candidates(results, spotify_track, query, profile_id=None):
     if p2p:
         accepted.extend(_match_filename_candidates(p2p, spotify_track, profile_id))
     return accepted
+
+
+def _filter_prowlarr_by_quality(candidates, profile_id=None):
+    """Apply the item's quality ladder to torrent/Usenet search hits.
+
+    Those sources enter the structured-metadata matching lane because their
+    release title is already split into artist/title.  That lane historically
+    skipped quality filtering for every non-YouTube source on the assumption
+    that the source handled it internally.  Prowlarr does not: its search API
+    exposes a release title, not normalized audio properties.  The projection
+    now parses those properties, and this is where they become an actual
+    profile decision before any torrent/NZB is grabbed.
+
+    Other streaming candidates are preserved unchanged.  A DB/profile read
+    failure is also non-fatal; the post-download quality guard remains the
+    final authority.
+    """
+    rows = list(candidates or [])
+    prowlarr = [
+        row for row in rows
+        if getattr(row, 'username', None) in ('torrent', 'usenet')
+    ]
+    if not prowlarr:
+        return rows
+
+    try:
+        from core.quality.model import AudioQuality
+        from core.quality.selection import load_profile_by_id, targets_from_profile
+
+        profile = load_profile_by_id(profile_id)
+        targets, fallback_enabled = targets_from_profile(profile)
+        if fallback_enabled or not targets:
+            return rows
+        ranked = [
+            row for row in prowlarr
+            if _satisfies_a_target_on_stated_facts(
+                AudioQuality(
+                    format=str(getattr(row, 'quality', '') or 'unknown'),
+                    bitrate=getattr(row, 'bitrate', None),
+                    sample_rate=getattr(row, 'sample_rate', None),
+                    bit_depth=getattr(row, 'bit_depth', None),
+                ),
+                targets,
+            )
+        ]
+    except Exception as exc:  # noqa: BLE001 - never turn config I/O into no hits
+        logger.debug("Prowlarr quality filtering unavailable: %s", exc)
+        return rows
+
+    kept_ids = {id(row) for row in ranked}
+    filtered = [
+        row for row in rows
+        if getattr(row, 'username', None) not in ('torrent', 'usenet')
+        or id(row) in kept_ids
+    ]
+    if len(ranked) != len(prowlarr):
+        logger.info(
+            "Prowlarr quality filter: kept %d/%d release(s) for %s",
+            len(ranked),
+            len(prowlarr),
+            f"item profile {profile_id}" if profile_id else "app default",
+        )
+    return filtered
 
 
 def _score_streaming_candidates(results, spotify_track):
@@ -468,8 +539,39 @@ def _match_filename_candidates(results, spotify_track, profile_id=None):
     # Uses the existing, powerful matching engine for scoring (Soulseek P2P results)
     _max_q = config_manager.get('soulseek.max_peer_queue', 0) or 0
     initial_candidates = matching_engine.find_best_slskd_matches_enhanced(spotify_track, results, max_peer_queue=_max_q)
+    # The generic path scorer can put a structurally unusual but exact title
+    # below its 0.58 threshold. It has already scored and version-checked
+    # every row (a version reject scores 0.0), so recover Soulseek files that
+    # still have positive confidence, an exact-title interpretation, and the
+    # artist in their path — the last so the recovery cannot undo the
+    # engine's short-title guard for a fuzzy-artist folder. Keep the
+    # configured queue gate's all-filtered fallback semantics.
+    if results and all(getattr(row, 'username', None) not in _STREAMING_USERNAMES
+                       for row in results):
+        eligible = list(results)
+        if _max_q > 0:
+            within_queue = [row for row in eligible
+                            if (getattr(row, 'queue_length', 0) or 0) <= _max_q]
+            if within_queue:
+                eligible = within_queue
+        accepted_ids = {id(row) for row in initial_candidates}
+        for row in eligible:
+            if id(row) in accepted_ids or (getattr(row, 'confidence', 0) or 0) <= 0:
+                continue
+            identity = match_track(spotify_track, row)
+            if identity.matches and identity.artist_path_evidence:
+                initial_candidates.append(row)
     if not initial_candidates:
         return []
+
+    # Identity is evidence for logging/ordering, never a rejection: a parsed
+    # title is not authoritative metadata.
+    for candidate in initial_candidates:
+        if getattr(candidate, 'username', None) in _STREAMING_USERNAMES:
+            continue
+        identity = match_track(spotify_track, candidate)
+        if identity.matches:
+            candidate.soulseek_match_evidence = identity
 
     # Skip quality filtering for streaming source results that somehow got here
     is_streaming_source = initial_candidates[0].username in _STREAMING_USERNAMES if initial_candidates else False

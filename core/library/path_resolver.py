@@ -166,6 +166,24 @@ def _collect_base_dirs(
     return out
 
 
+def library_base_dirs(
+    config_manager: Any = None,
+    *,
+    transfer_folder: Optional[str] = None,
+    download_folder: Optional[str] = None,
+    plex_client: Any = None,
+) -> List[str]:
+    """The existing directories a stored library path can be resolved against.
+
+    The public form of the search roots the suffix walk uses: transfer and
+    download folders, Plex-reported library locations, and
+    ``library.music_paths``. Callers that need to judge whether some path
+    belongs to the library at all — rather than resolve one file — ask here,
+    instead of reaching for the private collector.
+    """
+    return _collect_base_dirs(transfer_folder, download_folder, config_manager, plex_client)
+
+
 def resolve_library_file_path(
     file_path: Any,
     *,
@@ -173,6 +191,7 @@ def resolve_library_file_path(
     download_folder: Optional[str] = None,
     config_manager: Any = None,
     plex_client: Any = None,
+    library_root: Optional[str] = None,
 ) -> Optional[str]:
     """Resolve a stored DB path to an actual file on disk.
 
@@ -182,6 +201,8 @@ def resolve_library_file_path(
         transfer_folder: Optional explicit transfer-folder override
             (bypasses the config_manager lookup). Useful when the caller
             already cached one.
+        library_root: When set, only resolve inside this library; never fall back
+            to the shared transfer folder or another configured music root.
         download_folder: Optional explicit download-folder override.
         config_manager: When provided, the resolver also pulls
             ``soulseek.transfer_path``, ``soulseek.download_path``, and
@@ -199,6 +220,7 @@ def resolve_library_file_path(
         download_folder=download_folder,
         config_manager=config_manager,
         plex_client=plex_client,
+        library_root=library_root,
     )
     return resolved
 
@@ -210,6 +232,7 @@ def resolve_library_file_path_with_diagnostic(
     download_folder: Optional[str] = None,
     config_manager: Any = None,
     plex_client: Any = None,
+    library_root: Optional[str] = None,
 ) -> Tuple[Optional[str], ResolveAttempt]:
     """Same as ``resolve_library_file_path`` but also returns a
     ``ResolveAttempt`` describing what the resolver tried.
@@ -230,12 +253,13 @@ def resolve_library_file_path_with_diagnostic(
     if not isinstance(file_path, str) or not file_path:
         return None, attempt
 
-    if os.path.exists(file_path):
+    if os.path.exists(file_path) and (not library_root or _inside_library_root(file_path, library_root)):
         attempt.raw_path_existed = True
         return file_path, attempt
 
     path_parts = file_path.replace("\\", "/").split("/")
-    base_dirs = _collect_base_dirs(transfer_folder, download_folder, config_manager, plex_client)
+    base_dirs = (_collect_base_dirs(library_root, None, None, None) if library_root else
+                 _collect_base_dirs(transfer_folder, download_folder, config_manager, plex_client))
     attempt.base_dirs_tried = list(base_dirs)
     if not base_dirs:
         return None, attempt
@@ -258,15 +282,26 @@ def resolve_library_file_path_with_diagnostic(
     for base in base_dirs:
         for i in range(0, len(path_parts)):
             candidate = os.path.join(base, *path_parts[i:])
-            if os.path.exists(candidate):
+            if os.path.exists(candidate) and (not library_root or _inside_library_root(candidate, library_root)):
                 return candidate, attempt
 
     sibling = _resolve_via_sibling_album_folder(path_parts, base_dirs)
-    if sibling:
+    if sibling and (not library_root or _inside_library_root(sibling, library_root)):
         return sibling, attempt
     # Filename wrong as well as the album folder — Navidrome synthesizes the
     # whole path from tags, so no exact segment is left to match on (#1127).
-    return _resolve_via_synthesized_filename(path_parts, base_dirs), attempt
+    resolved = _resolve_via_synthesized_filename(path_parts, base_dirs)
+    if library_root and resolved and not _inside_library_root(resolved, library_root):
+        resolved = None
+    return resolved, attempt
+
+
+def _inside_library_root(path, root):
+    try:
+        base = os.path.normcase(os.path.realpath(root))
+        return os.path.commonpath([base, os.path.normcase(os.path.realpath(path))]) == base
+    except (ValueError, OSError):
+        return False
 
 
 def _resolve_via_sibling_album_folder(
@@ -366,6 +401,37 @@ def _strip_track_number(basename: str) -> str:
     return (stripped or (basename or "")).lower()
 
 
+# the synthesized basename split into its parts: "01-04 - Tether" is disc 01,
+# track 04, title "Tether". the disc is optional ("04 - Tether").
+_SYNTH_NAME = re.compile(r"^(?:\d{1,3}-)?(?P<track>\d{1,3})\s+-\s+(?P<title>.+)$")
+
+# a physical "<artist> - <album> - <track> - <title>" filename (#1298). the
+# prefix is checked against the artist and album the path names, not guessed.
+_PREFIXED_NAME = re.compile(
+    r"^(?P<prefix>.+?)\s+-\s+(?:\d{1,3}-)?(?P<track>\d{1,3})\s+-\s+(?P<title>.+)$")
+
+# characters a tagger or navidrome writes in place of one a filename can't hold.
+# navidrome turns "Science/Visions" into "Science_Visions", a tagger may have
+# written "Science+Visions", so all of these compare as one slot.
+_FILENAME_SUBSTITUTES = re.compile(r'[/\\_+:*?"<>|-]')
+
+
+def _loose(text: str) -> str:
+    return _FILENAME_SUBSTITUTES.sub("_", text or "").casefold().strip()
+
+
+def _prefixed_name_matches(entry_base: str, artist: str, album: str,
+                           track: int, title: str) -> bool:
+    """``"CHVRCHES - The Bones of What You Believe - 04 - Tether"`` against the
+    synthesized artist, album, track and title. every one of them has to agree."""
+    m = _PREFIXED_NAME.match(entry_base)
+    if not m or int(m.group("track")) != track:
+        return False
+    if _loose(m.group("title")) != _loose(title):
+        return False
+    return _loose(m.group("prefix")) == _loose(f"{artist} - {album}")
+
+
 def _resolve_via_synthesized_filename(
     path_parts: List[str], base_dirs: List[str]
 ) -> Optional[str]:
@@ -391,6 +457,11 @@ def _resolve_via_synthesized_filename(
     Conservative by design: exactly ONE file across all album folders may match,
     and the extension must be identical. Dead File Cleaner DELETES what this
     resolves, so an ambiguous guess is far worse than failing.
+
+    #1298: a library named ``Artist - Album - NN - Title`` has the numbering in
+    the middle, so stripping a leading number never lines up. when the plain
+    comparison finds nothing, a file is taken only if its artist, album, track
+    number and title all agree with the synthesized path.
     """
     if len(path_parts) < 3:
         return None
@@ -406,8 +477,11 @@ def _resolve_via_synthesized_filename(
     wanted_stem = _strip_track_number(wanted_base)
     if not wanted_stem or not wanted_ext:
         return None
+    synth = _SYNTH_NAME.match(wanted_base)
+    album_segment = path_parts[-2]
 
     matches: List[str] = []
+    prefixed: List[str] = []
     for base in base_dirs:
         artist_dir = os.path.join(base, artist_segment)
         if not os.path.isdir(artist_dir):
@@ -440,11 +514,19 @@ def _resolve_via_synthesized_filename(
                 entry_base, entry_ext = os.path.splitext(entry.name)
                 if entry_ext.lower() != wanted_ext.lower():
                     continue
-                if _strip_track_number(entry_base) != wanted_stem:
-                    continue
-                if entry.path not in matches:
-                    matches.append(entry.path)
+                if _strip_track_number(entry_base) == wanted_stem:
+                    if entry.path not in matches:
+                        matches.append(entry.path)
+                elif synth and album_segment and _prefixed_name_matches(
+                        entry_base, artist_segment, album_segment,
+                        int(synth.group("track")), synth.group("title")):
+                    if entry.path not in prefixed:
+                        prefixed.append(entry.path)
 
+    # the plain match wins outright, so a path that resolved before #1298
+    # still resolves the same way and can't turn ambiguous
+    if not matches:
+        matches = prefixed
     if not matches:
         return None
     # Same reasoning as the sibling-album step: one library reachable through

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from contextlib import AbstractContextManager
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from core.wishlist.payloads import build_failed_track_wishlist_context
 from core.wishlist.selection import filter_wishlist_tracks_by_category, sanitize_and_dedupe_wishlist_tracks
@@ -94,11 +94,32 @@ def remove_completed_tracks_from_wishlist(
                 try:
                     track_info = task.get('track_info', {})
                     context = {'track_info': track_info, 'original_search_result': track_info}
-                    remove_from_wishlist(context)
+                    # #1289: same proof the per-track callback needs. 'completed'
+                    # is a task state, not a library state — the verification
+                    # worker's no-context branch completes a task whose file
+                    # never left the downloads folder, and an atomic batch's
+                    # tasks complete while their files are still staged (those
+                    # were already settled by the publish itself).
+                    remove_from_wishlist(context, published_path=task.get('final_file_path'),
+                                         quiet_refusal=True)
                     removed_count += 1
                 except Exception as exc:
                     logger.error(f"[Wishlist Processing] Error removing completed track from wishlist: {exc}")
     return removed_count
+
+
+def _tag_wishlist_owner(tracks, profile_id) -> None:
+    """Mark each wishlist track with the profile it belongs to and the library
+    that profile fills. A run spanning several profiles dispatches each one's
+    tracks under its own profile -- which is also where its downloads land
+    (#1199): the batch's library follows its profile -- and deduplicates per
+    library, never across two of them."""
+    from core.library_scope import library_scope_for_profile, owner_for_scope
+    library = owner_for_scope(library_scope_for_profile(profile_id))
+    for track in tracks or []:
+        if isinstance(track, dict):
+            track['_wishlist_profile_id'] = profile_id
+            track['_wishlist_library'] = library
 
 
 def make_wishlist_batch_row(
@@ -162,6 +183,7 @@ def _run_wishlist_cycle(
     run_id: str,
     auto_initiated: bool,
     first_batch_id: Optional[str] = None,
+    batch_extra_fields: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """THE single wishlist orchestration engine — both the auto timer and the
     manual trigger call this, so a manual scan runs the exact same code path as
@@ -191,13 +213,13 @@ def _run_wishlist_cycle(
         if cycle == 'albums' else None
     )
 
-    extra_fields = None
+    extra_fields = dict(batch_extra_fields or {})
     if auto_initiated:
-        extra_fields = {
+        extra_fields.update({
             'auto_initiated': True,
             'auto_processing_timestamp': runtime.current_time_fn(),
             'current_cycle': cycle,
-        }
+        })
 
     # Reuse the caller-provided placeholder id for the FIRST batch created; every
     # other batch gets a fresh uuid.
@@ -298,6 +320,96 @@ def _run_wishlist_cycle(
         'album_batches': len(album_groups),
         'residual_count': residual_count,
     }
+
+
+def start_direct_track_download_batch(
+    runtime: "WishlistManualDownloadRuntime",
+    tracks: list[Dict[str, Any]],
+) -> tuple[Dict[str, Any], int]:
+    """Dispatch transient track payloads through the shared download pipeline.
+
+    Unlike ``start_manual_wishlist_download_batch`` this entry point never
+    reads from or writes to the Wishlist. It exists for an explicit scoped
+    Automatic Search, where the click is a one-shot acquisition intent rather
+    than a request to monitor the track persistently.
+    """
+    try:
+        if not tracks:
+            return {"success": False, "error": "No tracks supplied"}, 400
+
+        batch_id = str(uuid.uuid4())
+        with runtime.tasks_lock:
+            runtime.download_batches[batch_id] = make_wishlist_batch_row(
+                playlist_id="library_v2_search",
+                playlist_name="Library v2 Automatic Search",
+                track_count=0,
+                max_concurrent=runtime.get_batch_max_concurrent(),
+                profile_id=runtime.profile_id,
+                phase='analysis',
+                extra_fields={
+                    'requeue_failed_to_wishlist': False,
+                    'transient_search': True,
+                },
+            )
+
+        runtime.missing_download_executor.submit(
+            _prepare_and_run_direct_track_batch,
+            runtime,
+            batch_id,
+            list(tracks),
+        )
+        return {"success": True, "batch_id": batch_id}, 200
+    except Exception as exc:
+        runtime.logger.error(f"Error starting direct track download process: {exc}")
+        return {"success": False, "error": str(exc)}, 500
+
+
+def _prepare_and_run_direct_track_batch(
+    runtime: "WishlistManualDownloadRuntime",
+    batch_id: str,
+    tracks: list[Dict[str, Any]],
+) -> None:
+    """Background hand-off for a Wishlist-free scoped Automatic Search."""
+    try:
+        direct_tracks, duplicates = sanitize_and_dedupe_wishlist_tracks(tracks)
+        if duplicates:
+            runtime.logger.info(
+                f"[Library-v2 Search] Removed {duplicates} duplicate transient payload(s)"
+            )
+        for index, track in enumerate(direct_tracks):
+            track['_original_index'] = index
+
+        if not direct_tracks:
+            with runtime.tasks_lock:
+                batch = runtime.download_batches.get(batch_id)
+                if batch is not None:
+                    batch['phase'] = 'complete'
+                    batch['error'] = 'No tracks to search'
+            return
+
+        runtime.add_activity_item(
+            "", "Automatic Search Started", f"{len(direct_tracks)} track(s)", "Now"
+        )
+        _run_wishlist_cycle(
+            runtime,
+            playlist_id='library_v2_search',
+            cycle='singles',
+            tracks=direct_tracks,
+            run_id=str(uuid.uuid4()),
+            auto_initiated=False,
+            first_batch_id=batch_id,
+            batch_extra_fields={
+                'requeue_failed_to_wishlist': False,
+                'transient_search': True,
+            },
+        )
+    except Exception as exc:
+        runtime.logger.error(f"Error preparing direct track batch {batch_id}: {exc}")
+        with runtime.tasks_lock:
+            batch = runtime.download_batches.get(batch_id)
+            if batch is not None:
+                batch['phase'] = 'error'
+                batch['error'] = str(exc)
 
 
 def add_cancelled_tracks_to_failed_tracks(
@@ -505,7 +617,11 @@ def finalize_auto_wishlist_completion(
     behavior — the gate treats a missing run_id as "lone batch"."""
     tracks_added = completion_summary.get('tracks_added', 0)
     total_failed = completion_summary.get('total_failed', 0)
-    logger.error(
+    # INFO, not ERROR: this is the normal end of every sub-batch, and "0 added
+    # to wishlist" is the healthy case (nothing failed, so nothing to re-queue).
+    # At ERROR it fired several times per cycle and made a working wishlist run
+    # read as a string of failures.
+    logger.info(
         f"[Auto-Wishlist] Background processing complete: {tracks_added} added to wishlist, {total_failed} failed"
     )
 
@@ -516,8 +632,11 @@ def finalize_auto_wishlist_completion(
     # active, defer cycle toggle + state reset until they finish.
     with tasks_lock:
         run_id = ''
+        toggle_cycle = True
         if batch_id in download_batches:
-            run_id = download_batches[batch_id].get('wishlist_run_id') or ''
+            completing_batch = download_batches[batch_id]
+            run_id = completing_batch.get('wishlist_run_id') or ''
+            toggle_cycle = completing_batch.get('toggle_wishlist_cycle', True) is not False
         siblings_active = bool(run_id) and _wishlist_run_has_siblings_still_active(
             download_batches, run_id, batch_id,
         )
@@ -528,30 +647,33 @@ def finalize_auto_wishlist_completion(
         )
         return completion_summary
 
-    try:
-        with tasks_lock:
-            if batch_id in download_batches:
-                current_cycle = download_batches[batch_id].get('current_cycle', 'albums')
-            else:
-                current_cycle = 'albums'
+    if toggle_cycle:
+        try:
+            with tasks_lock:
+                if batch_id in download_batches:
+                    current_cycle = download_batches[batch_id].get('current_cycle', 'albums')
+                else:
+                    current_cycle = 'albums'
 
-        next_cycle = 'singles' if current_cycle == 'albums' else 'albums'
+            next_cycle = 'singles' if current_cycle == 'albums' else 'albums'
 
-        db = db_factory()
-        with db._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                    INSERT OR REPLACE INTO metadata (key, value, updated_at)
-                    VALUES ('wishlist_cycle', ?, CURRENT_TIMESTAMP)
-                """,
-                (next_cycle,),
-            )
-            conn.commit()
+            db = db_factory()
+            with db._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                        INSERT OR REPLACE INTO metadata (key, value, updated_at)
+                        VALUES ('wishlist_cycle', ?, CURRENT_TIMESTAMP)
+                    """,
+                    (next_cycle,),
+                )
+                conn.commit()
 
-        logger.info(f"[Auto-Wishlist] Cycle toggled after completion: {current_cycle} → {next_cycle}")
-    except Exception as cycle_error:
-        logger.error(f"[Auto-Wishlist] Error toggling cycle: {cycle_error}")
+            logger.info(f"[Auto-Wishlist] Cycle toggled after completion: {current_cycle} → {next_cycle}")
+        except Exception as cycle_error:
+            logger.error(f"[Auto-Wishlist] Error toggling cycle: {cycle_error}")
+    else:
+        logger.info('[Auto-Wishlist] Scoped run complete; global cycle left unchanged')
 
     reset_processing_state()
 
@@ -589,10 +711,33 @@ def remove_tracks_already_in_library(
         for t in wishlist_service.get_wishlist_tracks_for_download(profile_id=pid):
             cleanup_tracks.append((pid, t))
 
+    from core.library_scope import library_scope_for_profile, reset_library_scope, set_library_scope
+
     cleanup_removed = 0
     for profile_id, track in cleanup_tracks:
         if skip_track_fn and skip_track_fn(track):
             continue
+        # this runs as a background job, so "already in the library" has to be
+        # asked through the wishlist owner's library, not the job's (#1199): an
+        # own-library profile's wishlist entry is not cleared by the admin
+        # owning the track
+        _scope_token = set_library_scope(library_scope_for_profile(profile_id))
+        try:
+            removed_here = _cleanup_one(
+                wishlist_service, music_database, _mlm, profile_id, track, active_server,
+                logger=logger, log_prefix=log_prefix)
+        finally:
+            reset_library_scope(_scope_token)
+        cleanup_removed += removed_here
+    return cleanup_removed
+
+
+def _cleanup_one(wishlist_service, music_database, _mlm, profile_id, track, active_server, *, logger, log_prefix) -> int:
+    """one wishlist entry: 1 when it was removed as already owned, else 0.
+    the loop body of remove_tracks_already_in_library, lifted so it runs
+    inside that profile's library scope."""
+    cleanup_removed = 0
+    if True:
 
         track_name = track.get('name', '')
         artists = track.get('artists', [])
@@ -600,51 +745,42 @@ def remove_tracks_already_in_library(
         track_album = track.get('album', {}).get('name') if isinstance(track.get('album'), dict) else track.get('album')
 
         if not track_name or not artists or not spotify_track_id:
-            continue
+            return 0
 
         # Manual match check — skip fuzzy search if user already linked this track.
-        if _mlm.get_match_for_track(music_database, profile_id, track, default_source='wishlist'):
+        manual_match = _mlm.get_match_for_track(music_database, profile_id, track, default_source='wishlist')
+        if manual_match and _mlm.match_is_live(music_database, manual_match):
             try:
-                removed = wishlist_service.mark_track_download_result(spotify_track_id, success=True)
+                from core.wishlist.removal_guard import REASON_MANUAL_MATCH
+                removed = wishlist_service.mark_track_download_result(
+                    spotify_track_id, success=True, profile_id=profile_id,
+                    profile_ids=[profile_id],
+                    audit={'reason': REASON_MANUAL_MATCH})
                 if removed:
                     cleanup_removed += 1
                     logger.info(f"{log_prefix} [Manual Match] Skipped already-matched track: '{track_name}'")
             except Exception as _mlm_err:
                 logger.error(f"{log_prefix} [Manual Match] Error removing track: {_mlm_err}")
-            continue
+            return cleanup_removed
 
-        found_in_db = False
-        matched_artist_name = ''
-        for artist in artists:
-            if isinstance(artist, str):
-                artist_name = artist
-            elif isinstance(artist, dict) and 'name' in artist:
-                artist_name = artist['name']
-            else:
-                artist_name = str(artist)
+        from core.wishlist.library_match import find_owned_match
+        from core.wishlist.removal_guard import REASON_ALREADY_OWNED
 
+        match = find_owned_match(
+            music_database, track_name, artists, track_album, active_server,
+            log=logger, log_prefix=log_prefix)
+
+        if match:
+            db_track, confidence, matched_artist_name = match
             try:
-                db_track, confidence = music_database.check_track_exists(
-                    track_name,
-                    artist_name,
-                    confidence_threshold=0.7,
-                    server_source=active_server,
-                    album=track_album,
-                )
-
-                if db_track and confidence >= 0.7:
-                    found_in_db = True
-                    matched_artist_name = artist_name
-                    break
-            except Exception:
-                continue
-
-        if found_in_db:
-            try:
-                removed = wishlist_service.mark_track_download_result(spotify_track_id, success=True)
+                removed = wishlist_service.mark_track_download_result(
+                    spotify_track_id, success=True, profile_id=profile_id,
+                    profile_ids=[profile_id],
+                    audit={'reason': REASON_ALREADY_OWNED,
+                           'final_path': getattr(db_track, 'file_path', '') or ''})
                 if removed:
                     cleanup_removed += 1
-                    logger.info(f"{log_prefix} Removed already-owned track: '{track_name}' by {matched_artist_name or artist_name}")
+                    logger.info(f"{log_prefix} Removed already-owned track: '{track_name}' by {matched_artist_name}")
             except Exception as remove_error:
                 logger.error(f"{log_prefix} Error removing track from wishlist: {remove_error}")
 
@@ -885,11 +1021,96 @@ def cleanup_wishlist_against_library(
         return {"success": False, "error": str(e)}, 500
 
 
-def process_wishlist_automatically(runtime: WishlistAutoProcessingRuntime, automation_id=None,
-                                   apply_backoff=None):
-    """Run automatic wishlist processing outside the controller."""
+def _bare_scope_track_id(value: Any) -> str:
+    return str(value or '').split('::', 1)[0].strip()
+
+
+def _normalize_track_scope(track_ids: Iterable[Any]) -> set[str]:
+    return {
+        normalized
+        for value in track_ids
+        if (normalized := str(value or '').strip())
+    }
+
+
+def _track_scope_identities(track: Dict[str, Any]) -> set[str]:
+    nested = track.get('track_data') or track.get('spotify_data') or {}
+    if not isinstance(nested, dict):
+        nested = {}
+    candidates = {
+        str(value).strip()
+        for value in (
+        track.get('track_id'),
+        track.get('spotify_track_id'),
+        track.get('id'),
+        nested.get('id'),
+        )
+        if value
+    }
+    album = nested.get('album') if isinstance(nested, dict) else None
+    album_id = album.get('id') if isinstance(album, dict) else None
+    if album_id:
+        candidates.update(
+            f'{_bare_scope_track_id(value)}::{album_id}'
+            for value in tuple(candidates)
+            if _bare_scope_track_id(value)
+        )
+    return candidates
+
+
+def _tracks_in_scope(
+    tracks: Iterable[Dict[str, Any]], track_ids: set[str]
+) -> List[Dict[str, Any]]:
+    """Resolve composite scope exactly; accept legacy bare ids only uniquely."""
+    rows = list(tracks)
+    identities = [_track_scope_identities(track) for track in rows]
+    exact = {value for value in track_ids if '::' in value}
+    bare = {value for value in track_ids if '::' not in value}
+    bare_matches: Dict[str, List[int]] = {value: [] for value in bare}
+    for index, row_ids in enumerate(identities):
+        row_bases = {_bare_scope_track_id(value) for value in row_ids}
+        for value in bare & row_bases:
+            bare_matches[value].append(index)
+    unique_indexes = {
+        indexes[0] for indexes in bare_matches.values() if len(indexes) == 1
+    }
+    return [
+        track
+        for index, (track, row_ids) in enumerate(zip(rows, identities, strict=True))
+        if row_ids & exact or index in unique_indexes
+    ]
+
+
+def process_wishlist_automatically(
+    runtime: WishlistAutoProcessingRuntime,
+    automation_id=None,
+    *,
+    apply_backoff=None,
+    track_ids: Optional[Iterable[str]] = None,
+    profile_ids: Optional[Iterable[int]] = None,
+):
+    """Run automatic Wishlist processing, optionally within an exact scope.
+
+    ``track_ids`` is used by a single-playlist Pipeline run. In that mode the
+    processor reads and dispatches only matching Wishlist rows, skips global
+    duplicate cleanup, processes every category, and leaves the timer's global
+    album/single cycle untouched.
+
+    ``apply_backoff`` gates the progressive retry-backoff filter below; unset,
+    it defaults to on for scheduled runs (``automation_id`` present, including
+    a playlist scope) and off for the manual "Process Wishlist Now" trigger.
+    """
     logger = runtime.logger
-    logger.info("[Auto-Wishlist] Timer triggered - starting automatic wishlist processing...")
+    scoped = track_ids is not None
+    requested_track_ids = _normalize_track_scope(track_ids or ())
+    requested_profile_ids = {
+        int(profile_id) for profile_id in (profile_ids or ())
+        if str(profile_id).strip().lstrip('-').isdigit()
+    }
+    log_source = 'Playlist scope' if scoped else 'Timer'
+    logger.info(
+        f"[Auto-Wishlist] {log_source} triggered - starting automatic wishlist processing..."
+    )
 
     try:
         # CRITICAL FIX: Use smart stuck detection BEFORE acquiring lock
@@ -909,7 +1130,38 @@ def process_wishlist_automatically(runtime: WishlistAutoProcessingRuntime, autom
                 # Check if wishlist has tracks across all profiles
                 database = runtime.get_profiles_database()
                 all_profiles = database.get_all_profiles()
-                count = sum(wishlist_service.get_wishlist_count(profile_id=p['id']) for p in all_profiles)
+                if scoped:
+                    scoped_profile_ids = requested_profile_ids or {int(runtime.profile_id)}
+                    all_profiles = [
+                        profile for profile in all_profiles
+                        if int(profile['id']) in scoped_profile_ids
+                    ]
+                    if len(scoped_profile_ids) == 1:
+                        runtime.profile_id = next(iter(scoped_profile_ids))
+
+                raw_wishlist_tracks = []
+                if scoped:
+                    if not requested_track_ids or not all_profiles:
+                        logger.info('[Auto-Wishlist] Empty playlist scope; nothing to process')
+                        return
+                    for profile in all_profiles:
+                        profile_tracks = wishlist_service.get_wishlist_tracks_for_download(
+                            profile_id=profile['id']
+                        )
+                        # A6: remembered so a multi-profile playlist scope
+                        # can dispatch each profile's tracks under its own
+                        # profile_id instead of collapsing everything onto
+                        # whatever runtime.profile_id happens to be set to.
+                        _tag_wishlist_owner(profile_tracks, profile['id'])
+                        raw_wishlist_tracks.extend(
+                            _tracks_in_scope(profile_tracks, requested_track_ids)
+                        )
+                    count = len(raw_wishlist_tracks)
+                else:
+                    count = sum(
+                        wishlist_service.get_wishlist_count(profile_id=p['id'])
+                        for p in all_profiles
+                    )
                 logger.info(f"[Auto-Wishlist] Wishlist count check: {count} tracks found across {len(all_profiles)} profiles")
                 runtime.update_automation_progress(automation_id, progress=10, phase='Checking wishlist',
                                                    log_line=f'{count} tracks across {len(all_profiles)} profiles', log_type='info')
@@ -919,26 +1171,31 @@ def process_wishlist_automatically(runtime: WishlistAutoProcessingRuntime, autom
 
                 logger.info(f"[Auto-Wishlist] Found {count} tracks in wishlist, starting automatic processing...")
 
-                # Check if wishlist processing is already active (auto or manual)
+                # Age alone does not prove a download is dead. The batch healer
+                # owns recovery using task/worker state; keep blocking while the
+                # batch is non-terminal, including slow downloads and held queues.
                 playlist_id = "wishlist"
                 with runtime.tasks_lock:
                     for _batch_id, batch_data in runtime.download_batches.items():
                         batch_playlist_id = batch_data.get('playlist_id')
-                        # Check for both auto ('wishlist') and manual ('wishlist_manual') batches
                         if (batch_playlist_id in ['wishlist', 'wishlist_manual'] and
-                            batch_data.get('phase') not in ['complete', 'error', 'cancelled']):
-                            logger.info(f"Wishlist processing already active in another batch ({batch_playlist_id}), skipping automatic start")
+                                batch_data.get('phase') not in ['complete', 'error', 'cancelled', 'failed']):
+                            logger.info(
+                                f"Wishlist processing already active in another batch "
+                                f"({batch_playlist_id}), skipping automatic start"
+                            )
                             return
 
                 # CRITICAL: Clean duplicates BEFORE fetching tracks to prevent count mismatches
                 # This prevents the "11 tracks shown but 12 counted" bug
                 music_database = runtime.get_music_database()
 
-                logger.warning("[Auto-Wishlist] Cleaning duplicate tracks before processing...")
-                for profile in all_profiles:
-                    duplicates_removed = music_database.remove_wishlist_duplicates(profile_id=profile['id'])
-                    if duplicates_removed > 0:
-                        logger.warning(f"[Auto-Wishlist] Removed {duplicates_removed} duplicate tracks from profile {profile['id']}")
+                if not scoped:
+                    logger.warning("[Auto-Wishlist] Cleaning duplicate tracks before processing...")
+                    for profile in all_profiles:
+                        duplicates_removed = music_database.remove_wishlist_duplicates(profile_id=profile['id'])
+                        if duplicates_removed > 0:
+                            logger.warning(f"[Auto-Wishlist] Removed {duplicates_removed} duplicate tracks from profile {profile['id']}")
 
                 # NOTE: We deliberately do NOT call remove_tracks_already_in_library here.
                 # The batch sets force_download_all=True (see comment a few lines below),
@@ -953,9 +1210,12 @@ def process_wishlist_automatically(runtime: WishlistAutoProcessingRuntime, autom
                                                    log_type='info')
 
                 # Get wishlist tracks for processing - combine all profiles
-                raw_wishlist_tracks = []
-                for profile in all_profiles:
-                    raw_wishlist_tracks.extend(wishlist_service.get_wishlist_tracks_for_download(profile_id=profile['id']))
+                if not scoped:
+                    raw_wishlist_tracks = []
+                    for profile in all_profiles:
+                        profile_tracks = wishlist_service.get_wishlist_tracks_for_download(profile_id=profile['id'])
+                        _tag_wishlist_owner(profile_tracks, profile['id'])
+                        raw_wishlist_tracks.extend(profile_tracks)
                 if not raw_wishlist_tracks:
                     logger.warning("No tracks returned from wishlist service.")
                     return
@@ -983,7 +1243,9 @@ def process_wishlist_automatically(runtime: WishlistAutoProcessingRuntime, autom
                 # manual "Process Wishlist Now" button retries everything (the
                 # click is the override, like Sonarr's manual search). Callers
                 # may state intent via apply_backoff; otherwise a present
-                # automation_id marks the run as scheduled.
+                # automation_id marks the run as scheduled — including a
+                # playlist-scoped Pipeline trigger, which is scheduled work
+                # too, not a manual override.
                 _backoff = apply_backoff if apply_backoff is not None else (automation_id is not None)
                 # "The user asked for this run" — the same condition that skips
                 # backoff. Named because the empty-category branch below needs it too.
@@ -1029,11 +1291,16 @@ def process_wishlist_automatically(runtime: WishlistAutoProcessingRuntime, autom
                                 f'cooldown — retried later automatically'),
                             log_type='info')
 
-                # CYCLE FILTERING: Get current cycle and filter tracks by category
-                current_cycle = get_wishlist_cycle(lambda: music_database)
-
-                # Filter tracks by current cycle category
-                filtered_tracks, _ = filter_wishlist_tracks_by_category(wishlist_tracks, current_cycle)
+                # A playlist run must cover every one of its tracks in this
+                # invocation. The timer retains its alternating category cycle.
+                current_cycle = 'playlist' if scoped else get_wishlist_cycle(
+                    lambda: music_database
+                )
+                filtered_tracks = wishlist_tracks
+                if not scoped:
+                    filtered_tracks, _ = filter_wishlist_tracks_by_category(
+                        wishlist_tracks, current_cycle
+                    )
 
                 logger.info(f"[Auto-Wishlist] Current cycle: {current_cycle}")
                 logger.info(f"[Auto-Wishlist] Filtered {len(filtered_tracks)}/{len(wishlist_tracks)} tracks for '{current_cycle}' category")
@@ -1041,7 +1308,7 @@ def process_wishlist_automatically(runtime: WishlistAutoProcessingRuntime, autom
                                                    log_line=f'Cycle: {current_cycle} — {len(filtered_tracks)} tracks to process', log_type='info')
 
                 # If no tracks in this category, skip to next cycle immediately
-                if len(filtered_tracks) == 0:
+                if len(filtered_tracks) == 0 and not scoped:
                     next_cycle = 'singles' if current_cycle == 'albums' else 'albums'
 
                     # A SCHEDULED run can afford to wait for its next tick, but
@@ -1078,14 +1345,58 @@ def process_wishlist_automatically(runtime: WishlistAutoProcessingRuntime, autom
                 # once-per-run cycle toggle on it) and hand off to the SHARED
                 # wishlist engine — the same code path the manual trigger uses.
                 wishlist_run_id = str(uuid.uuid4())
-                _cycle_result = _run_wishlist_cycle(
-                    runtime,
-                    playlist_id=playlist_id,
-                    cycle=current_cycle,
-                    tracks=wishlist_tracks,
-                    run_id=wishlist_run_id,
-                    auto_initiated=True,
-                )
+                _track_profiles = {
+                    int(t.get('_wishlist_profile_id') or runtime.profile_id) for t in wishlist_tracks
+                }
+                _cycle_extra = {
+                    'wishlist_scope': 'playlist',
+                    'toggle_wishlist_cycle': False,
+                } if scoped else None
+                _runtime_profile = runtime.profile_id
+                if len(_track_profiles) == 1:
+                    # one profile's tracks: dispatched under THAT profile, which
+                    # is also the library they land in (#1199) -- not under
+                    # whichever profile the runtime was built for
+                    runtime.profile_id = next(iter(_track_profiles))
+                if len(_track_profiles) > 1:
+                    # A6: tracks in this playlist scope span more than one
+                    # wishlist profile. _run_wishlist_cycle stamps every batch
+                    # it creates with the single runtime.profile_id in effect
+                    # at call time, so each profile's tracks get their own
+                    # cycle run (own batches, own profile_id, own quality
+                    # settings) instead of merging into one dispatch that
+                    # would land entirely under whichever profile
+                    # runtime.profile_id last happened to be.
+                    grouped_by_profile: Dict[int, list] = {}
+                    for track in wishlist_tracks:
+                        group_id = int(track.get('_wishlist_profile_id') or runtime.profile_id)
+                        grouped_by_profile.setdefault(group_id, []).append(track)
+                    _cycle_result = {'submitted': [], 'album_batches': 0, 'residual_count': 0}
+                    for group_profile_id, group_tracks in grouped_by_profile.items():
+                        runtime.profile_id = group_profile_id
+                        group_result = _run_wishlist_cycle(
+                            runtime,
+                            playlist_id=playlist_id,
+                            cycle=current_cycle,
+                            tracks=group_tracks,
+                            run_id=wishlist_run_id,
+                            auto_initiated=True,
+                            batch_extra_fields=_cycle_extra,
+                        )
+                        _cycle_result['submitted'].extend(group_result['submitted'])
+                        _cycle_result['album_batches'] += group_result['album_batches']
+                        _cycle_result['residual_count'] += group_result['residual_count']
+                else:
+                    _cycle_result = _run_wishlist_cycle(
+                        runtime,
+                        playlist_id=playlist_id,
+                        cycle=current_cycle,
+                        tracks=wishlist_tracks,
+                        run_id=wishlist_run_id,
+                        auto_initiated=True,
+                        batch_extra_fields=_cycle_extra,
+                    )
+                runtime.profile_id = _runtime_profile
 
                 _summary_parts: list[str] = []
                 if _cycle_result['album_batches']:
@@ -1210,6 +1521,7 @@ __all__ = [
     "WishlistAutoProcessingRuntime",
     "WishlistManualDownloadRuntime",
     "process_wishlist_automatically",
+    "start_direct_track_download_batch",
     "start_manual_wishlist_download_batch",
     "cleanup_wishlist_against_library",
     "remove_tracks_already_in_library",

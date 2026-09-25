@@ -159,12 +159,78 @@ class TestDatabaseUpdate:
         assert result['status'] == 'completed'
 
 
+    def test_auto_start_database_update_resets_last_progress_at_heartbeat(self):
+        # A stale last_progress_at from the prior hour must be updated
+        # to now upon launch so the watchdog does not falsely declare
+        # a stall at second 0 (#859).
+        import time
+        from core.database_update_health import is_db_update_stalled
+
+        old_epoch = time.time() - 3600
+        state = {'status': 'idle', 'last_progress_at': old_epoch}
+        executor = _StubExecutor()
+
+        def fake_task(*_a, **_k):
+            # Check state while the task is supposedly running
+            assert state['status'] == 'running'
+            assert state['last_progress_at'] > old_epoch
+            assert abs(state['last_progress_at'] - time.time()) < 5.0
+            assert is_db_update_stalled(state, time.time()) is False
+            state['status'] = 'finished'
+
+        executor.submit = lambda fn, *a, **k: fake_task()
+        deps = _build_deps(
+            get_db_update_state=lambda: state,
+            db_update_executor=executor,
+            run_db_update_task=fake_task,
+        )
+        import core.automation.handlers.database_update as module
+        original = module.time.sleep
+        module.time.sleep = lambda _: None
+        try:
+            result = auto_start_database_update({'_automation_id': 'auto-hb'}, deps)
+        finally:
+            module.time.sleep = original
+        assert result['status'] == 'completed'
+        assert state['last_progress_at'] > old_epoch
+
+
 class TestDeepScan:
     def test_already_running_returns_skipped(self):
         state = {'status': 'running'}
         deps = _build_deps(get_db_update_state=lambda: state)
         result = auto_deep_scan_library({}, deps)
         assert result == {'status': 'skipped', 'reason': 'Database update already running'}
+
+    def test_auto_deep_scan_resets_last_progress_at_heartbeat(self):
+        import time
+        from core.database_update_health import is_db_update_stalled
+
+        old_epoch = time.time() - 3600
+        state = {'status': 'idle', 'last_progress_at': old_epoch}
+        executor = _StubExecutor()
+
+        def fake_task(*_a, **_k):
+            assert state['status'] == 'running'
+            assert state['last_progress_at'] > old_epoch
+            assert is_db_update_stalled(state, time.time()) is False
+            state['status'] = 'finished'
+
+        executor.submit = lambda fn, *a, **k: fake_task()
+        deps = _build_deps(
+            get_db_update_state=lambda: state,
+            db_update_executor=executor,
+            run_deep_scan_task=fake_task,
+        )
+        import core.automation.handlers.database_update as module
+        original = module.time.sleep
+        module.time.sleep = lambda _: None
+        try:
+            result = auto_deep_scan_library({'_automation_id': 'auto-deep-hb'}, deps)
+        finally:
+            module.time.sleep = original
+        assert result['status'] == 'completed'
+        assert state['last_progress_at'] > old_epoch
 
 
 # ─── duplicate_cleaner ────────────────────────────────────────────────
@@ -182,16 +248,31 @@ class TestDuplicateCleaner:
 
 
 class TestQualityScanner:
-    def test_triggers_quality_upgrade_repair_job(self):
+    def test_triggers_the_job_that_now_owns_the_outcome(self):
+        """There is no quality-scan job left to trigger.
+
+        Queueing an upgrade candidate is what the wanted projection does
+        continuously; `monitoring_list_reconcile` mirrors the result. A saved
+        automation keeps its action name and now runs the job that actually
+        produces the outcome it was written for, instead of erroring on a job
+        that no longer exists.
+        """
         triggered = []
-        deps = _build_deps(run_repair_job_now=lambda job_id, **kw: triggered.append(job_id) or True)
+        deps = _build_deps(
+            run_repair_job_now=lambda job_id, **kwargs: triggered.append(
+                (job_id, kwargs.get('scope'))
+            ) or True
+        )
         result = auto_start_quality_scan({}, deps)
-        assert triggered == ['quality_upgrade']
+        assert triggered == [(
+            'monitoring_list_reconcile',
+            {'compatibility_source': 'start_quality_scan'},
+        )]
         assert result['status'] == 'completed'
         assert result['triggered'] is True
 
     def test_error_when_worker_unavailable(self):
-        deps = _build_deps(run_repair_job_now=lambda job_id, **kw: None)
+        deps = _build_deps(run_repair_job_now=lambda job_id, **kwargs: None)
         result = auto_start_quality_scan({}, deps)
         assert result['status'] == 'skipped'
 
@@ -205,7 +286,11 @@ class TestQualityScanner:
             return True
 
         auto_start_quality_scan({}, _build_deps(run_repair_job_now=_run))
-        assert seen == {'job': 'quality_upgrade', 'respect_enabled': True}
+        assert seen == {
+            'job': 'monitoring_list_reconcile',
+            'scope': {'compatibility_source': 'start_quality_scan'},
+            'respect_enabled': True,
+        }
 
     def test_a_disabled_job_reads_as_skipped_not_failed(self):
         """Turning a job off is a choice, not a fault. #1192 already taught us
@@ -417,3 +502,45 @@ class TestSearchAndDownload:
         result = auto_search_and_download({'query': 'xyz'}, deps)
         assert result['status'] == 'not_found'
         assert result['query'] == 'xyz'
+
+
+# ─── full_cleanup: the quarantine step ────────────────────────────────
+
+
+class TestFullCleanupQuarantineStep:
+    """full_cleanup carried its own copy of the quarantine walk; it now calls
+    core.library.cleanup like the route and clear_quarantine do. Pinned end
+    to end, the other steps stubbed to no-ops."""
+
+    def _deps(self, tmp_path):
+        from core.automation.handlers.download_cleanup import auto_full_cleanup
+        lines: List[Dict[str, Any]] = []
+        deps = _build_deps(
+            config_manager=_StubConfig({'soulseek.download_path': str(tmp_path),
+                                        'soulseek.auto_clear_searches': False}),
+            update_progress=lambda automation_id, **kw: lines.append(kw),
+            get_staging_path=lambda: str(tmp_path / 'no-staging'),
+        )
+        return auto_full_cleanup, deps, lines
+
+    def test_clears_the_quarantine_and_reports_the_count(self, tmp_path, monkeypatch):
+        from core.downloads import cleanup as dl_cleanup
+        monkeypatch.setattr(dl_cleanup, 'sweep_orphaned_download_audio', lambda *a, **k: [])
+        q = tmp_path / 'ss_quarantine'
+        q.mkdir()
+        (q / 'a.flac').write_bytes(b'')
+        (q / 'album').mkdir()
+        run, deps, lines = self._deps(tmp_path)
+        result = run({}, deps)
+        assert result['status'] == 'completed'
+        assert result['quarantine_removed'] == '2'
+        assert os.listdir(q) == []
+        assert {'log_line': 'Quarantine: removed 2 items', 'log_type': 'success'} in lines
+
+    def test_a_missing_quarantine_is_zero(self, tmp_path, monkeypatch):
+        from core.downloads import cleanup as dl_cleanup
+        monkeypatch.setattr(dl_cleanup, 'sweep_orphaned_download_audio', lambda *a, **k: [])
+        run, deps, lines = self._deps(tmp_path)
+        result = run({}, deps)
+        assert result['quarantine_removed'] == '0'
+        assert {'log_line': 'Quarantine: removed 0 items', 'log_type': 'info'} in lines

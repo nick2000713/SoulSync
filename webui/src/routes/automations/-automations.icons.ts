@@ -6,6 +6,10 @@
  * variation selectors (the U+FE0F suffixes below).
  */
 export const AUTOMATION_ICONS: Record<string, string> = {
+  audiobook_process_wishlist: '\uD83D\uDCDA',
+  audiobook_scan_watchlist: '\u270D\uFE0F',
+  audiobook_scan_library: '\uD83C\uDFA7',
+  audiobook_purge_recycle: '\uD83D\uDDD1\uFE0F',
   schedule: '⏱️',
   daily_time: '🕰️',
   weekly_time: '📅',
@@ -17,6 +21,7 @@ export const AUTOMATION_ICONS: Record<string, string> = {
   playlist_changed: '✏️',
   process_wishlist: '📋',
   scan_watchlist: '👁️',
+  scan_watchlist_podcasts: '🎙️',
   scan_library: '🔄',
   refresh_mirrored: '📂',
   sync_playlist: '🔁',
@@ -24,6 +29,8 @@ export const AUTOMATION_ICONS: Record<string, string> = {
   discovery_completed: '🔍',
   notify_only: '🔔',
   discord_webhook: '💬',
+  ntfy: '📡',
+  gotify: '📬',
   pushbullet: '🔔',
   telegram: '✉️',
   webhook: '🌐',
@@ -39,6 +46,7 @@ export const AUTOMATION_ICONS: Record<string, string> = {
   watchlist_artist_added: '👤',
   watchlist_artist_removed: '👤',
   import_completed: '📥',
+  import_needs_attention: '📥',
   mirrored_playlist_created: '📂',
   quality_scan_completed: '📊',
   duplicate_scan_completed: '🗂️',
@@ -47,6 +55,7 @@ export const AUTOMATION_ICONS: Record<string, string> = {
   start_database_update_hourly: '🗄️',
   run_duplicate_cleaner: '🗂️',
   clear_quarantine: '🗑️',
+  library_cleanup: '🗑️',
   cleanup_wishlist: '🧹',
   update_discovery_pool: '🧭',
   start_quality_scan: '📊',
@@ -115,6 +124,8 @@ export function automationIcon(type: string | null | undefined): string {
 /** Notification/then-action label. Two carry their own icon inline. */
 export function formatNotify(type: string | null | undefined): string {
   if (type === 'discord_webhook') return 'Discord';
+  if (type === 'ntfy') return 'ntfy';
+  if (type === 'gotify') return 'Gotify';
   if (type === 'pushbullet') return 'Pushbullet';
   if (type === 'telegram') return 'Telegram';
   if (type === 'webhook') return 'Webhook';

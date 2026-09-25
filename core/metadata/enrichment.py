@@ -146,6 +146,7 @@ def enhance_file_metadata(file_path: str, context: dict, artist: dict, album_inf
             disc_num_str = str(_disc_num)
             write_multi = cfg.get("metadata_enhancement.tags.write_multi_artist", False)
             artists_list = metadata.get("_artists_list", [])
+            album_artists_list = metadata.get("_album_artists_list", [])
 
             if isinstance(audio_file.tags, symbols.ID3):
                 if metadata.get("title"):
@@ -168,6 +169,12 @@ def enhance_file_metadata(file_path: str, context: dict, artist: dict, album_inf
                         )
                 if metadata.get("album_artist"):
                     audio_file.tags.add(symbols.TPE2(encoding=3, text=[metadata["album_artist"]]))
+                    # same idea for albums: TPE2 stays the display string, the
+                    # list goes where navidrome looks (txxx:album artists)
+                    if write_multi and len(album_artists_list) > 1:
+                        audio_file.tags.add(
+                            symbols.TXXX(encoding=3, desc='Album Artists', text=list(album_artists_list))
+                        )
                 if metadata.get("album"):
                     audio_file.tags.add(symbols.TALB(encoding=3, text=[metadata["album"]]))
                 if metadata.get("date"):
@@ -185,6 +192,8 @@ def enhance_file_metadata(file_path: str, context: dict, artist: dict, album_inf
                         audio_file["artists"] = artists_list
                 if metadata.get("album_artist"):
                     audio_file["albumartist"] = [metadata["album_artist"]]
+                    if write_multi and len(album_artists_list) > 1:
+                        audio_file["albumartists"] = list(album_artists_list)
                 if metadata.get("album"):
                     audio_file["album"] = [metadata["album"]]
                 if metadata.get("date"):
@@ -219,7 +228,16 @@ def enhance_file_metadata(file_path: str, context: dict, artist: dict, album_inf
                 )]
                 audio_file["disk"] = [(_disc_num, 0)]
 
-            embed_source_ids(audio_file, metadata, context, runtime=runtime)
+            from core.metadata.manual import is_manual_context, manual_cover_path, write_manual_marker
+            if is_manual_context(context):
+                # the user typed this release in. no name-based id lookups:
+                # they'd embed a studio release's ids and replace the user's
+                # date with a musicbrainz one
+                metadata['_manual'] = True
+                metadata['_manual_cover_path'] = manual_cover_path(context)
+                write_manual_marker(audio_file, symbols)
+            else:
+                embed_source_ids(audio_file, metadata, context, runtime=runtime)
 
             if album_info is not None and metadata.get("musicbrainz_release_id"):
                 album_info["musicbrainz_release_id"] = metadata["musicbrainz_release_id"]

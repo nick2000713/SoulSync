@@ -11,8 +11,10 @@ from __future__ import annotations
 import types
 
 
-# A query-aware fake DB: owned-albums query → owned titles; the source_id_conflict
-# query (SELECT name FROM artists ...) → no conflict.
+# A query-aware fake DB: owned-albums query → owned titles; the id-conflict query
+# → no conflict. Both table names are served because the workers are being moved to
+# Library v2 one at a time (docs §32.3.1 stage 2) — Spotify/iTunes/MusicBrainz read
+# `lib2_albums` now, Deezer still reads `albums`.
 class _Cur:
     def __init__(self, rows):
         self._rows = rows
@@ -32,7 +34,7 @@ class _Conn:
         return False
 
     def execute(self, sql, params=()):
-        if 'FROM albums' in sql:
+        if 'FROM albums' in sql or 'FROM lib2_albums' in sql:
             return _Cur([(t,) for t in self._owned])
         return _Cur([])  # conflict check → none
 
@@ -132,11 +134,11 @@ def _mb_service(owned_release_groups):
     s._save_to_cache = lambda *a, **k: None
     s._calculate_similarity = lambda a, b: 1.0
     s.mb_client = types.SimpleNamespace(
-        search_artist=lambda name, limit=5: [
+        search_artist=lambda name, limit=5, strict=True, raise_on_error=False: [
             {'id': 'wrong_mbid', 'name': 'Rone', 'score': 100},  # ranked first
             {'id': 'right_mbid', 'name': 'Rone', 'score': 90},
         ],
-        get_artist=lambda mbid, includes=None: owned_release_groups.get(mbid),
+        get_artist=lambda mbid, includes=None, raise_on_error=False: owned_release_groups.get(mbid),
     )
     return s
 

@@ -19,7 +19,7 @@ from core.musicbrainz_client import MusicBrainzClient
 def client(monkeypatch):
     import core.musicbrainz_client as mbc
     # no rate-limit sleeping in a unit test
-    monkeypatch.setattr(mbc, '_wait_for_musicbrainz_slot', lambda: None)
+    monkeypatch.setattr(mbc, '_wait_for_musicbrainz_slot', lambda *args: None)
     c = MusicBrainzClient()
 
     def _boom(path, *, params=None):
@@ -45,3 +45,24 @@ def test_get_artist_fail_soft_by_default(client):
 def test_get_artist_raises_when_asked(client):
     with pytest.raises(requests.Timeout):
         client.get_artist("mbid-x", includes=['aliases'], raise_on_error=True)
+
+
+# --- p5-mb-busy-negcache: search_recording / search_release gain the same seam ---
+
+
+def test_search_recording_fail_soft_by_default(client):
+    assert client.search_recording("Song Title", "Some Artist") == []
+
+
+def test_search_recording_raises_when_asked(client):
+    with pytest.raises(requests.Timeout):
+        client.search_recording("Song Title", "Some Artist", raise_on_error=True)
+
+
+def test_search_release_fail_soft_by_default(client):
+    assert client.search_release("Album Title", "Some Artist") == []
+
+
+def test_search_release_raises_when_asked(client):
+    with pytest.raises(requests.Timeout):
+        client.search_release("Album Title", "Some Artist", raise_on_error=True)

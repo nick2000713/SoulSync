@@ -774,6 +774,7 @@ function initializeWebSocket() {
     }
 
     socket = io({
+        path: window.SoulSyncURL?.resolve('/socket.io') || '/socket.io',
         // Polling-first (Socket.IO default) then upgrade — most compatible behind
         // reverse proxies that don't cleanly forward WebSocket upgrade headers
         // (common in self-hosted setups). websocket-first shaves connect time when
@@ -972,6 +973,10 @@ function initializeWebSocket() {
     socket.on('lastfm:import-progress', (data) => {
         window.dispatchEvent(new CustomEvent('ss:lastfm-import-progress', { detail: data }));
         if (typeof updateLastfmListeningImportTask === 'function') updateLastfmListeningImportTask(data);
+    });
+    socket.on('listenbrainz:import-progress', (data) => {
+        window.dispatchEvent(new CustomEvent('ss:listenbrainz-import-progress', { detail: data }));
+        if (typeof updateListenbrainzListeningImportTask === 'function') updateListenbrainzListeningImportTask(data);
     });
     // Phase 6: Automation progress
     socket.on('automation:progress', (data) => {

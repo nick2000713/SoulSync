@@ -1,9 +1,11 @@
 import os
+import math
+import re
 import requests
 import time
 import threading
 from typing import Dict, List, Optional, Any
-from functools import wraps
+from urllib.parse import urlsplit, urlunsplit
 from utils.logging_config import get_logger
 
 logger = get_logger("musicbrainz_client")
@@ -21,6 +23,12 @@ def _escape_lucene(text: str) -> str:
     return ''.join('\\' + ch if ch in _LUCENE_SPECIAL else ch for ch in text)
 
 
+# ISRC (International Standard Recording Code): 2-letter country + 3-char
+# registrant + 2-digit year + 5-digit designation = 12 alphanumeric characters,
+# conventionally written upper-case (sometimes with hyphens, which we strip).
+_ISRC_RE = re.compile(r'^[A-Z0-9]{12}$')
+
+
 # Global rate limiting variables
 _last_api_call_time = 0
 _api_call_lock = threading.Lock()
@@ -29,6 +37,42 @@ DEFAULT_READ_TIMEOUT = 30.0
 DEFAULT_CONNECT_TIMEOUT = 5.0
 DEFAULT_MAX_RETRIES = 2
 TRANSIENT_STATUS_CODES = {429, 503, 504}
+
+# Keys a genuine search/browse payload carries. Used to tell a real (if empty)
+# result apart from the 200-status "server busy" body below — see
+# `_looks_like_busy_body`.
+_MB_COLLECTION_KEYS = frozenset({'artists', 'releases', 'recordings', 'release-groups', 'labels'})
+
+
+class MusicBrainzBusyError(RuntimeError):
+    """MusicBrainz answered 200 OK with an overload message instead of data.
+
+    Under load MusicBrainz sometimes reports `{"error": "The MusicBrainz web
+    server is currently busy. Please try again later."}` at HTTP 200 rather
+    than a 503 — `raise_for_status()` never fires, so every caller's
+    `data.get('recordings', [])` (etc.) silently returns `[]`, indistinguishable
+    from a genuine "no results". `_is_transient_musicbrainz_error` recognises
+    this type so it is retried/backed-off exactly like a real 503.
+    """
+
+
+def _looks_like_busy_body(data: Any) -> bool:
+    """True when a parsed JSON body is MusicBrainz's 200-status busy message.
+
+    An `error` key with none of the collection keys a real search/browse
+    response carries — a legitimate empty result (e.g. `{"recordings": []}`)
+    has no `error` key at all, so it is never mistaken for this. The message
+    must also actually say the server is busy/to retry: MusicBrainz's `error`
+    key is also how it reports genuine 200-status validation failures (e.g. a
+    malformed Lucene query), and those are not transient — retrying one just
+    repeats the same 200 three times before giving up on a request that was
+    never going to succeed.
+    """
+    if not (isinstance(data, dict) and 'error' in data
+            and not _MB_COLLECTION_KEYS.intersection(data.keys())):
+        return False
+    message = str(data.get('error') or '').lower()
+    return 'busy' in message or 'try again' in message
 
 
 def _config_setting(env_name: str, config_key: str) -> Any:
@@ -63,6 +107,8 @@ def _int_setting(env_name: str, config_key: str, default: int) -> int:
 
 
 def _is_transient_musicbrainz_error(exc: Exception) -> bool:
+    if isinstance(exc, MusicBrainzBusyError):
+        return True
     if isinstance(exc, (requests.exceptions.ReadTimeout, requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
         return True
     response = getattr(exc, 'response', None)
@@ -72,24 +118,50 @@ def _is_transient_musicbrainz_error(exc: Exception) -> bool:
     message = str(exc).lower()
     return 'rate limit' in message or 'read timed out' in message or '503' in message or '429' in message
 
-def rate_limited(func):
-    """Decorator to enforce process-wide MusicBrainz request pacing."""
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        _wait_for_musicbrainz_slot()
-        return func(*args, **kwargs)
-    return wrapper
+def _server_settings():
+    """Resolve current settings; environment overrides persisted configuration."""
+    return validate_server_settings(
+        _config_setting('SOULSYNC_MUSICBRAINZ_BASE_URL', 'musicbrainz.base_url'),
+        _config_setting('SOULSYNC_MUSICBRAINZ_REQUEST_INTERVAL', 'musicbrainz.request_interval'))
 
 
-def _wait_for_musicbrainz_slot() -> None:
+def validate_server_settings(raw, raw_interval):
+    """Normalize and validate a server URL and interval without network access."""
+    try:
+        parsed = urlsplit(str(raw or MusicBrainzClient.BASE_URL).strip())
+        if (parsed.scheme not in ('http', 'https') or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None
+                or parsed.query or parsed.fragment
+                or any(c.isspace() for c in str(raw or ''))):
+            raise ValueError('expected HTTP(S) URL without credentials, query or fragment')
+        _port = parsed.port  # Validate malformed/out-of-range ports, including IPv6 URLs.
+        path = parsed.path.rstrip('/')
+        if not path.endswith('/ws/2'):
+            path += '/ws/2'
+        url = urlunsplit((parsed.scheme, parsed.netloc, path, '', ''))
+    except ValueError as exc:
+        raise ValueError('Invalid musicbrainz.base_url / SOULSYNC_MUSICBRAINZ_BASE_URL') from exc
+    try:
+        interval = MIN_API_INTERVAL if raw_interval in (None, '') else float(raw_interval)
+        if isinstance(raw_interval, bool) or not math.isfinite(interval) or interval < 0:
+            raise ValueError('expected finite nonnegative seconds')
+    except (ValueError, TypeError) as exc:
+        raise ValueError('Invalid musicbrainz.request_interval / SOULSYNC_MUSICBRAINZ_REQUEST_INTERVAL') from exc
+    hostname = parsed.hostname.lower().rstrip('.')
+    if hostname == 'musicbrainz.org' or hostname.endswith('.musicbrainz.org'):
+        interval = max(MIN_API_INTERVAL, interval)
+    return url, interval
+
+
+def _wait_for_musicbrainz_slot(interval: float = MIN_API_INTERVAL) -> None:
     global _last_api_call_time
 
     with _api_call_lock:
         current_time = time.monotonic()
         time_since_last_call = current_time - _last_api_call_time
 
-        if time_since_last_call < MIN_API_INTERVAL:
-            sleep_time = MIN_API_INTERVAL - time_since_last_call
+        if time_since_last_call < interval:
+            sleep_time = interval - time_since_last_call
             time.sleep(sleep_time)
 
         _last_api_call_time = time.monotonic()
@@ -115,6 +187,7 @@ class MusicBrainzClient:
             app_version: Version of the application
             contact_email: Contact email or URL (defaults to project URL when empty)
         """
+        self.base_url, self.request_interval = _server_settings()
         contact = contact_email or self.DEFAULT_CONTACT
         self.user_agent = f"{app_name}/{app_version} ( {contact} )"
 
@@ -132,20 +205,37 @@ class MusicBrainzClient:
 
     def _get(self, path: str, *, params: Optional[Dict[str, Any]] = None) -> requests.Response:
         """GET a MusicBrainz endpoint with shared pacing and transient retries."""
-        url = f"{self.BASE_URL}{path}"
+        # Resolve at request boundaries so every existing client sees UI saves.
+        # Keep this pair local: an in-flight retry stays on its original server.
+        base_url, interval = _server_settings()
+        url = f"{base_url}{path}"
         attempts = self.max_retries + 1
         last_exc: Exception | None = None
 
         for attempt in range(attempts):
-            if attempt:
-                _wait_for_musicbrainz_slot()
+            _wait_for_musicbrainz_slot(interval)
             try:
                 response = self.session.get(
                     url,
                     params=params,
                     timeout=(self.connect_timeout, self.read_timeout),
+                    allow_redirects=False,
                 )
+                # Redirects must not send mirror traffic to an unpaced public server.
+                if 300 <= response.status_code < 400:
+                    raise requests.HTTPError(
+                        "MusicBrainz API redirected; configure its final base URL", response=response)
                 response.raise_for_status()
+                # A 200 can still carry MusicBrainz's overload message instead
+                # of data (see MusicBrainzBusyError) — catch it here, in one
+                # place, before any caller's `data.get(key, [])` turns it into
+                # a silent empty result.
+                try:
+                    payload = response.json()
+                except ValueError:
+                    payload = None
+                if _looks_like_busy_body(payload):
+                    raise MusicBrainzBusyError(str(payload.get('error')))
                 return response
             except Exception as exc:
                 last_exc = exc
@@ -163,7 +253,6 @@ class MusicBrainzClient:
 
         raise last_exc or RuntimeError('MusicBrainz request failed')
     
-    @rate_limited
     def search_artist(self, artist_name: str, limit: int = 10, strict: bool = True,
                       raise_on_error: bool = False) -> List[Dict[str, Any]]:
         """
@@ -225,9 +314,9 @@ class MusicBrainzClient:
                 raise
             return []
     
-    @rate_limited
     def search_release(self, album_name: str, artist_name: Optional[str] = None,
-                       limit: int = 10, strict: bool = True) -> List[Dict[str, Any]]:
+                       limit: int = 10, strict: bool = True,
+                       raise_on_error: bool = False) -> List[Dict[str, Any]]:
         """
         Search for releases (albums) by name.
 
@@ -242,6 +331,13 @@ class MusicBrainzClient:
                 hits alias / sortname indexes and folds diacritics,
                 dramatically improving recall for user-facing fuzzy
                 lookups (e.g. the manual Fix popup).
+            raise_on_error: Re-raise a transport failure instead of reporting
+                it as an empty result. The default is the historical
+                fail-soft behaviour, which suits callers that only want a
+                best-effort list. It does NOT suit a caller that WRITES the
+                answer down: a timeout and "MusicBrainz knows no such
+                release" are the same `[]` here, and a negative cache would
+                store the second meaning for a month after seeing the first.
 
         Returns:
             List of release results
@@ -279,14 +375,16 @@ class MusicBrainzClient:
             
             logger.debug(f"Found {len(releases)} releases for query: {album_name}")
             return releases
-            
+
         except Exception as e:
             logger.error(f"Error searching for release '{album_name}': {e}")
+            if raise_on_error:
+                raise
             return []
     
-    @rate_limited
     def search_recording(self, track_name: str, artist_name: Optional[str] = None,
-                         limit: int = 10, strict: bool = True) -> List[Dict[str, Any]]:
+                         limit: int = 10, strict: bool = True,
+                         raise_on_error: bool = False) -> List[Dict[str, Any]]:
         """
         Search for recordings (tracks) by name.
 
@@ -303,6 +401,13 @@ class MusicBrainzClient:
                 when either side mis-matches (e.g. "Bjork" vs canonical
                 "Björk", or a track title with bracketed suffix like
                 "(Live)" that strict phrase match rejects).
+            raise_on_error: Re-raise a transport failure instead of reporting
+                it as an empty result. The default is the historical
+                fail-soft behaviour, which suits callers that only want a
+                best-effort list. It does NOT suit a caller that WRITES the
+                answer down: a timeout and "MusicBrainz knows no such
+                recording" are the same `[]` here, and a negative cache would
+                store the second meaning for a month after seeing the first.
 
         Returns:
             List of recording results
@@ -343,12 +448,60 @@ class MusicBrainzClient:
             
             logger.debug(f"Found {len(recordings)} recordings for query: {track_name}")
             return recordings
-            
+
         except Exception as e:
             logger.error(f"Error searching for recording '{track_name}': {e}")
+            if raise_on_error:
+                raise
             return []
-    
-    @rate_limited
+
+    def search_recording_by_artist_mbid(self, track_name: str, artist_mbid: str,
+                                        limit: int = 5,
+                                        raise_on_error: bool = False) -> List[Dict[str, Any]]:
+        """Search recordings by exact title, pinned to a resolved artist MBID.
+
+        The ``artist``/``artistname``/``creditname`` fields on a /recording
+        query reflect the artist CREDIT printed on that specific recording —
+        never the artist entity's aliases, and /recording has no alias field
+        at all. So `search_recording(strict=True)`'s `artist:"..."` clause
+        can never match a romanised or cross-script name against a recording
+        credited in the artist's native script (e.g. "Tatsuro Yamashita"
+        finds nothing for a recording credited "山下達郎", even though the
+        artist entity itself resolves via the alias-aware artist search).
+        `arid:<mbid>` queries the artist relationship directly instead of the
+        printed credit text, sidestepping that mismatch entirely. Callers are
+        expected to have resolved ``artist_mbid`` through an alias-aware path
+        (e.g. `search_artist(strict=False)`) first.
+
+        ``raise_on_error`` re-raises a transport failure instead of folding it
+        into ``[]`` — same contract as `search_artist`, for callers that
+        would otherwise cache the empty list as "no such recording".
+        """
+        try:
+            safe_track = track_name.replace('\\', '\\\\').replace('"', '\\"')
+            query = f'arid:{artist_mbid} AND recording:"{safe_track}"'
+
+            params = {
+                'query': query,
+                'fmt': 'json',
+                'limit': limit
+            }
+
+            response = self._get("/recording", params=params)
+            response.raise_for_status()
+
+            data = response.json()
+            recordings = data.get('recordings', [])
+
+            logger.debug(f"Found {len(recordings)} recordings for artist-pinned query: {track_name}")
+            return recordings
+
+        except Exception as e:
+            logger.error(f"Error searching recordings for artist {artist_mbid}, track '{track_name}': {e}")
+            if raise_on_error:
+                raise
+            return []
+
     def browse_artist_release_groups(self, artist_mbid: str,
                                      release_types: Optional[List[str]] = None,
                                      limit: int = 100,
@@ -390,7 +543,6 @@ class MusicBrainzClient:
             logger.error(f"Error browsing release-groups for artist {artist_mbid}: {e}")
             return []
 
-    @rate_limited
     def browse_release_group_releases(self, release_group_mbid: str,
                                       limit: int = 100,
                                       offset: int = 0) -> List[Dict[str, Any]]:
@@ -421,7 +573,6 @@ class MusicBrainzClient:
             logger.error(f"Error browsing releases for release-group {release_group_mbid}: {e}")
             return []
 
-    @rate_limited
     def search_labels(self, label_name: str, limit: int = 10) -> List[Dict[str, Any]]:
         """Search record labels by name (labels feature). Each hit has `id`
         (MBID), `name`, `disambiguation`, `type` (imprint/production/etc.),
@@ -438,7 +589,6 @@ class MusicBrainzClient:
             logger.error(f"Error searching labels for '{name}': {e}")
             return []
 
-    @rate_limited
     def browse_label_releases(self, label_mbid: str, limit: int = 100,
                               offset: int = 0) -> List[Dict[str, Any]]:
         """Browse releases put out by a label (labels feature). Each release
@@ -457,7 +607,6 @@ class MusicBrainzClient:
             logger.error(f"Error browsing releases for label {mbid}: {e}")
             return []
 
-    @rate_limited
     def search_recordings_by_artist_mbid(self, artist_mbid: str,
                                          limit: int = 100) -> List[Dict[str, Any]]:
         """Search for recordings linked to an artist via Lucene `arid:` query.
@@ -499,7 +648,6 @@ class MusicBrainzClient:
             logger.error(f"Error searching recordings for artist {artist_mbid}: {e}")
             return []
 
-    @rate_limited
     def get_artist(self, mbid: str, includes: Optional[List[str]] = None,
                    raise_on_error: bool = False) -> Optional[Dict[str, Any]]:
         """
@@ -532,7 +680,6 @@ class MusicBrainzClient:
                 raise
             return None
     
-    @rate_limited
     def get_release(self, mbid: str, includes: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
         """
         Get full release details by MusicBrainz ID
@@ -558,7 +705,6 @@ class MusicBrainzClient:
             logger.error(f"Error fetching release {mbid}: {e}")
             return None
     
-    @rate_limited
     def get_release_group(self, mbid: str, includes: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
         """Get full release-group details by MBID.
 
@@ -586,7 +732,6 @@ class MusicBrainzClient:
             logger.error(f"Error fetching release-group {mbid}: {e}")
             return None
 
-    @rate_limited
     def get_recording(self, mbid: str, includes: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
         """
         Get full recording details by MusicBrainz ID
@@ -611,3 +756,43 @@ class MusicBrainzClient:
         except Exception as e:
             logger.error(f"Error fetching recording {mbid}: {e}")
             return None
+
+    def lookup_recordings_by_isrc(self, isrc: str) -> List[Dict[str, Any]]:
+        """
+        Exact recording lookup by ISRC via MusicBrainz's ``/isrc/<ISRC>`` endpoint.
+
+        An ISRC identifies a specific recording exactly and is script/language
+        independent, unlike a text search — so this is the source of truth an
+        export waterfall reaches for once cheaper (cache/DB/file) rungs miss.
+
+        Fail-soft like ``search_recording``/``get_recording``: a malformed ISRC,
+        an unknown one (MusicBrainz 404s), or any transport error all return
+        ``[]`` rather than raise, so a caller can treat this as just another
+        waterfall rung. Honours the same shared rate limiting as every other
+        request this client makes.
+
+        Args:
+            isrc: The ISRC to look up (hyphens/case are normalized).
+
+        Returns:
+            List of recording dicts sharing that ISRC (usually 0 or 1, occasionally
+            a handful of remasters/duplicate masters).
+        """
+        code = re.sub(r'[^A-Za-z0-9]', '', str(isrc or '')).upper()
+        if not _ISRC_RE.match(code):
+            logger.debug(f"Invalid ISRC format, skipping lookup: {isrc!r}")
+            return []
+        try:
+            params = {'inc': 'artist-credits', 'fmt': 'json'}
+            response = self._get(f"/isrc/{code}", params=params)
+            response.raise_for_status()
+
+            data = response.json()
+            recordings = data.get('recordings', [])
+
+            logger.debug(f"Found {len(recordings)} recordings for ISRC {code}")
+            return recordings
+
+        except Exception as e:
+            logger.debug(f"Error looking up ISRC {code}: {e}")
+            return []

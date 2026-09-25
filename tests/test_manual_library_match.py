@@ -101,18 +101,19 @@ def test_save_persists_library_file_path(db):
 
 
 def test_find_track_id_by_file_path(db):
-    """Re-resolution primitive: locate the current tracks.id for a file path
+    """Re-resolution primitive: locate the current track id for a file path
     (exact, then basename fallback)."""
+    from tests.support.catalogue_seed import seed_library_track
     with db._get_connection() as conn:
-        conn.execute("PRAGMA foreign_keys=OFF")
-        conn.execute(
-            "INSERT INTO tracks (id, album_id, artist_id, title, file_path) VALUES (?, ?, ?, ?, ?)",
-            ("7777", 1, 1, "Track", "/music/Artist/Album/01.flac"),
-        )
+        track_id = seed_library_track(
+            conn, artist='Artist', album='Album', title='Track',
+            file_path='/music/Artist/Album/01.flac')
+        conn.commit()
+
     # Exact path
-    assert db.find_track_id_by_file_path("/music/Artist/Album/01.flac") == "7777"
+    assert db.find_track_id_by_file_path("/music/Artist/Album/01.flac") == str(track_id)
     # Basename fallback (server vs local path shape)
-    assert db.find_track_id_by_file_path("/different/root/01.flac") == "7777"
+    assert db.find_track_id_by_file_path("/different/root/01.flac") == str(track_id)
     # Unknown file → None
     assert db.find_track_id_by_file_path("/music/nope.flac") is None
     assert db.find_track_id_by_file_path("") is None
@@ -333,7 +334,10 @@ def test_wishlist_skips_manual_matched_track():
         )
 
     assert removed == 1
-    mock_wishlist_svc.mark_track_download_result.assert_called_once_with("spotify-track-123", success=True)
+    # #1289: scoped to the owning profile, and stamped with why it was removed.
+    mock_wishlist_svc.mark_track_download_result.assert_called_once_with(
+        "spotify-track-123", success=True, profile_id=1, profile_ids=[1],
+        audit={"reason": "manual_match"})
     mock_music_db.check_track_exists.assert_not_called()
 
 

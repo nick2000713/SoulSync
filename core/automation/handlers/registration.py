@@ -10,6 +10,11 @@ from __future__ import annotations
 from core.automation.deps import AutomationDeps
 from core.automation.handlers.process_wishlist import auto_process_wishlist
 from core.automation.handlers.scan_watchlist import auto_scan_watchlist
+from core.automation.handlers.audiobook_process_wishlist import auto_process_audiobook_wishlist
+from core.automation.handlers.audiobook_scan_watchlist import auto_scan_audiobook_watchlist
+from core.automation.handlers.audiobook_scan_library import auto_scan_audiobook_library
+from core.automation.handlers.audiobook_purge_recycle import auto_purge_audiobook_recycle
+from core.automation.handlers.scan_watchlist_podcasts import auto_scan_watchlist_podcasts
 from core.automation.handlers.scan_library import auto_scan_library
 from core.automation.handlers.refresh_mirrored import auto_refresh_mirrored
 from core.automation.handlers.sync_playlist import auto_sync_playlist
@@ -17,6 +22,8 @@ from core.automation.handlers.discover_playlist import auto_discover_playlist
 from core.automation.handlers.playlist_pipeline import auto_playlist_pipeline
 from core.automation.handlers.personalized_pipeline import auto_personalized_pipeline
 from core.automation.handlers.lastfm_import import auto_import_lastfm_listening
+from core.automation.handlers.listenbrainz_import import auto_import_listenbrainz_listening
+from core.automation.handlers.library_cleanup import auto_library_cleanup
 from core.automation.handlers.database_update import (
     auto_start_database_update, auto_deep_scan_library,
 )
@@ -93,6 +100,26 @@ def register_all(deps: AutomationDeps) -> None:
         lambda config: auto_scan_watchlist(config, deps),
         guard_fn=deps.is_watchlist_actually_scanning,
     )
+    engine.register_action_handler(
+        'scan_watchlist_podcasts',
+        lambda config: auto_scan_watchlist_podcasts(config, deps),
+    )
+    engine.register_action_handler(
+        'audiobook_process_wishlist',
+        lambda config: auto_process_audiobook_wishlist(config, deps),
+    )
+    engine.register_action_handler(
+        'audiobook_scan_watchlist',
+        lambda config: auto_scan_audiobook_watchlist(config, deps),
+    )
+    engine.register_action_handler(
+        'audiobook_scan_library',
+        lambda config: auto_scan_audiobook_library(config, deps),
+    )
+    engine.register_action_handler(
+        'audiobook_purge_recycle',
+        lambda config: auto_purge_audiobook_recycle(config, deps),
+    )
     # NOTE: labels are NOT a separate automation kind — the 'scan_watchlist'
     # action (and the manual scan) run a label phase after the artist scan via
     # run_label_scan_phase, so followed labels are covered by the normal
@@ -137,6 +164,11 @@ def register_all(deps: AutomationDeps) -> None:
         lambda config: auto_import_lastfm_listening(config, deps),
         lambda: bool(deps.lastfm_import_worker and deps.lastfm_import_worker.is_running()),
     )
+    engine.register_action_handler(
+        'import_listenbrainz_listening',
+        lambda config: auto_import_listenbrainz_listening(config, deps),
+        lambda: bool(deps.listenbrainz_import_worker and deps.listenbrainz_import_worker.is_running()),
+    )
 
     # Database update + deep scan share the db_update_state guard —
     # only one operation can mutate that state at a time.
@@ -173,6 +205,10 @@ def register_all(deps: AutomationDeps) -> None:
     engine.register_action_handler(
         'clear_quarantine',
         lambda config: auto_clear_quarantine(config, deps),
+    )
+    engine.register_action_handler(
+        'library_cleanup',
+        lambda config: auto_library_cleanup(config, deps),
     )
     engine.register_action_handler(
         'cleanup_wishlist',

@@ -8,12 +8,17 @@ attribute). bodies byte-identical; only the decorator changed and
 dev_mode_enabled / hydrabase_worker became getters.
 """
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, current_app, jsonify, request
 
 from core.imports.album import build_album_import_match_payload
 from core.imports.routes import ImportRouteRuntime as _ImportRouteRuntime
 from core.imports.routes import album_match as _import_album_match
+from core.imports.routes import album_preview as _import_album_preview
+from core.imports.routes import fingerprint_files as _import_fingerprint_files
 from core.imports.routes import album_process as _import_album_process
+from core.imports.routes import upload_chunk_to_staging as _import_upload_chunk_to_staging
+from core.imports.routes import upload_to_staging as _import_upload_to_staging
+from core.imports.routes import inbox as _import_inbox
 from core.imports.routes import process_single_import_file as _import_process_single_import_file
 from core.imports.routes import search_albums as _import_search_albums
 from core.imports.routes import search_sources as _import_search_sources
@@ -65,14 +70,81 @@ def _build_import_route_runtime():
         dev_mode_enabled=_dev_mode_enabled(),
         import_singles_executor=import_singles_executor,
         build_album_import_match_payload=build_album_import_match_payload,
-        process_single_import_file=lambda runtime, file_info: _process_single_import_file(file_info),
+        # the singles executor runs outside the request: carry the request's
+        # profile along instead of resolving it again on the worker thread
+        process_single_import_file=lambda runtime, file_info: _process_single_import_file(
+            file_info, profile_id=runtime.profile_id),
         logger=logger,
+        profile_id=_request_profile_id(),
     )
+
+
+def _request_profile_id():
+    """the importing profile, when there is a request to read it from."""
+    try:
+        from flask import has_request_context
+        if not has_request_context():
+            return None
+        return int(get_current_profile_id())
+    except Exception:  # noqa: BLE001
+        return None
 
 
 @bp.route('/api/import/staging/files', methods=['GET'])
 def import_staging_files():
     payload, status = _import_staging_files(_build_import_route_runtime())
+    return jsonify(payload), status
+
+
+@bp.route('/api/import/inbox', methods=['GET'])
+def import_inbox():
+    payload, status = _import_inbox(_build_import_route_runtime(), auto_import_worker)
+    return jsonify(payload), status
+
+
+@bp.route('/api/import/upload', methods=['POST'])
+@admin_only
+def import_upload():
+    """browser upload into the import folder. multipart: one or more
+    `files`, and a matching `paths` field per file carrying the relative
+    path the browser knows (webkitRelativePath) so a dropped folder lands
+    as a folder."""
+    files = request.files.getlist('files')
+    if not files:
+        return jsonify({"success": False, "error": "no files"}), 400
+    paths = request.form.getlist('paths')
+    payload, status = _import_upload_to_staging(_build_import_route_runtime(), files, paths)
+    return jsonify(payload), status
+
+
+@bp.route('/api/import/fingerprint', methods=['POST'])
+def import_fingerprint():
+    data = request.get_json() or {}
+    payload, status = _import_fingerprint_files(_build_import_route_runtime(), data.get('file_paths') or [])
+    return jsonify(payload), status
+
+
+@bp.route('/api/import/upload/chunk', methods=['POST'])
+@admin_only
+def import_upload_chunk():
+    """one piece of a file. fields: upload_id, index, total, path; file: chunk."""
+    chunk = request.files.get('chunk')
+    if chunk is None:
+        return jsonify({"success": False, "error": "no chunk"}), 400
+    payload, status = _import_upload_chunk_to_staging(
+        _build_import_route_runtime(),
+        upload_id=request.form.get('upload_id', ''),
+        index=request.form.get('index', ''),
+        total=request.form.get('total', ''),
+        relative_path=request.form.get('path', '') or chunk.filename or '',
+        chunk=chunk,
+    )
+    return jsonify(payload), status
+
+
+@bp.route('/api/import/album/preview', methods=['POST'])
+def import_album_preview():
+    payload, status = _import_album_preview(_build_import_route_runtime(), request.get_json() or {})
     return jsonify(payload), status
 
 
@@ -208,10 +280,41 @@ def import_album_match():
     return jsonify(payload), status
 
 
+def _process_import(kind, data):
+    runtime = _build_import_route_runtime()
+    def operation():
+        if kind == 'album':
+            return _import_album_process(runtime, data)
+        return _import_singles_process(runtime, data.get('files', []))
+    if request.headers.get('Prefer') != 'respond-async':
+        payload, status = operation()
+    else:
+        from core.imports.jobs import import_jobs
+        key = request.headers.get('Idempotency-Key', '')
+        if not key or len(key) > 128:
+            return jsonify(success=False, error='A valid Idempotency-Key is required'), 400
+        app = current_app._get_current_object()
+        def background():
+            with app.app_context():
+                return operation()
+        payload, status = import_jobs.submit(get_current_profile_id(), key, kind, data, background)
+    return jsonify(payload), status
+
+
+@bp.route('/api/import/jobs/<job_id>', methods=['GET'])
+def import_job_status(job_id):
+    from core.imports.jobs import import_jobs
+    payload, status = import_jobs.get(get_current_profile_id(), job_id)
+    if payload.get('state') == 'complete' and (payload.get('status') or 200) >= 400:
+        # Preserve HTTPError/error_code semantics (notably disconnected media
+        # servers) used by the browser to stop the rest of an import batch.
+        return jsonify(payload['result']), payload['status']
+    return jsonify(payload), status
+
+
 @bp.route('/api/import/album/process', methods=['POST'])
 def import_album_process():
-    payload, status = _import_album_process(_build_import_route_runtime(), request.get_json() or {})
-    return jsonify(payload), status
+    return _process_import('album', request.get_json() or {})
 
 
 @bp.route('/api/import/search/tracks', methods=['GET'])
@@ -224,15 +327,17 @@ def import_search_tracks():
     return jsonify(payload), status
 
 
-def _process_single_import_file(file_info):
-    return _import_process_single_import_file(_build_import_route_runtime(), file_info)
+def _process_single_import_file(file_info, profile_id=None):
+    runtime = _build_import_route_runtime()
+    if profile_id and not runtime.profile_id:
+        runtime.profile_id = profile_id
+    return _import_process_single_import_file(runtime, file_info)
 
 
 @bp.route('/api/import/singles/process', methods=['POST'])
 def import_singles_process():
     data = request.get_json() or {}
-    payload, status = _import_singles_process(_build_import_route_runtime(), data.get('files', []))
-    return jsonify(payload), status
+    return _process_import('singles', data)
 
 
 # Auto-Import Worker
@@ -257,7 +362,14 @@ def _boot_auto_import_worker():
             automation_engine=automation_engine,
         )
         if config_manager.get('auto_import.enabled', False):
-            auto_import_worker.start()
+            # NOT a bare start(): on an installation still migrating into lib2
+            # the auto-importer would import against a half-built catalogue.
+            # defer_or_start holds it behind the upgrade barrier, the same gate
+            # every enrichment worker goes through (and api/auto_import.py's
+            # start endpoint).
+            from core.library2.migration_gate import defer_or_start
+
+            defer_or_start(auto_import_worker, _ai_db)
             logger.info("Auto-import worker started")
         else:
             logger.info("Auto-import worker initialized (disabled)")

@@ -25,9 +25,13 @@ function stub() {
     http.post('/api/watchlist/remove', () => HttpResponse.json({ success: true })),
     http.post('/api/discover/similar-artists/enrich', async ({ request }) => {
       enrichBodies.push(await request.json());
+      // The shape the ROUTE actually returns: a map keyed by artist id.
+      // This mock used to send a list, which is a contract the server has
+      // never had — so the test stayed green while every real Discovery open
+      // threw "e.artists is not iterable" (#1234).
       return HttpResponse.json({
         success: true,
-        artists: [{ artist_id: 'sp2', image_url: '/img/2.jpg' }],
+        artists: { sp2: { artist_name: 'B', image_url: '/img/2.jpg' } },
       });
     }),
     http.post('/api/discover/adventurousness', async ({ request }) => {
@@ -126,6 +130,44 @@ describe('useRecommended', () => {
     expect(enrichBodies).toHaveLength(1);
   });
 
+  it('survives the empty map the route sends when it has nothing (#1234)', async () => {
+    // `{}` is truthy, so the old `!data.artists` guard let it through and
+    // `for...of` threw. This is the "sometimes immediately" half of the report.
+    server.use(
+      http.post('/api/discover/similar-artists/enrich', () =>
+        HttpResponse.json({ success: true, artists: {} }),
+      ),
+    );
+    const { result } = renderHook(() => useRecommended((t) => toasts.push(t)));
+    await act(() =>
+      result.current.enrichImages(
+        [{ artist_name: 'B', spotify_artist_id: 'sp2' }] as RecommendedArtist[],
+        'spotify',
+      ),
+    );
+    expect(result.current.images).toEqual({});
+  });
+
+  it('a shape it does not understand leaves the cards alone, not the page', async () => {
+    // The whole point of the catch: placeholders stay, Discovery still opens.
+    // Deliberately a NUMBER rather than a string — a string is iterable, so
+    // `for...of` walks its characters and the old code survives it. This guard
+    // has to fail against the bug it is guarding.
+    server.use(
+      http.post('/api/discover/similar-artists/enrich', () =>
+        HttpResponse.json({ success: true, artists: 5 }),
+      ),
+    );
+    const { result } = renderHook(() => useRecommended((t) => toasts.push(t)));
+    await act(() =>
+      result.current.enrichImages(
+        [{ artist_name: 'B', spotify_artist_id: 'sp2' }] as RecommendedArtist[],
+        'spotify',
+      ),
+    );
+    expect(result.current.images).toEqual({});
+  });
+
   it('a deezer-sourced shelf asks by the deezer id column', async () => {
     const items = [{ artist_name: 'B', deezer_artist_id: 'dz9' }] as RecommendedArtist[];
     const { result } = renderHook(() => useRecommended((t) => toasts.push(t)));
@@ -144,7 +186,7 @@ describe('useAdventurousness', () => {
     // test is the throttle and the save bodies — the refetch wiring is typed.
   });
 
-  it('drag saves are throttled at 450ms; the value always tracks', async () => {
+  it('drag only updates local state; persistence waits for commit', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(1_753_000_000_000);
     const { result } = renderHook(() => useAdventurousness(0.3), { wrapper: wrapper() });
@@ -152,10 +194,10 @@ describe('useAdventurousness', () => {
     act(() => result.current.change(0.5)); // inside the throttle window
     expect(result.current.value).toBe(0.5);
     await act(() => vi.advanceTimersByTimeAsync(10));
-    expect(advBodies).toEqual([{ value: 0.4 }]);
+    expect(advBodies).toEqual([]);
     vi.setSystemTime(1_753_000_000_500);
     act(() => result.current.change(0.6));
     await act(() => vi.advanceTimersByTimeAsync(10));
-    expect(advBodies).toEqual([{ value: 0.4 }, { value: 0.6 }]);
+    expect(advBodies).toEqual([]);
   });
 });

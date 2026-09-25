@@ -112,6 +112,11 @@ TRIGGERS: list[dict] = [
      "description": "When album/track import finishes", "available": True,
      "has_conditions": True, "condition_fields": ["artist", "album_name"],
      "variables": ["track_count", "album_name", "artist"]},
+    {"type": "import_needs_attention", "label": "Import Needs Attention", "icon": "upload",
+     "description": "When auto-import cannot finish a folder on its own (needs review, could not identify, or failed)",
+     "available": True,
+     "has_conditions": True, "condition_fields": ["status", "artist", "album_name"],
+     "variables": ["folder_name", "status", "reason", "album_name", "artist", "confidence", "track_count"]},
     {"type": "mirrored_playlist_created", "label": "Playlist Mirrored", "icon": "copy",
      "description": "When a new playlist is mirrored", "available": True,
      "has_conditions": True, "condition_fields": ["playlist_name", "source"],
@@ -236,6 +241,13 @@ ACTIONS: list[dict] = [
     {"type": "process_wishlist", "label": "Process Wishlist", "icon": "list", "description": "Retry failed downloads from wishlist", "available": True,
      "config_fields": [{"key": "category", "type": "select", "label": "Category", "options": [{"value": "all", "label": "All"}, {"value": "albums", "label": "Albums"}, {"value": "singles", "label": "Singles"}], "default": "all"}]},
     {"type": "scan_watchlist", "label": "Scan Watchlist", "icon": "eye", "description": "Check watched artists AND followed labels for new releases", "available": True},
+    {"type": "scan_watchlist_podcasts", "label": "Scan Watchlist Podcasts", "icon": "mic", "description": "Check watchlisted podcasts for new episodes and prune expired", "available": True},
+    {"type": "audiobook_scan_library", "label": "Scan Audiobook Library", "icon": "headphones",
+     "description": "Scan the audiobook folder set in Settings, including books added outside SoulSync. Read tags and sidecars, index local books, and reconcile missing files without changing files on disk.",
+     "available": True, "config_fields": [
+         {"key": "match_catalog", "type": "checkbox", "label": "Find catalogue matches after scanning", "default": True},
+         {"key": "match_batch_size", "type": "number", "label": "Books to match per run", "default": 25, "min": 1, "max": 100},
+     ]},
     {"type": "scan_library", "label": "Scan Library", "icon": "refresh", "description": "Trigger media server library scan", "available": True},
     {"type": "refresh_mirrored", "label": "Refresh Mirrored Playlist", "icon": "copy", "description": "Re-fetch playlist from source and update mirror", "available": True,
      "config_fields": [
@@ -275,6 +287,13 @@ ACTIONS: list[dict] = [
          {"key": "username", "type": "text", "label": "Username", "placeholder": "Blank = authorized Last.fm user"},
          {"key": "full", "type": "checkbox", "label": "Force full backfill", "default": False},
      ]},
+    {"type": "import_listenbrainz_listening", "label": "Import ListenBrainz Listening", "icon": "activity",
+     "description": "Pull ListenBrainz / Maloja listens into SoulSync listening history so Stats and discovery stay current.",
+     "available": True,
+     "config_fields": [
+         {"key": "username", "type": "text", "label": "Username", "placeholder": "Blank = authorized user or token user"},
+         {"key": "full", "type": "checkbox", "label": "Force full backfill", "default": False},
+     ]},
     {"type": "notify_only", "label": "Notify Only", "icon": "bell", "scope": "both", "description": "No action — just send notification", "available": True},
     # Phase 3 actions
     {"type": "start_database_update", "label": "Update Database", "icon": "database",
@@ -286,6 +305,17 @@ ACTIONS: list[dict] = [
      "description": "Scan for and remove duplicate files", "available": True},
     {"type": "clear_quarantine", "label": "Clear Quarantine", "icon": "trash",
      "description": "Delete all quarantined files", "available": True},
+    {"type": "library_cleanup", "label": "Clear Quarantine + Empty Recycle Bin", "icon": "trash",
+     "description": "One sweep for both bins: delete the download quarantine, then empty the recycle bin "
+                    "(files deleted by the duplicate cleaner and repair tools). The recycle bin honours the keep "
+                    "window set on the Downloads page's Recycle Bin tab; with the window on 'keep forever' it "
+                    "empties the whole bin. Either half can be switched off. The seeded 'Weekly Cleanup' "
+                    "automation runs this and ships switched off.",
+     "available": True,
+     "config_fields": [
+         {"key": "quarantine", "type": "checkbox", "label": "Clear the download quarantine", "default": True},
+         {"key": "recycle_bin", "type": "checkbox", "label": "Empty the recycle bin", "default": True},
+     ]},
     {"type": "cleanup_wishlist", "label": "Clean Up Wishlist", "icon": "filter",
      "description": "Remove duplicate/owned tracks from wishlist", "available": True},
     {"type": "update_discovery_pool", "label": "Update Discovery", "icon": "compass",

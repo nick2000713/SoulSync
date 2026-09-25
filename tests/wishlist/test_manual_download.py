@@ -39,7 +39,7 @@ class _FakeWishlistService:
             if (track.get("spotify_track_id") or track.get("id")) not in self.removed_ids
         ]
 
-    def mark_track_download_result(self, spotify_track_id, success, error_message=None, profile_id=1):
+    def mark_track_download_result(self, spotify_track_id, success, error_message=None, profile_id=1, **kwargs):
         self.removed_ids.add(spotify_track_id)
         return True
 
@@ -151,6 +151,46 @@ def test_start_manual_wishlist_download_batch_returns_immediately_with_placehold
 
     # The bg job is queued.
     assert len(executor.submissions) == 1
+
+
+def test_direct_track_batch_bypasses_wishlist_and_disables_failure_requeue():
+    runtime, service, _db, executor, _logger, activity_calls, batch_map, _master_calls = _build_runtime(
+        tracks=[]
+    )
+    direct_track = {
+        "id": "sp-direct",
+        "name": "One Shot",
+        "artists": [{"name": "Direct Artist"}],
+        "album": {"name": "Direct Single", "album_type": "single"},
+        "spotify_data": {
+            "id": "sp-direct",
+            "name": "One Shot",
+            "artists": [{"name": "Direct Artist"}],
+            "album": {"name": "Direct Single", "album_type": "single"},
+        },
+        "source_info": {"lib2_track_id": 77, "lib2_album_id": 8},
+        "quality_profile_id": 3,
+        "_lib2_direct_search": True,
+    }
+
+    payload, status = processing.start_direct_track_download_batch(runtime, [direct_track])
+
+    assert status == 200
+    batch_id = payload["batch_id"]
+    assert batch_map[batch_id]["playlist_id"] == "library_v2_search"
+    assert batch_map[batch_id]["requeue_failed_to_wishlist"] is False
+    assert service.get_wishlist_tracks_for_download() == []
+
+    _run_submitted_bg_job(executor)
+
+    dispatched = _dispatched(executor, runtime)
+    assert len(dispatched) == 1
+    args = dispatched[0][1]
+    assert args[0] == batch_id
+    assert args[1] == "library_v2_search"
+    assert args[2][0]["id"] == "sp-direct"
+    assert batch_map[batch_id]["requeue_failed_to_wishlist"] is False
+    assert activity_calls == [("", "Automatic Search Started", "1 track(s)", "Now")]
 
 
 def test_start_manual_wishlist_download_batch_filters_track_ids_and_starts_batch():

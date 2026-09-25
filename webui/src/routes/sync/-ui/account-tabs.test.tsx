@@ -4,12 +4,12 @@
  * selector — so they are asserted as literals, not derived.
  */
 
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AccountDetailsModal } from './account-details-modal';
 import { AccountPlaylistCard } from './account-playlist-card';
-import { DeezerArlTab, SpotifyTab } from './account-tabs';
+import { DEEZER_PLAYLIST_PROGRESS_EVENT, DeezerArlTab, SpotifyTab } from './account-tabs';
 
 interface Call {
   url: string;
@@ -370,6 +370,27 @@ describe('seeding — the engine must be able to FIND the playlist (2235-2240)',
     // Seeded BEFORE the engine is asked to open it.
     expect(openDownloadMissingModal).toHaveBeenCalledWith('deezer_arl_7');
   });
+
+  it('formats deezer progress events with albums count and passes', async () => {
+    const showLoadingOverlay = vi.fn();
+    window.showLoadingOverlay = showLoadingOverlay;
+    render(<DeezerArlTab />);
+    await waitFor(() => expect(screen.getByText('Deep Cuts')).toBeInTheDocument());
+
+    fireEvent.click(document.querySelector('#action-btn-deezer_arl_7') as Element);
+
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent(DEEZER_PLAYLIST_PROGRESS_EVENT, {
+          detail: { playlist_id: 7, phase: 'release dates', done: 50, total: 100 },
+        }),
+      );
+    });
+
+    expect(showLoadingOverlay).toHaveBeenCalledWith(
+      'Loading playlist: Deep Cuts — release dates 50/100 albums (50%), pass 1 of 2',
+    );
+  });
 });
 
 describe('the header count is per-tab drift (1901 vs 2592)', () => {
@@ -569,5 +590,34 @@ describe('DeezerArlTab', () => {
     );
     // The PATH takes the raw id; the ids around it are prefixed.
     expect(calls.some((c) => c.url === '/api/deezer/arl-playlist/7?async=1')).toBe(true);
+  });
+
+  it('narrates the resolve-albums progress and ignores a frame for another playlist', async () => {
+    responder = (url) =>
+      url === '/api/deezer/arl-playlists' ? [ARL_ROW] : { name: 'Deep Cuts', tracks: [] };
+    render(<DeezerArlTab />);
+    await waitFor(() => expect(screen.getByText('Deep Cuts')).toBeInTheDocument());
+    fireEvent.click(document.querySelector('#action-btn-deezer_arl_7') as Element);
+    // Fired synchronously — the listener is attached before the details fetch
+    // is awaited, so both dispatches land while the modal is still loading.
+    fireEvent(
+      window,
+      new CustomEvent(DEEZER_PLAYLIST_PROGRESS_EVENT, {
+        detail: { playlist_id: '99', done: 1, total: 2, phase: 'release dates' },
+      }),
+    );
+    fireEvent(
+      window,
+      new CustomEvent(DEEZER_PLAYLIST_PROGRESS_EVENT, {
+        detail: { playlist_id: '7', done: 3, total: 10, phase: 'track numbers' },
+      }),
+    );
+    expect(window.showLoadingOverlay).not.toHaveBeenCalledWith(expect.stringContaining('99'));
+    expect(window.showLoadingOverlay).toHaveBeenCalledWith(
+      expect.stringContaining('track numbers 3/10'),
+    );
+    await waitFor(() =>
+      expect(document.querySelector('#deezer-arl-playlist-details-modal')).not.toBeNull(),
+    );
   });
 });
