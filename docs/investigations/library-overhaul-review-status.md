@@ -30,6 +30,7 @@ und lässt sich per Fast-Forward übernehmen. Die Findings selbst stehen in
 | L7 | Wishlist-Grund: „Missing from library“ bzw. „Quality upgrade wanted“ |
 | L8 | Meldung der Automatic Search ist lesbar |
 | L12 | Der Enrichment-Sweep importiert `web_server` nicht mehr |
+| M7 | Schalter „Re-download files deleted outside SoulSync“ (`library.redownload_externally_deleted`, Standard an) unter Settings → Library Organize. Aus: der Scan schreibt für jeden Track ohne verbleibende Datei dieselbe explizite Unmonitor-Regel wie „Don't download again“ (`user_explicit`, damit ein Album-Toggle sie nicht überstimmt) |
 | Extra | Bitrate in bps (Jellyfin) wird für Upgrades in kbps bewertet |
 | Tests | Veraltete Tests angepasst; Blocklist-Test als `[dev]`-Commit |
 
@@ -39,39 +40,74 @@ Bewusst unverändert:
 - **L9:** Die übrigen Root-Dateien stammen von Upstream.
 - **L10:** Nur zur Info, keine Aktion.
 
-## Offen
+## Bewusst offen
 
-1. **M7: Einstellung „Extern gelöschte Dateien neu laden“ (Standard: an).**
-   Entschieden, aber noch kein Code.
-   - Ansatz: Config-Key, z. B. `library.redownload_externally_deleted`.
-   - `core/library2/scan.py` sammelt in `rescan_files` die Tracks, die
-     `missing_confirmed` geworden sind (`presence`, `on_presence_change`).
-   - Ist die Option aus: für diese Tracks, wenn keine nutzbare Datei mehr da ist,
-     `monitor_rules.record_rule(conn, 'track', id, False, PROVENANCE_FILE)`, dazu
-     `lib2_tracks.monitored=0` und `recompute_wanted`.
-   - Settings-UI: Schalter unter Library.
-2. **H7/H10 Enhanced View im Artist-Detail:** Library-Artists werden auf `/library`
-   umgeleitet, die Seite ist auf diesem Branch also unerreichbar. Die Dateien kommen
-   über dev-Merges, deshalb nicht angefasst, um Merge-Konflikte zu vermeiden.
-   Tag-Preview, ReplayGain, Source-Info und Sync rufen dort weiter entfernte Routen auf.
-3. **Release Notes:**
-   - Migrationsdauer (ca. 9 min bei 200k Tracks; Downloads und Automationen in der
-     Zeit pausiert).
-   - Papierkorb statt Löschen.
-   - Extern gelöschte Dateien werden neu geladen (Lidarr-Verhalten).
-   - Hauptdatei folgt dem Profil.
-4. **Kompletter Testlauf zum Schluss fehlt.** Zuletzt:
-   - vitest: 10.011 von 10.012 bestanden; der Fehlschlag ist A07 unter Volllast,
-     danach mit längerem Timeout versehen.
-   - library2: alle 18 Fehlschläge behoben, aber kein Gesamtlauf mehr danach.
-   - Unter Python 3.13 stürzen die echten Analysen in `tests/sample` im Kindprozess ab
-     (erwartet); mit 3.11 wie in CI laufen alle durch.
+- **H7/H10 Enhanced View im Artist-Detail:** geprüft und unerreichbar:
+  `$source/$id.tsx` leitet jede `library`-URL auf `/library` um. Die Dateien kommen
+  über dev-Merges, deshalb nicht angefasst, um Merge-Konflikte zu vermeiden.
+  Tag-Preview, ReplayGain, Source-Info und Sync rufen dort weiter entfernte Routen auf.
 
-   Vorschlag: `PYTHON=.venv/bin/python bash scripts/run_tests_chunked.sh`
-   mit Python 3.11 und `cd webui && npx vitest run`.
+## Release Notes (Entwurf für PR #1062 / Discord)
+
+```
+- The first start upgrades the library: about 9 minutes per 200k tracks on a local
+  disk, longer on a NAS. Downloads, sync and automations wait until it is done; a
+  banner on every page shows the progress and offers a retry if it fails.
+- Nothing is deleted outright anymore. The Library delete dialog, every repair fix
+  and the file an upgrade, enhance or redownload replaces go to the deleted-files
+  folder and can be restored until retention clears them.
+- A monitored track whose file was deleted outside SoulSync is downloaded again,
+  like Lidarr does. Settings > Library Organize > "Re-download files deleted outside
+  SoulSync" turns that off.
+- When a track has several files, the quality profile decides which one is primary.
+  A file you picked by hand stays primary.
+```
+
+## Testlauf
+
+Lokal am 2026-10-06, Python 3.14, in einem Worktree ohne `config/config.json`
+(im Haupt-Checkout gehen einige Download-Tests mit der echten Konfiguration ans Netz
+und hängen):
+
+- **vitest:** 10.012 von 10.012 bestanden; `npm run check` 0 Fehler.
+- **pytest (chunked):** alles grün bis auf
+  - `test_filter_keys_match_write_path_keys`: auch auf `upstream/dev` rot;
+  - `test_vanilla_globals_resolve` (35×): Worktree ohne `webui/node_modules`, im
+    Haupt-Checkout 35/35 grün;
+  - `tests/imports/test_rematch_hints_seam.py` (5×): echte Regression aus L4, die
+    handgebaute Tabelle hatte keine `profile_rank`-Spalte; behoben (2e0dcf0b7),
+    `tests/imports` danach 1262/1262.
+- `tests/sample` (188) läuft auch mit 3.14 komplett durch.
+
+## Dev-Branch
+
+`fix/dev-bugs-from-overhaul-review`, nur lokal (Worktree `../SoulSync-devfix2`),
+Basis `upstream/dev` 24c5ef0ef (3.5.1). Jeder Fix ist gegen dev geprüft, jeder Test
+schlägt ohne den Fix auf dev fehl:
+
+1. Live/Commentary-Cleaner löscht keine Interludes/Introductions mehr (M12)
+2. Exakter Stem-Match gewinnt vor Fuzzy (H11); auf dev hing das Ergebnis von der
+   Verzeichnisreihenfolge ab, der neue Test erzwingt beide Reihenfolgen
+3. Tools-Job-Toggle setzt bzw. stoppt den Timer sofort (H6, ohne die fork-eigene
+   Job-ID-Umbenennung)
+4. Album-Jahr-Fix benennt den Ordner zurück, wenn das DB-Update scheitert (M8)
+5. `suspect_album_tag`: „1 von N“ nur noch als Zusatzsignal, Singles und eigene
+   Greatest Hits ausgenommen (M9; dev nutzt `albums.record_type`)
+
+Volltest auf dem Dev-Branch: grün bis auf `test_filter_keys_match_write_path_keys`
+(auf dev schon rot), `test_vanilla_globals_resolve` (kein `node_modules` im Worktree)
+und `test_title_match_guard::test_single_word_spelling_variants_not_regressed`
+(Titel-Matching, von keinem Commit berührt, allein grün: Reihenfolge-Flake).
+
+Nicht übernommen:
+- Blocklist-Test: auf dev ohne Änderung grün.
+- M11 (Analyse im Kindprozess): lokal mit Python 3.14 / numpy 2.5.3 kein Absturz,
+  Docker nutzt 3.11; ohne Nachweis keine Architekturänderung für dev.
+- M10 (Papierkorb überall): Verhaltensänderung, hängt am lib2-Delete-Journal.
+- Bitrate in bps: dev misst für Upgrades die echte Datei per mutagen.
+- H8, H9, L5, L7, L8, L12, L13: nur Library v2.
 
 ## Hinweise
-- Commits mit dem Präfix `[dev]` sind unabhängig vom Overhaul und lassen sich per
-  Cherry-Pick nach `dev` übernehmen.
-- Nicht nach `library-overhaul` gepusht; das ist deine Entscheidung (Fast-Forward
-  möglich).
+- Commits mit dem Präfix `[dev]` sind unabhängig vom Overhaul; der Dev-Branch oben
+  enthält die übernommenen Fixes ohne Präfix.
+- Nichts gepusht, keine PR.
