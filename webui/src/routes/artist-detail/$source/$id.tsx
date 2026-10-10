@@ -1,4 +1,4 @@
-import { createFileRoute } from '@tanstack/react-router';
+import { createFileRoute, redirect } from '@tanstack/react-router';
 import { useLayoutEffect } from 'react';
 
 import { useShellBridge } from '@/platform/shell/route-controllers';
@@ -6,6 +6,11 @@ import { getShellRouteByPageId } from '@/platform/shell/route-manifest';
 
 import { artistDetailSearchSchema } from '../-artist-detail.types';
 import { ArtistDetailPage } from '../-ui/artist-detail-page';
+import {
+  LIBRARY_V2_QUERY_KEY,
+  resolveLibraryV2DiscoveryArtist,
+} from '../../library/-library-v2.api';
+import { ArtistPageLibraryProvider } from '../../library/-ui/artist-page-release-actions';
 
 /**
  * Whether the shell has handed artist detail over to React yet.
@@ -26,14 +31,55 @@ function isReactOwned(): boolean {
 
 export const Route = createFileRoute('/artist-detail/$source/$id')({
   validateSearch: artistDetailSearchSchema,
+  /**
+   * Library v2 owns every artist the catalogue knows; this page shows the ones
+   * it does not. `library:<n>` is a catalogue row. Any other id is looked up
+   * first, with a plain GET so that opening a search result creates nothing:
+   * a provider artist the catalogue already holds opens there, with the full
+   * discography as cards so it looks like what the user clicked. A failed
+   * lookup still shows the provider page, which is the right answer for an
+   * artist we cannot place.
+   */
+  beforeLoad: async ({ params, search, context }) => {
+    const source = params.source.toLowerCase();
+    const isLibrary = source === 'library';
+    if (isLibrary && /^\d+$/.test(params.id)) {
+      throw redirect({ to: '/library', search: { artist: Number(params.id) }, replace: true });
+    }
+    const known = await context.queryClient
+      .fetchQuery({
+        queryKey: [...LIBRARY_V2_QUERY_KEY, 'discovery-resolve', source, params.id, search.name],
+        queryFn: () =>
+          resolveLibraryV2DiscoveryArtist({ source, providerId: params.id, name: search.name }),
+      })
+      .catch(() => null);
+    if (known) {
+      throw redirect({
+        to: '/library',
+        search: isLibrary
+          ? { artist: known }
+          : { artist: known, releases: 'all', releaseView: 'cards', header: 'rich' },
+        replace: true,
+      });
+    }
+    // A media-server id nothing in the catalogue carries has no provider to
+    // ask either (`/api/artist-detail` needs a source).
+    if (isLibrary) throw redirect({ to: '/library', replace: true });
+  },
   component: ArtistDetailRouteComponent,
 });
 
 function ArtistDetailRouteComponent() {
+  const { source, id } = Route.useParams();
+  const { name } = Route.useSearch();
   if (!isReactOwned()) {
     return <LegacyArtistDetailHandoff />;
   }
-  return <ArtistDetailPage />;
+  return (
+    <ArtistPageLibraryProvider source={source} id={id} name={name}>
+      <ArtistDetailPage />
+    </ArtistPageLibraryProvider>
+  );
 }
 
 /**

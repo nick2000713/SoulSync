@@ -7,8 +7,9 @@ import type {
   WishlistBulkResponse,
 } from '../-wishlist.types';
 
-import { trackCountLabel } from '../-wishlist.helpers';
+import { trackCountLabel, upgradeTitle } from '../-wishlist.helpers';
 import { openWishlistInspector } from '../../../features/downloads/inspector-modal';
+import { WishlistCover } from './wishlist-cover';
 
 /**
  * The dense LIST view — the nebula's operational twin (Boulder: "alternative
@@ -83,11 +84,12 @@ function TrackRow({
           data-testid={`wl-select-${track.id}`}
         />
       ) : null}
-      {track.image ? (
-        <img className="wl-list-cover" src={track.image} alt="" loading="lazy" />
-      ) : (
-        <div className="wl-list-cover wl-list-cover--ph">♪</div>
-      )}
+      <WishlistCover
+        className="wl-list-cover"
+        src={track.image}
+        fallback={track.imageFallback}
+        placeholder={<div className="wl-list-cover wl-list-cover--ph">♪</div>}
+      />
       {/* Title with the album stacked beneath — ONE flexible cell, so wide
           screens read as left cluster + right cluster instead of columns
           adrift in a void (Boulder's image 8). */}
@@ -96,6 +98,14 @@ function TrackRow({
           {track.track}
         </span>
         <span className="wl-list-track-album" title={track.album}>
+          {/* Upgrades are neither missing tracks nor duplicates. Saying so on
+              the row is the difference between "my wishlist is broken" and
+              "my quality profile is doing its job". */}
+          {track.upgrade ? (
+            <span className="wl-list-upgrade" title={upgradeTitle(track)}>
+              ⬆ upgrade{track.currentQuality ? ` · ${track.currentQuality}` : ''}
+            </span>
+          ) : null}
           {track.type === 'single' ? 'Single' : track.album}
           {track.type !== 'single' && onRemoveAlbum ? (
             <button

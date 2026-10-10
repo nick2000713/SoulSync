@@ -367,7 +367,7 @@ ACTIONS: list[dict] = [
     {"type": "update_discovery_pool", "label": "Update Discovery", "icon": "compass",
      "description": "Refresh discovery pool with new tracks", "available": True},
     {"type": "start_quality_scan", "label": "Run Quality Scan", "icon": "bar-chart",
-     "description": "Run the Quality Upgrade Finder (scope is set in Library Maintenance)", "available": True},
+     "description": "Reconcile monitored missing tracks and quality upgrade candidates into the Wishlist", "available": True},
     # Library Maintenance from an automation (music twin of video_run_repair_job).
     # The job list is filled from the repair-job registry in blocks_for_scope.
     {"type": "run_repair_job", "label": "Run Maintenance Job", "icon": "tool",
@@ -377,8 +377,10 @@ ACTIONS: list[dict] = [
          {"key": "job_id", "type": "select", "label": "Job",
           "options": [{"value": "all", "label": "All enabled jobs"}],
           "default": "all"}]},
+    # Native audit proposals now support this action without restoring the
+    # retired Quality Upgrade Finder or another automatic wishlist writer.
     {"type": "apply_quality_upgrades", "label": "Apply Quality Upgrades", "icon": "arrow-up-circle",
-     "description": "Queue the Quality Upgrade Finder's better versions on the wishlist, only for tracks whose quality profile is set to keep upgrading until its cutoff. Pair with a nightly schedule.",
+     "description": "Apply current Quality Profile Audit proposals for already-monitored tracks whose live profile requests upgrades until cutoff. Unmonitored tracks stay for manual review. Enable or run the audit in Library Maintenance first.",
      "available": True,
      "config_fields": [{"key": "limit", "label": "Most per run", "type": "number", "default": 100}]},
     {"type": "backup_database", "label": "Backup Database", "icon": "save",

@@ -64,7 +64,8 @@ import {
   cacheHealthLabel,
   cacheHealthScore,
   findingFilePath,
-  findingFixLabel,
+  findingRedownloadTrackId,
+  findingRowFixLabel,
   findingSeverityIcon,
   findingStatusBadge,
   findingTypeLabel,
@@ -108,6 +109,7 @@ function readStoredPageSize(): number {
 const TYPE_ORPHAN = 'orphan_file';
 const TYPE_DEAD = 'dead_file';
 const TYPE_ACOUSTID = 'acoustid_mismatch';
+const TYPE_RETAG = 'library_retag';
 const TYPE_BACKFILL = 'missing_discography_track';
 const TYPE_QUALITY = 'quality_upgrade';
 const TYPE_SUSPECT_ALBUM = 'suspect_album_tag';
@@ -214,6 +216,7 @@ export function FindingsSurface({
 
   const [selectedAlbum, setSelectedAlbum] = useState<FindingAlbumGroup | null>(null);
   const [redownloadFinding, setRedownloadFinding] = useState<RepairFinding | null>(null);
+  const redownloadTrackId = redownloadFinding ? findingRedownloadTrackId(redownloadFinding) : null;
 
   /** Which group is expanded. Exactly one at a time: the open group hosts the
    *  single finding list, which is what lets every row feature survive
@@ -336,6 +339,23 @@ export function FindingsSurface({
     void loadFindings();
     onStatusChanged();
   }, [loadCounts, loadFindings, loadGroups, onStatusChanged]);
+
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const changed = () => {
+      timer ??= setTimeout(() => {
+        timer = undefined;
+        void loadCounts();
+        void loadGroups();
+        if (!selectedCount.current) void loadFindings();
+      }, 500);
+    };
+    window.addEventListener('ss:library-changed', changed);
+    return () => {
+      window.removeEventListener('ss:library-changed', changed);
+      clearTimeout(timer);
+    };
+  }, [loadCounts, loadGroups, loadFindings]);
 
   // a job finished: its findings only showed after a page refresh (#1386).
   // any change after the first render counts, even from no runs at all (a
@@ -548,6 +568,13 @@ export function FindingsSurface({
           return;
         }
       }
+      if (type === TYPE_RETAG && !finding.details?.has_manual_conflict) {
+        // Nothing to settle on this row — the plain apply is the whole action.
+      } else if (type === TYPE_RETAG) {
+        fixAction = await prompts.promptRetag(1, 1);
+        if (!fixAction) return;
+        if (fixAction === 'safe') fixAction = null;
+      }
       if (type === TYPE_BACKFILL) {
         const choice = await prompts.promptBackfill(1);
         if (!choice) return;
@@ -561,6 +588,40 @@ export function FindingsSurface({
       if (type === TYPE_SUSPECT_ALBUM) {
         setReidentifyingFinding(finding);
         return;
+      }
+
+      if (type === 'native_duplicate_tracks') {
+        const weak = Boolean(finding.details?.requires_recording_confirmation);
+        const confirmed = await window.showConfirmDialog?.({
+          title: weak ? 'Confirm Recording & Keep Best' : 'Keep Best',
+          message: weak
+            ? 'After comparing these files, confirm they contain the same recording. Keep the recommended file and move redundant copies to recoverable quarantine? Protected copies stay.'
+            : 'Keep the recommended file and move redundant copies to recoverable quarantine? Protected companions, shared files and playlist copies stay.',
+          confirmText: weak ? 'Confirm Recording & Keep Best' : 'Keep Best',
+          destructive: true,
+        });
+        if (!confirmed) return;
+        fixAction = weak ? 'keep_best:confirmed' : 'keep_best';
+      }
+
+      // A finding with no catalogue subject cannot be re-downloaded — the fix
+      // is a plain delete, and unlike every prompt above it has no dialog of
+      // its own to stop at. Confirm it here rather than let one click remove a
+      // file from disk.
+      if (findingRowFixLabel(finding) === 'Delete File') {
+        const quarantined = type === 'corrupt_audio' || type === 'fake_lossless';
+        const confirmed = await window.showConfirmDialog?.({
+          title: 'Delete File',
+          message: quarantined
+            ? `Move ${findingFilePath(finding) || 'this file'} to the deleted-files folder? It is not in your library, so nothing will be queued to replace it.`
+            : `Permanently delete ${findingFilePath(finding) || 'this file'} from disk? It is not in your library, so nothing will be queued to replace it.`,
+          confirmText: 'Delete',
+          destructive: true,
+        });
+        if (!confirmed) return;
+        // Fake lossless refuses to remove an uncatalogued file without being
+        // told to: its default action is a re-download.
+        fixAction = 'delete';
       }
 
       setBusyFix((current) => new Set(current).add(finding.id));
@@ -593,9 +654,12 @@ export function FindingsSurface({
   /** `selectDuplicateToKeep`. */
   const keepDuplicate = useCallback(
     async (findingId: number, trackId: string) => {
+      const native = trackId.startsWith('file-') || trackId.startsWith('keep_best');
       const confirmed = await window.showConfirmDialog?.({
         title: 'Keep This Version',
-        message: 'Keep this version and remove the other duplicate(s)?',
+        message: native
+          ? 'Keep this file and move redundant copies to recoverable quarantine? Protected companions, shared files and playlist copies stay.'
+          : 'Keep this version and remove the other duplicate(s)?',
         confirmText: 'Keep',
         destructive: true,
       });
@@ -697,6 +761,24 @@ export function FindingsSurface({
       if (!qualityAction) return;
     }
 
+    const nativeDuplicateIds = withType('native_duplicate_tracks');
+    let nativeDuplicateAction: string | null = null;
+    if (nativeDuplicateIds.length) {
+      const weak = nativeDuplicateIds.some((id) =>
+        Boolean(byId.get(id)?.details?.requires_recording_confirmation),
+      );
+      const confirmed = await window.showConfirmDialog?.({
+        title: weak ? 'Confirm Recordings & Keep Best' : 'Keep Best',
+        message: weak
+          ? 'Confirm that each selected duplicate group contains the same recording after reviewing its files. Keep the recommended copies and quarantine redundant files? Protected copies stay.'
+          : 'Keep the recommended copies and move redundant files to recoverable quarantine? Protected copies stay.',
+        confirmText: weak ? 'Confirm Recordings & Keep Best' : 'Keep Best',
+        destructive: true,
+      });
+      if (!confirmed) return;
+      nativeDuplicateAction = weak ? 'keep_best:confirmed' : 'keep_best';
+    }
+
     let fixed = 0;
     let failed = 0;
     let lastError = '';
@@ -728,6 +810,7 @@ export function FindingsSurface({
         else if (findingType === TYPE_DEAD && deadAction) fixAction = deadAction;
         else if (findingType === TYPE_ACOUSTID && acoustidAction) fixAction = acoustidAction;
         else if (findingType === TYPE_QUALITY && qualityAction) fixAction = qualityAction;
+        else if (findingType === 'native_duplicate_tracks') fixAction = nativeDuplicateAction;
         // Backfill "Add to Wishlist" falls through with no action — the fix
         // handler already adds to the wishlist by default.
 
@@ -805,6 +888,15 @@ export function FindingsSurface({
           return;
         }
         // 'add_to_wishlist' falls through with no fix_action.
+      } else if (group.finding_type === TYPE_RETAG) {
+        // Two requests wear one button: write the library's values, and write
+        // them even over the fields this user edited by hand. The count comes
+        // with the group so the choice is informed rather than a coin toss.
+        fixAction = await prompts.promptRetag(count, group.manual_conflicts || 0);
+        if (!fixAction) return;
+        // 'safe' IS the default the handler takes with no action at all;
+        // sending it would only add a string nothing reads.
+        if (fixAction === 'safe') fixAction = null;
       } else if (group.finding_type === TYPE_DEAD) {
         fixAction = await prompts.promptDeadFile();
         if (!fixAction) return;
@@ -842,6 +934,15 @@ export function FindingsSurface({
           });
           if (!confirmed) return;
         }
+      } else if (group.finding_type === 'native_duplicate_tracks') {
+        const confirmed = await window.showConfirmDialog?.({
+          title: 'Keep Best',
+          message: `Keep recommended copies for ${count.toLocaleString()} duplicate findings and move redundant files to recoverable quarantine? Protected copies stay. Weak matches remain pending for individual recording confirmation.`,
+          confirmText: 'Keep Best',
+          destructive: true,
+        });
+        if (!confirmed) return;
+        fixAction = 'keep_best';
       } else {
         // Everything else takes its default action. Destructive types still
         // spell out what happens to files; safe ones just confirm the scale.
@@ -1489,11 +1590,11 @@ export function FindingsSurface({
 
       {/* a finding with no track behind it (a fake-lossless FILE finding) has no
           id to search for; its finding id is not a track id */}
-      {redownloadFinding?.entity_id ? (
+      {redownloadFinding && redownloadTrackId ? (
         <RedownloadModal
           track={{
-            id: String(redownloadFinding.entity_id),
-            track_id: String(redownloadFinding.entity_id),
+            id: redownloadTrackId,
+            track_id: redownloadTrackId,
             title: String(
               (redownloadFinding.details as Record<string, any>)?.track_title ||
                 redownloadFinding.title ||
@@ -1518,8 +1619,8 @@ export function FindingsSurface({
               '',
             tracks: [
               {
-                id: String(redownloadFinding.entity_id),
-                track_id: String(redownloadFinding.entity_id),
+                id: redownloadTrackId,
+                track_id: redownloadTrackId,
                 title: String(
                   (redownloadFinding.details as Record<string, any>)?.track_title ||
                     redownloadFinding.title ||
@@ -1587,7 +1688,7 @@ function FindingCard({
 }) {
   const details = finding.details || {};
   const filePath = findingFilePath(finding);
-  const fixLabel = findingFixLabel(finding.finding_type);
+  const fixLabel = findingRowFixLabel(finding);
   const statusBadge = findingStatusBadge(finding.status, finding.user_action);
 
   return (
@@ -1654,7 +1755,7 @@ function FindingCard({
                       finding.finding_type === 'fake_lossless' ||
                       finding.finding_type === 'short_preview_track' ||
                       finding.finding_type === 'dead_file';
-                    if (isRedownload && onInspectRedownload && finding.entity_id) {
+                    if (isRedownload && onInspectRedownload && findingRedownloadTrackId(finding)) {
                       onInspectRedownload(finding);
                     } else {
                       void onFix(finding);

@@ -192,7 +192,7 @@ class WishlistService:
             logger.error("No track data provided for wishlist add")
             return self.database._wishlist_outcome("rejected", reason="no track data")
 
-        return self.database.add_to_wishlist_detailed(
+        outcome = self.database.add_to_wishlist_detailed(
             track_data=track_data,
             failure_reason=failure_reason,
             source_type=source_type,
@@ -201,6 +201,7 @@ class WishlistService:
             user_initiated=user_initiated,
             quality_profile_id=quality_profile_id,
         )
+        return outcome
 
     def add_spotify_track_to_wishlist(
         self,
@@ -212,6 +213,7 @@ class WishlistService:
         profile_id: int = 1,
         quality_profile_id: Optional[int] = None,
         detailed: bool = False,
+        user_initiated: bool = False,
     ):
         """Backward-compatible wrapper for `add_track_to_wishlist`.
 
@@ -228,6 +230,7 @@ class WishlistService:
             source_context=source_context,
             profile_id=profile_id,
             quality_profile_id=quality_profile_id,
+            user_initiated=user_initiated,
         )
         return outcome if detailed else outcome["created"]
 

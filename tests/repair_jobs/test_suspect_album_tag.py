@@ -210,21 +210,31 @@ def test_skips_compilation_if_artist_is_various():
     assert len(findings) == 0
 
 
-def test_flags_lone_track_when_full_release_has_many_tracks():
-    row = _row_dict(
-        album_title="Ordinary Album",
-        thumb_url="http://art.jpg",
-        full_track_count=12,  # Expected full release is 12 tracks, but we only have 1
-        artist_name="Coldplay",
-        track_title="Yellow",
-    )
+def test_one_wished_track_of_a_big_album_alone_is_not_suspect():
+    """The Wishlist case: one track of a 12-track album, cover present."""
+    row = _row_dict(album_title="Ordinary Album", thumb_url="http://art.jpg",
+                    full_track_count=12, artist_name="Coldplay", track_title="Yellow")
     ctx, findings = _context([row])
-    result = SuspectAlbumTagDetector().scan(ctx)
+    assert SuspectAlbumTagDetector().scan(ctx).findings_created == 0
 
-    assert result.findings_created == 1
-    f = findings[0]
-    assert any("only 1 of 12 tracks locally owned" in r for r in f["details"]["reasons"])
-    assert f["details"]["reidentify_query"] == "Yellow Coldplay"
+
+def test_lone_track_of_a_big_album_corroborates_another_signal():
+    row = _row_dict(album_title="Ordinary Album", thumb_url=None,
+                    full_track_count=12, artist_name="Coldplay", track_title="Yellow")
+    ctx, findings = _context([row])
+    SuspectAlbumTagDetector().scan(ctx)
+    assert findings[0]["details"]["reasons"] == ["no cover art", "only 1 of 12 tracks locally owned"]
+    assert findings[0]["details"]["reidentify_query"] == "Yellow Coldplay"
+
+
+def test_singles_and_an_artists_own_greatest_hits_are_not_suspects():
+    single = _row_dict(album_title="Yellow", thumb_url=None, artist_name="Coldplay")
+    single["album_type"] = "single"
+    hits = _row_dict(album_id=2, album_title="Greatest Hits", thumb_url="http://art.jpg",
+                     full_track_count=17, artist_name="Queen", track_id=101)
+    hits["album_artist_name"] = "Queen"
+    ctx, findings = _context([single, hits])
+    assert SuspectAlbumTagDetector().scan(ctx).findings_created == 0
 
 
 def test_normal_single_with_art_not_flagged():
@@ -262,3 +272,79 @@ def test_fix_finding_requires_reidentify_target():
     )
     assert res["success"] is False
     assert "Re-identify button" in res["error"]
+
+
+# ── Library v2: the query against a real catalogue ─────────────────────────
+
+def _lib2_album(db, artist, title, *, owned_tracks, catalogue_tracks, image=None,
+                track_count=None, credit=None):
+    """An album with `catalogue_tracks` rows, the first `owned_tracks` of them
+    with a live file. Returns the lib2 track ids."""
+    with db._get_connection() as conn:
+        artist_id = conn.execute(
+            "INSERT INTO lib2_artists (name, name_key) VALUES (?, ?)",
+            (artist, f"{artist.lower()}-{title.lower()}")).lastrowid
+        album_id = conn.execute(
+            "INSERT INTO lib2_albums (primary_artist_id, title, image_url, track_count, origin) "
+            "VALUES (?, ?, ?, ?, 'library')",
+            (artist_id, title, image, track_count)).lastrowid
+        credit_id = None
+        if credit:
+            credit_id = conn.execute(
+                "INSERT INTO lib2_artists (name, name_key) VALUES (?, ?)",
+                (credit, f"{credit.lower()}-credit")).lastrowid
+        ids = []
+        for n in range(catalogue_tracks):
+            track_id = conn.execute(
+                "INSERT INTO lib2_tracks (album_id, title, track_number) VALUES (?, ?, ?)",
+                (album_id, f"{title} {n + 1}", n + 1)).lastrowid
+            if credit_id:
+                conn.execute("INSERT INTO lib2_track_artists (track_id, artist_id) VALUES (?, ?)",
+                             (track_id, credit_id))
+            if n < owned_tracks:
+                conn.execute(
+                    "INSERT INTO lib2_track_files (track_id, path, is_primary) VALUES (?, ?, 1)",
+                    (track_id, f"/music/{artist}/{title}/{n + 1}.flac"))
+            ids.append(track_id)
+        conn.commit()
+    return ids
+
+
+def test_library_v2_lone_owned_track_is_flagged_with_a_native_subject(tmp_path):
+    from database.music_database import MusicDatabase
+
+    db = MusicDatabase(str(tmp_path / "m.db"))
+    lone = _lib2_album(db, "Various Artists", "Hitzone 43", owned_tracks=1,
+                       catalogue_tracks=20, image="http://art.jpg", track_count=20,
+                       credit="Daughtry")
+    _lib2_album(db, "Coldplay", "Parachutes", owned_tracks=10, catalogue_tracks=10,
+                image="http://art.jpg", track_count=10)
+    findings = []
+    ctx = JobContext(db=db, transfer_folder="/music", config_manager=None,
+                     create_finding=lambda **kw: findings.append(kw) or True)
+
+    result = SuspectAlbumTagDetector().scan(ctx)
+
+    assert result.scanned == 1                       # only the one-track album
+    assert len(findings) == 1
+    f = findings[0]
+    assert f["entity_id"] == f"lib2:{lone[0]}"
+    assert f["file_path"] == "/music/Various Artists/Hitzone 43/1.flac"
+    assert f["details"]["artist_name"] == "Daughtry"   # the track's own credit
+    assert f["details"]["album_artist_name"] == "Various Artists"
+    assert any("only 1 of 20" in r for r in f["details"]["reasons"])
+    assert SuspectAlbumTagDetector().estimate_scope(ctx) == 1
+
+
+def test_library_v2_wanted_tracks_without_files_are_not_owned(tmp_path):
+    """a monitored album's missing tracks are catalogue rows with no file;
+    they are not "your tracks" and must not hide a lone owned one"""
+    from database.music_database import MusicDatabase
+
+    db = MusicDatabase(str(tmp_path / "m.db"))
+    _lib2_album(db, "Nobody", "Nothing Owned", owned_tracks=0, catalogue_tracks=5)
+    findings = []
+    ctx = JobContext(db=db, transfer_folder="/music", config_manager=None,
+                     create_finding=lambda **kw: findings.append(kw) or True)
+    assert SuspectAlbumTagDetector().scan(ctx).scanned == 0
+    assert findings == []

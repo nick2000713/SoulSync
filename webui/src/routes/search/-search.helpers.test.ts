@@ -16,6 +16,7 @@ import {
   formatVideoDuration,
   formatViewCount,
   hasAnyResults,
+  inLibraryArtistPath,
   isIdLookupQuery,
   labelDetailPath,
   labelMetaLine,
@@ -402,6 +403,29 @@ describe('detail paths', () => {
     expect(artistDetailPath(42, '   ')).toBe('/artist-detail/library/42');
   });
 
+  /**
+   * The "In Your Library" section is the one place a search result points at
+   * something the user already owns, so it opens the page that can manage it.
+   * The old vanilla search sent every one of them to the legacy artist page,
+   * which is the bug this replaces (docs/library-v2-issues.md §10/§11).
+   */
+  it('opens an "In Your Library" hit in Library v2 when v2 knows the artist', () => {
+    // ldp-05 (iss29-B05): a search arrival lands on the legacy artist page's
+    // shape — full discography, cards, rich header. Without these params the
+    // deep link fell back to the in-library defaults, so the same artist looked
+    // different depending on whether v2 had mapped it.
+    expect(inLibraryArtistPath({ id: 42, library_v2_id: 7 })).toBe(
+      '/library?artist=7&releases=all&releaseView=cards&header=rich',
+    );
+  });
+
+  it('falls back to artist detail when v2 has not mapped the artist', () => {
+    // No v2 id means no v2 row — routing there would open an artist that does
+    // not exist. Both an absent and an explicitly null id take the fallback.
+    expect(inLibraryArtistPath({ id: 42 })).toBe('/artist-detail/library/42');
+    expect(inLibraryArtistPath({ id: 42, library_v2_id: null })).toBe('/artist-detail/library/42');
+  });
+
   it('lowercases the source, as _normalizeArtistDetailSource does', () => {
     expect(artistDetailPath('x', 'Deezer')).toBe('/artist-detail/deezer/x');
   });
@@ -506,5 +530,34 @@ describe('the results layout helpers', () => {
     expect(shelfColumns(1000, 168, 14)).toBe(5);
     expect(shelfColumns(168 * 3 + 14 * 2, 168, 14)).toBe(3);
     expect(shelfColumns(80, 168, 14)).toBe(1);
+  });
+});
+
+describe('playlistTrackOf', () => {
+  it('takes the main artist, not the joined credit', async () => {
+    const { playlistTrackOf } = await import('./-search.helpers');
+    expect(
+      playlistTrackOf({
+        name: 'Love.',
+        artist: 'Kendrick Lamar, Zacari',
+        artists: ['Kendrick Lamar', 'Zacari'],
+        album: 'DAMN.',
+        duration_ms: 213000,
+        image_url: 'https://img/x.jpg',
+      }),
+    ).toEqual({
+      track_name: 'Love.',
+      artist_name: 'Kendrick Lamar',
+      album_name: 'DAMN.',
+      duration_ms: 213000,
+      image_url: 'https://img/x.jpg',
+    });
+  });
+
+  it('falls back to the display artist, and gives up without one', async () => {
+    const { playlistTrackOf } = await import('./-search.helpers');
+    expect(playlistTrackOf({ name: 'A', artist: 'B' })?.artist_name).toBe('B');
+    expect(playlistTrackOf({ name: 'A' })).toBeNull();
+    expect(playlistTrackOf({ artist: 'B' })).toBeNull();
   });
 });

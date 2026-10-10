@@ -38,10 +38,14 @@ jobs:
       - name: Build app
         run: python -m compileall api core database services scripts web_server.py wsgi.py beatport_unified_scraper.py
 
+      # Chunked on purpose: one pytest process over the whole suite leaks
+      # background workers and a shared asyncio loop between files, and a single
+      # wedged file then takes the rest of the run with it. See the header of
+      # the script.
       - name: Run tests
         env:
           PYTHONPATH: ${{ github.workspace }}
-        run: python -m pytest -n auto
+        run: ./scripts/run_tests_chunked.sh
 
   webui:
     runs-on: ubuntu-latest
@@ -72,5 +76,57 @@ jobs:
       - name: Build webui
         run: npm run build
 
+      # Audit §16.1: the generated route tree must be committed in sync with
+      # the route files. A diff here means someone edited routes without
+      # committing the regenerated webui/src/routeTree.gen.ts (or edited the
+      # generated file by hand) — routes would differ between dev and the
+      # checked-in tree.
+      - name: Route tree must not drift
+        run: |
+          git diff --exit-code -- src/routeTree.gen.ts || {
+            echo "::error file=webui/src/routeTree.gen.ts::routeTree.gen.ts is stale — run the webui build and commit the regenerated file."
+            exit 1
+          }
+
       - name: Run tests
         run: npm test
+
+  webui-visual:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Non-blocking for now: UI changes land on dev without re-rendered
+    # baselines, so a diff here is a heads-up, not a red run. The diffs are
+    # still uploaded. Refresh the baselines with the visual-baselines
+    # workflow (see webui/tests/visual/README.md).
+    continue-on-error: true
+    # The baselines are rendered in this image (webui/scripts/visual.mjs runs
+    # them in it locally too), so fonts and rasterising match. Keep the tag in
+    # step with @playwright/test in webui/package.json.
+    container:
+      image: mcr.microsoft.com/playwright:v1.59.1-jammy
+      options: --ipc=host
+
+    defaults:
+      run:
+        working-directory: webui
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build webui
+        run: npm run build
+
+      - name: Compare screenshot baselines
+        run: node scripts/visual.mjs
+
+      - name: Upload diffs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: visual-diffs
+          path: webui/test-results
+          retention-days: 7

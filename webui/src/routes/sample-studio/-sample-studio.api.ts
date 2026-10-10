@@ -2,8 +2,9 @@
  * Sample Studio — API layer.
  *
  * Library search reuses the session-auth GET /api/library/tracks wrapper
- * (free-text `q` over title + artist) and GET /api/library/recently-added
- * (default browse view). Analysis + peaks come from the Phase 1 api/sample.py
+ * (free-text `q` over title + artist) and GET /api/library/tracks/recent
+ * (default browse view). not /api/library/recently-added: that's the
+ * dashboard's album rail, and asking it for tracks always failed. Analysis + peaks come from the Phase 1 api/sample.py
  * endpoints via the session-auth /api/sample/* wrappers in web_server.py.
  */
 
@@ -24,6 +25,7 @@ import type {
   StemName,
   StemsInfo,
   StudioTrack,
+  TrackId,
 } from './-sample-studio.types';
 
 import { isAnalysisError } from './-sample-studio.types';
@@ -36,17 +38,14 @@ interface Envelope<T> {
   error: string | null;
 }
 
-interface TrackSearchResponse {
-  tracks: StudioTrack[];
-}
+type StudioTrackRow = Omit<StudioTrack, 'id'> & { id: string | number };
 
-interface RecentlyAddedResponse {
-  items: StudioTrack[];
-  type: string;
+interface TrackSearchResponse {
+  tracks: StudioTrackRow[];
 }
 
 interface AnalysisPayload {
-  track_id: number;
+  track_id: TrackId;
   status: AnalysisStatus;
   bpm: number | null;
   onsets: number[] | null;
@@ -61,12 +60,12 @@ export function studioTrackSearchQueryOptions(query: string) {
     queryKey: [...SAMPLE_STUDIO_QUERY_KEY, 'tracks', q] as const,
     queryFn: async (): Promise<StudioTrack[]> => {
       if (!q) {
-        const payload = await readJson<Envelope<RecentlyAddedResponse>>(
-          apiClient.get('library/recently-added', {
-            searchParams: { type: 'tracks', limit: 50 },
+        const payload = await readJson<Envelope<TrackSearchResponse>>(
+          apiClient.get('library/tracks/recent', {
+            searchParams: { limit: 50 },
           }),
         );
-        return payload.data.items.map(toStudioTrack);
+        return payload.data.tracks.map(toStudioTrack);
       }
       const payload = await readJson<Envelope<TrackSearchResponse>>(
         apiClient.get('library/tracks', {
@@ -85,9 +84,9 @@ export function studioTrackSearchQueryOptions(query: string) {
  * queryFn above is the single choke point both the search and the browse
  * view flow through, so every StudioTrack in the app carries seconds.
  */
-function toStudioTrack(row: StudioTrack): StudioTrack {
+function toStudioTrack(row: StudioTrackRow): StudioTrack {
   const ms = row.duration;
-  return { ...row, duration: typeof ms === 'number' ? ms / 1000 : ms };
+  return { ...row, id: String(row.id), duration: typeof ms === 'number' ? ms / 1000 : ms };
 }
 
 function normalizeKey(raw: unknown): SampleKey | null {
@@ -120,7 +119,7 @@ function normalizeAnalysis(payload: AnalysisPayload): SampleAnalysis {
  * `retryNonce` re-fires the query with ?retry=1, which clears the recorded
  * error and queues the track again.
  */
-export function studioAnalysisQueryOptions(trackId: number | null, retryNonce = 0) {
+export function studioAnalysisQueryOptions(trackId: TrackId | null, retryNonce = 0) {
   return queryOptions({
     queryKey: [...SAMPLE_STUDIO_QUERY_KEY, 'analysis', trackId, retryNonce] as const,
     enabled: trackId !== null,
@@ -142,7 +141,7 @@ export function studioAnalysisQueryOptions(trackId: number | null, retryNonce = 
 }
 
 export function studioPeaksQueryOptions(
-  trackId: number | null,
+  trackId: TrackId | null,
   buckets = 1500,
   stem: StemName | null = null,
 ) {
@@ -208,7 +207,7 @@ function fxToRenderParams(fx: RenderFx | undefined): {
 
 /** Fast server render of the in/out region for auditioning pitch/BPM/FX changes. */
 export async function requestPreview(
-  trackId: number,
+  trackId: TrackId,
   params: PreviewParams,
 ): Promise<PreviewResult> {
   const payload = await readJson<Envelope<PreviewResponse>>(
@@ -246,7 +245,7 @@ export interface SaveChopParams extends PreviewParams {
 
 /** Final render + stash row (file + bookmark). The FX recipe renders into
  *  the audio AND is persisted on the stash entry. */
-export async function saveChop(trackId: number, params: SaveChopParams): Promise<StashEntry> {
+export async function saveChop(trackId: TrackId, params: SaveChopParams): Promise<StashEntry> {
   const payload = await readJson<Envelope<StashEntry>>(
     apiClient.post('sample/chop', {
       json: {
@@ -314,19 +313,19 @@ export function stashExportUrl(): string {
 }
 
 /** Direct streaming URL for one separated stem. */
-export function stemAudioUrl(trackId: number, stem: StemName): string {
-  return `/api/sample/stems/${trackId}/${stem}/audio`;
+export function stemAudioUrl(trackId: TrackId, stem: StemName): string {
+  return `/api/sample/stems/${encodeURIComponent(trackId)}/${stem}/audio`;
 }
 
 /** Enqueue stem separation for a track. Idempotent. */
-export async function requestStems(trackId: number): Promise<StemsInfo> {
+export async function requestStems(trackId: TrackId): Promise<StemsInfo> {
   const payload = await readJson<Envelope<StemsInfo>>(
     apiClient.post('sample/stems', { json: { track_id: trackId } }),
   );
   return payload.data;
 }
 
-export function studioStemsStatusQueryOptions(trackId: number | null, active: boolean) {
+export function studioStemsStatusQueryOptions(trackId: TrackId | null, active: boolean) {
   return queryOptions({
     queryKey: [...SAMPLE_STUDIO_QUERY_KEY, 'stems', 'status', trackId] as const,
     enabled: trackId !== null,
@@ -362,7 +361,7 @@ export interface TrimResult {
  * you're chopping from, not the full mix.
  */
 export async function trimSilence(
-  trackId: number,
+  trackId: TrackId,
   start: number,
   end: number,
   stem: StemName | null = null,
@@ -381,7 +380,7 @@ export async function trimSilence(
  * null when the track left the library.
  */
 export async function lookupStudioTrack(
-  trackId: number,
+  trackId: TrackId,
   title: string,
   artistName: string | null,
 ): Promise<StudioTrack | null> {
@@ -390,5 +389,7 @@ export async function lookupStudioTrack(
       searchParams: { title, artist: artistName ?? '', limit: 50 },
     }),
   );
-  return payload.data.tracks.map(toStudioTrack).find((t) => t.id === trackId) ?? null;
+  return (
+    payload.data.tracks.map(toStudioTrack).find((t) => String(t.id) === String(trackId)) ?? null
+  );
 }

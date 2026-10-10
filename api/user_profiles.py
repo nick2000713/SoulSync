@@ -455,7 +455,10 @@ def list_profiles():
                         # where an own-library folder goes on this install (#1199):
                         # a mount under /app in docker, anywhere otherwise
                         'own_library_root_hint': _own_library_root_hint(),
-                        'own_library_supported': config_manager.get_active_media_server() in ('plex', 'jellyfin')})
+                        'own_library_supported': config_manager.get_active_media_server() in ('plex', 'jellyfin'),
+                        # supported != available: the server may be right and the
+                        # feature still parked, and the UI must say which
+                        'own_library_available': not _own_library_parked()})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -657,8 +660,8 @@ def update_profile(profile_id):
                 if problem:
                     return jsonify({'success': False, 'error': problem}), 400
             library_result = database.set_profile_library(profile_id, mode, root or None)
-            from core.library_scope import invalidate_library_scope_cache
-            invalidate_library_scope_cache()
+            from core.library_scope import library_config_changed
+            library_config_changed()
             try:
                 from core.imports.paths import reset_own_library_fallback_notifications
                 reset_own_library_fallback_notifications()
@@ -711,6 +714,9 @@ def delete_profile(profile_id):
             from api.profiles import _sweep_video_profile_data
             _sweep_video_profile_data(profile_id)
             _audit('profile_deleted', profile_id, target.get('name'))
+            # its folder is no library any more (#1199)
+            from core.library_scope import library_config_changed
+            library_config_changed()
         return jsonify({'success': success})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -1307,6 +1313,15 @@ def _is_docker() -> bool:
     return os.path.exists('/.dockerenv')
 
 
+def _own_library_parked() -> bool:
+    """Whether own libraries are switched off in this build (SCOPE_PARKED)."""
+    try:
+        from core.library_scope import SCOPE_PARKED
+        return bool(SCOPE_PARKED)
+    except Exception:  # noqa: BLE001 - unreadable means treat it as off
+        return True
+
+
 def _own_library_root_hint(name: str = '<name>') -> str:
     """the folder an own library is prefilled with. in docker that is a mount
     the compose file has to provide (same rule as /app/Transfer). outside
@@ -1437,6 +1452,80 @@ def link_plex_home_user():
         return jsonify({'success': True, 'title': title})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/profiles/me/plex-connect/start', methods=['POST'])
+def plex_connect_start():
+    """connect with plex from my account: anyone, home user or a friend the
+    server is shared with, proves their plex account on plex's own page.
+    the pin lives in this session only, apart from login's"""
+    from api.login import plex_start_limiter
+    ip = request.remote_addr or 'unknown'
+    now = time.time()
+    locked, retry_after = plex_start_limiter.is_locked(ip, '<plex>', now)
+    if locked:
+        return (jsonify({'success': False, 'error': 'Too many attempts — please wait and try again'}),
+                429, {'Retry-After': str(retry_after)})
+    plex_start_limiter.record_failure(ip, '<plex>', now)  # every start counts
+    try:
+        from core.security import plex_signin
+        cid = plex_signin.client_identifier(config_manager)
+        pin = plex_signin.start_pin(cid)
+        session['plex_connect_pin'] = pin['id']
+        session['plex_connect_profile'] = get_current_profile_id()
+        session.pop('plex_connect_checked_at', None)
+        return jsonify({'success': True, 'url': pin['url']})
+    except Exception as e:
+        logger.error(f"Plex connect could not start: {e}")
+        return jsonify({'success': False, 'error': "Couldn't reach Plex. Try again in a moment."}), 502
+
+
+@bp.route('/api/profiles/me/plex-connect/check', methods=['POST'])
+def plex_connect_check():
+    """poll the pin. once approved: who they are on plex links to this
+    profile, for playlists, plex sign-in and their own listening history"""
+    pid = get_current_profile_id()
+    pin_id = session.get('plex_connect_pin')
+    if not pin_id or session.get('plex_connect_profile') != pid:
+        # a pin started under another profile in this browser isn't this one's
+        return jsonify({'success': False, 'error': 'Start connecting with Plex first'}), 400
+    import api.login as login_api
+    now = time.time()
+    if now - float(session.get('plex_connect_checked_at') or 0) < login_api._PLEX_CHECK_MIN_INTERVAL:
+        return jsonify({'success': True, 'pending': True})
+    session['plex_connect_checked_at'] = now
+    try:
+        import requests as _requests
+        from core.security import plex_signin
+        cid = plex_signin.client_identifier(config_manager)
+        try:
+            account_token = plex_signin.check_pin(cid, pin_id)
+        except _requests.HTTPError as e:
+            if getattr(e.response, 'status_code', None) == 404:
+                session.pop('plex_connect_pin', None)
+                return jsonify({'success': False, 'error': 'That Plex link expired. Try again.'}), 410
+            logger.warning(f"Plex connect check failed, will retry: {e}")
+            return jsonify({'success': True, 'pending': True})
+        except _requests.RequestException as e:
+            logger.warning(f"Plex connect check failed, will retry: {e}")
+            return jsonify({'success': True, 'pending': True})
+        if not account_token:
+            return jsonify({'success': True, 'pending': True})
+        session.pop('plex_connect_pin', None)
+        session.pop('plex_connect_profile', None)
+        engine = _media_server_engine()
+        client = engine.client('plex') if engine is not None else None
+        machine = plex_signin.server_machine_id(client)
+        if not machine:
+            return jsonify({'success': False, 'error': "SoulSync isn't connected to a Plex server"}), 503
+        account = plex_signin.resolve_account(account_token, machine)
+        result = plex_signin.connect_profile(get_database(), pid, account)
+        if result.error:
+            return jsonify({'success': False, 'error': result.error}), 403
+        return jsonify({'success': True, 'pending': False, 'title': account.username})
+    except Exception as e:
+        logger.error(f"Plex connect failed: {e}")
+        return jsonify({'success': False, 'error': 'Connecting with Plex failed. Try again.'}), 502
 
 
 @bp.route('/api/profiles/me/plex-home-user', methods=['DELETE'])

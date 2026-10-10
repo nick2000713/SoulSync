@@ -15,7 +15,21 @@ from utils.logging_config import get_logger
 from core.listening_scope import SHARED_OWNER, owner_clause
 from core.worker_utils import interruptible_sleep
 
+
+def _name_key(name) -> str:
+    """The catalogue's folded artist key (indexed, and not ASCII-only)."""
+    from core.library2.importer import normalize_name
+
+    return normalize_name(str(name or ''))
+
 logger = get_logger("listening_stats_worker")
+
+
+def _play_epoch(played_at):
+    """a stored play time (utc) as unix seconds, None when unreadable"""
+    from core.listening_import.dedup import canonical_played_at, _timestamp
+    canonical = canonical_played_at(played_at)
+    return _timestamp(canonical) if canonical else None
 
 SHARED_SCOPE = owner_clause(SHARED_OWNER)
 
@@ -147,11 +161,60 @@ class ListeningStatsWorker:
         self.current_item = None
         logger.info("Listening stats worker thread finished")
 
+    _TAGGED_KEY = 'listening_plays_account_tagged_{server}'
+
+    def _tag_old_plays_once(self, client, server):
+        """rows recorded before plays kept their account don't say who played
+        them, so they all sat in the shared pile. read the server's full
+        history once and tag each row with its account; re-filing then moves
+        them. plex only (the only server whose history names the account).
+        retried next poll if it fails; never twice once done"""
+        if server != 'plex':
+            return
+        key = self._TAGGED_KEY.format(server=server)
+        try:
+            if self.db.get_metadata(key):
+                return
+            history = client.get_play_history(limit=None)
+            if not history:
+                return
+            tags = [(e['account_id'], e['track_id'], e['played_at']) for e in history
+                    if e.get('account_id') and e.get('track_id') and e.get('played_at')]
+            conn = self.db._get_connection()
+            try:
+                tagged = 0
+                for account_id, track_id, played_at in tags:
+                    cur = conn.execute(
+                        "UPDATE listening_history SET server_account_id = ? "
+                        "WHERE server_source = ? AND track_id = ? AND played_at = ? "
+                        "AND server_account_id IS NULL",
+                        (account_id, server, track_id, played_at))
+                    tagged += cur.rowcount
+                conn.commit()
+            finally:
+                conn.close()
+            self.db.set_metadata(key, '1')
+            logger.info(f"Tagged {tagged} earlier {server} plays with the account that played them")
+        except Exception as e:
+            logger.warning(f"Tagging earlier {server} plays by account failed, will retry: {e}")
+
+    def _repair_history_once(self):
+        try:
+            from core.listening_import.history_repair import repair_once
+            repair_once(self.db)
+        except Exception as e:
+            logger.warning(f"Listening history repair failed, will retry next poll: {e}")
+
     def _poll(self):
         """Poll the active media server for play data."""
         active_server = self.config_manager.get_active_media_server()
         logger.info(f"Polling {active_server} for listening data...")
         self.current_item = f"Polling {active_server}..."
+
+        # once: put every stored play on one clock and fold the last.fm /
+        # listenbrainz copies of soulsync's own scrobbles back into their
+        # plays. before this poll inserts, so new plays meet repaired rows
+        self._repair_history_once()
 
         client = self._engine.client(active_server) if self._engine else None
         # SoulSync standalone has no listening data; only the three
@@ -173,11 +236,17 @@ class ListeningStatsWorker:
             return
 
         if history:
+            # each play goes in the pile of whoever played it: the owner's
+            # plays are the shared pile, a linked profile's are its own, an
+            # account linked to nobody is kept but claimed by no one
+            from core.listening_scope import media_account_owner, media_account_owners
+            account_owners = media_account_owners(self.db, active_server)
             # Convert to DB format
             events = []
             for entry in history:
                 if not entry.get('played_at'):
                     continue
+                account_id = entry.get('account_id')
                 events.append({
                     'track_id': entry.get('track_id', ''),
                     'title': entry.get('track_title', ''),
@@ -186,9 +255,10 @@ class ListeningStatsWorker:
                     'played_at': entry.get('played_at'),
                     'duration_ms': entry.get('duration_ms', 0),
                     'server_source': active_server,
-                    # the app's server account, so the shared pile. a navidrome
-                    # admin only ever sees its own plays here (#1293).
-                    'profile_id': SHARED_OWNER,
+                    # no account (jellyfin, navidrome: the app's own account
+                    # only) is the shared pile, as before (#1293)
+                    'profile_id': media_account_owner(account_owners, account_id),
+                    'server_account_id': account_id,
                     # db_track_id filled in below by a single batched lookup
                     'db_track_id': None,
                 })
@@ -197,15 +267,25 @@ class ListeningStatsWorker:
             id_map = self._resolve_db_track_ids_batch(events)
             for ev in events:
                 title_l = (ev.get('title') or '').strip().lower()
-                artist_l = (ev.get('artist') or '').strip().lower()
+                artist_l = _name_key((ev.get('artist') or '').strip())
                 if title_l:
-                    ev['db_track_id'] = id_map.get((title_l, artist_l))
+                    ev['lib2_track_id'] = id_map.get((title_l, artist_l))
 
             inserted = self.db.insert_listening_events(events)
             self.stats['events_added'] += inserted
             logger.info(f"Inserted {inserted} new listening events (of {len(events)} total)")
 
-        # Step 2: Fetch play counts and update tracks table
+        # plays recorded before accounts were kept: tag them once from the
+        # server's full history, then re-file anything whose account's pile
+        # changed (a profile linked or unlinked since)
+        self._tag_old_plays_once(client, active_server)
+        try:
+            from core.listening_scope import reattribute_media_plays
+            reattribute_media_plays(self.db, active_server)
+        except Exception as e:
+            logger.warning(f"Re-filing plays by account failed: {e}")
+
+        # Step 2: Fetch play counts and record them per track
         self.current_item = f"Updating play counts from {active_server}..."
         try:
             server_counts = client.get_track_play_counts()
@@ -408,8 +488,9 @@ class ListeningStatsWorker:
                                     'artist': r[2] or '',
                                     'track': r[1] or '',
                                     'album': r[3] or '',
-                                    'timestamp': r[4],
-                                } for r in rows]
+                                    # stored utc; the clients read a bare time as local
+                                    'timestamp': _play_epoch(r[4]),
+                                } for r in rows if _play_epoch(r[4])]
 
                                 if lb_client.submit_listens(listens):
                                     # Mark as scrobbled
@@ -458,8 +539,9 @@ class ListeningStatsWorker:
                                     'artist': r[2] or '',
                                     'track': r[1] or '',
                                     'album': r[3] or '',
-                                    'timestamp': r[4],
-                                } for r in batch]
+                                    # stored utc; the clients read a bare time as local
+                                    'timestamp': _play_epoch(r[4]),
+                                } for r in batch if _play_epoch(r[4])]
 
                                 if lfm_client.scrobble_tracks(tracks):
                                     all_scrobbled_ids.extend(r[0] for r in batch)
@@ -494,11 +576,12 @@ class ListeningStatsWorker:
             conn = self.db._get_connection()
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT t.id FROM tracks t
-                JOIN artists ar ON ar.id = t.artist_id
-                WHERE LOWER(t.title) = LOWER(?) AND LOWER(ar.name) = LOWER(?)
+                SELECT t.id FROM lib2_tracks t
+                JOIN lib2_albums al ON al.id = t.album_id
+                JOIN lib2_artists ar ON ar.id = al.primary_artist_id
+                WHERE LOWER(t.title) = LOWER(?) AND ar.name_key = ?
                 LIMIT 1
-            """, (title.strip(), (artist or '').strip()))
+            """, (title.strip(), _name_key(artist)))
             row = cursor.fetchone()
             return row[0] if row else None
         except Exception:
@@ -522,7 +605,7 @@ class ListeningStatsWorker:
             title = (ev.get('title') or '').strip()
             artist = (ev.get('artist') or '').strip()
             if title:
-                pairs.add((title.lower(), artist.lower()))
+                pairs.add((title.lower(), _name_key(artist)))
 
         result = {}
         if not pairs:
@@ -538,13 +621,16 @@ class ListeningStatsWorker:
             for i in range(0, len(pair_list), chunk_size):
                 chunk = pair_list[i:i + chunk_size]
                 placeholders = ','.join(['(?,?)'] * len(chunk))
+                # The artist half is matched on the indexed, accent-preserving
+                # fold `name_key`; SQLite's LOWER() is ASCII-only (iss29-D13).
                 flat_args = [v for pair in chunk for v in pair]
                 cursor.execute(
                     f"""
-                    SELECT LOWER(t.title), LOWER(ar.name), t.id
-                    FROM tracks t
-                    JOIN artists ar ON ar.id = t.artist_id
-                    WHERE (LOWER(t.title), LOWER(ar.name)) IN ({placeholders})
+                    SELECT LOWER(t.title), ar.name_key, t.id
+                    FROM lib2_tracks t
+                    JOIN lib2_albums al ON al.id = t.album_id
+                    JOIN lib2_artists ar ON ar.id = al.primary_artist_id
+                    WHERE (LOWER(t.title), ar.name_key) IN ({placeholders})
                     """,
                     flat_args,
                 )
@@ -561,11 +647,13 @@ class ListeningStatsWorker:
         return result
 
     def _map_play_counts_to_db(self, server_counts, server_source):
-        """Map server track IDs to DB track IDs for play count updates.
+        """Map server track ids onto catalogue rows for play-count updates.
 
-        Looks up which server IDs exist in the tracks table. Replaces a
-        previous N+1 pattern of one SELECT per server ID with a single
-        batched IN query (chunked for safety).
+        The counts arrive keyed by the media server's own id. Library v2 keeps
+        that identity in the server-scoped mapping table; the singular track
+        columns are only an upgrade fallback.
+        Rows the catalogue has not been told about yet are skipped, exactly as
+        before.
         """
         if not server_counts:
             return []
@@ -575,26 +663,42 @@ class ListeningStatsWorker:
             conn = self.db._get_connection()
             cursor = conn.cursor()
 
-            ids = list(server_counts.keys())
-            existing = set()
+            ids = [str(i) for i in server_counts.keys()]
+            by_server_id = {}
             chunk_size = 500
             for i in range(0, len(ids), chunk_size):
                 chunk = ids[i:i + chunk_size]
                 placeholders = ','.join(['?'] * len(chunk))
+                # Mapping first, snapshot only for what it does not answer. A
+                # UNION has no defined row order — SQLite sorts it, so the lower
+                # entity id won, not the authoritative row — and after a
+                # re-match the stale snapshot is usually the older, lower id.
+                # Play counts landed on the wrong track.
                 cursor.execute(
-                    f"SELECT id FROM tracks WHERE id IN ({placeholders})",
-                    chunk,
+                    f"SELECT m.server_id, m.entity_id FROM lib2_media_server_mappings m "
+                    f"WHERE m.entity_type='track' AND m.server_source=? "
+                    f"AND m.server_id IN ({placeholders})",
+                    [server_source, *chunk],
                 )
-                existing.update(r[0] for r in cursor.fetchall())
+                for server_id, track_id in cursor.fetchall():
+                    by_server_id[str(server_id)] = track_id
+                cursor.execute(
+                    f"SELECT t.server_id, t.id FROM lib2_tracks t "
+                    f"WHERE t.server_source=? AND t.server_id IN ({placeholders})",
+                    [server_source, *chunk],
+                )
+                for server_id, track_id in cursor.fetchall():
+                    by_server_id.setdefault(str(server_id), track_id)
 
             return [
                 {
                     'db_track_id': server_id,
+                    'lib2_track_id': by_server_id[str(server_id)],
                     'play_count': play_count,
                     'last_played': None,  # Could be fetched separately
                 }
                 for server_id, play_count in server_counts.items()
-                if server_id in existing
+                if str(server_id) in by_server_id
             ]
         except Exception as e:
             logger.error(f"Error mapping play counts: {e}")

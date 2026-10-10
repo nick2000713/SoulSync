@@ -2134,6 +2134,9 @@ let cancelledTracks = new Set(); // Track cancelled track indices like GUI's can
 const TRACK_RENDER_BATCH_SIZE = 100;
 
 function applyProgressiveTrackRendering(playlistId, totalTrackCount) {
+    // Every download dialog calls this once its rows exist: ask the library
+    // what it already has now, not only after Begin Analysis (shell/download-modal-library.ts).
+    window.hydrateDownloadModalLibraryStatus?.(playlistId, activeDownloadProcesses[playlistId]);
     if (totalTrackCount <= TRACK_RENDER_BATCH_SIZE) return;
 
     const modal = document.getElementById(`download-missing-modal-${playlistId}`);
@@ -2357,7 +2360,7 @@ async function openDownloadMissingModal(playlistId) {
                                                    onchange="updateTrackSelectionCount('${playlistId}')">
                                         </td>
                                         <td class="track-number">${index + 1}</td>
-                                        <td class="track-name" title="${escapeHtml(track.name)}">${renderModalTrackPlayButton(playlistId, index)}${escapeHtml(track.name)}</td>
+                                        <td class="track-name" title="${escapeHtml(track.name)}">${renderModalTrackPlayButton(playlistId, index)}${renderModalTrackPlaylistButton(playlistId, index)}${escapeHtml(track.name)}</td>
                                         <td class="track-artist" title="${escapeHtml(formatArtists(track.artists))}">${escapeHtml(formatArtists(track.artists))}</td>
                                         <td class="track-duration">${formatDuration(track.duration_ms)}</td>
                                         <td class="track-match-status match-checking" id="match-${playlistId}-${index}">🔍 Pending</td>

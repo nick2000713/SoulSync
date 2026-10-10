@@ -91,7 +91,7 @@ const _QP_BUNDLE_CONTROL_IDS = new Set([
 const _QP_PROFILE_CONTROL_IDS = new Set([
     ..._QP_BUNDLE_CONTROL_IDS,
     'quality-fallback-enabled', 'quality-search-mode', 'quality-rank-candidates',
-    'quality-upgrade-policy', 'quality-upgrade-cutoff',
+    'quality-upgrade-policy', 'quality-upgrade-cutoff', 'quality-release-import-mode',
 ]);
 
 // Route a Quality-page change to the profile editor's lightweight autosave.
@@ -1129,6 +1129,9 @@ function switchSettingsTab(tab) {
     if (tab === 'advanced' && typeof loadImageCacheStatus === 'function') {
         try { loadImageCacheStatus(); } catch (e) { }
     }
+    if (tab === 'advanced' && typeof loadSidebarWeatherSettings === 'function') {
+        try { loadSidebarWeatherSettings(); } catch (e) { }
+    }
     // First time the Downloads tab is shown, auto-probe source status so the
     // dots reflect real connection state without a manual "Test all sources".
     if (tab === 'downloads' && typeof autoTestSourcesOnce === 'function') {
@@ -1908,6 +1911,15 @@ function toggleAudiobookSource(src, on) {
     renderAudiobookHybrid();
 }
 
+// the sources audiobooks actually download through: the chain in hybrid mode,
+// the one picked source otherwise.
+function _audiobookActiveSources() {
+    const mode = document.getElementById('audiobook-download-mode')?.value;
+    if (!mode) return [];
+    const ids = mode === 'hybrid' ? _audiobookHybrid : [mode];
+    return ids.filter(s => AUDIOBOOK_SOURCES.includes(s));
+}
+
 // The chain only applies in hybrid mode; a single-source mode has nothing to
 // order, so showing the rows there would imply a choice that does nothing.
 function onAudiobookModeChange() {
@@ -2378,6 +2390,10 @@ async function testAllSources(opts = {}) {
         sources.add(mode);
     }
     if (sources.size === 0) sources.add('soulseek');
+    // the audiobook chain is its own setting. a user whose books come over
+    // torrent but whose music never does saw a grey torrent tile forever,
+    // because only the music chain got probed.
+    for (const id of _audiobookActiveSources()) sources.add(id);
 
     // Torrent/Usenet downloads go through Prowlarr — its connection must be
     // established first or those source tests fail. Probe Prowlarr up front.
@@ -2650,7 +2666,7 @@ function buildArtSourceList() {
     if (!container) return;
     container.innerHTML = '';
     if (!_artVisualOrder.length) {
-        container.innerHTML = '<div style="padding:10px;color:var(--text-secondary,#888);font-size:13px;">No connected art sources available.</div>';
+        container.innerHTML = '<div style="padding:10px;color:#888;font-size:13px;">No connected art sources available.</div>';
         return;
     }
     const enabledOrder = getArtOrder();
@@ -3312,6 +3328,16 @@ async function loadSettingsData() {
             ? abq.format_order
             : ['m4b', 'm4a', 'mp3', 'opus', 'ogg', 'flac'];
         abVal(document.getElementById('audiobook-format-first'), abOrder[0] || 'm4b');
+        // Empty means every format, so a fresh install shows them all on.
+        const abAllowed = Array.isArray(abq.allowed_formats) ? abq.allowed_formats : [];
+        document.getElementById('audiobook-allowed-formats')?.querySelectorAll('input').forEach(box => {
+            box.checked = !abAllowed.length || abAllowed.includes(box.value);
+        });
+        // "any" shows both switches on; "single"/"multiple" shows just that one.
+        const abLayout = abq.file_layout || 'any';
+        document.getElementById('audiobook-file-layout')?.querySelectorAll('input').forEach(box => {
+            box.checked = abLayout === 'any' || abLayout === box.value;
+        });
         abVal(document.getElementById('audiobook-min-bitrate'), abq.min_bitrate_kbps ?? 0);
         abVal(document.getElementById('audiobook-max-bitrate'), abq.max_bitrate_kbps ?? 0);
         abChecked(document.getElementById('audiobook-allow-dramatized'),
@@ -3391,6 +3417,10 @@ async function loadSettingsData() {
         // #1449: write artist.nfo into new artist folders (default off)
         const _nfoEl = document.getElementById('write-artist-nfo');
         if (_nfoEl) _nfoEl.checked = settings.library?.write_artist_nfo === true;
+
+        // Library v2: re-download files deleted outside SoulSync (default on)
+        const _redlEl = document.getElementById('redownload-externally-deleted');
+        if (_redlEl) _redlEl.checked = settings.library?.redownload_externally_deleted !== false;
 
         // Populate Content Filter settings
         document.getElementById('allow-explicit').checked = settings.content_filter?.allow_explicit !== false;
@@ -3555,6 +3585,12 @@ async function loadSettingsData() {
             if (authHeader) authHeader.value = settings.security?.auth_proxy_header || '';
             const reqLogin = document.getElementById('security-require-login');
             if (reqLogin) reqLogin.checked = settings.security?.require_login || false;
+            const plexSignin = document.getElementById('security-plex-signin');
+            if (plexSignin) plexSignin.checked = settings.security?.plex_signin || false;
+            const plexCreate = document.getElementById('security-plex-signin-auto-create');
+            if (plexCreate) plexCreate.checked = settings.security?.plex_signin_auto_create !== false;
+            const plexDl = document.getElementById('security-plex-signin-can-download');
+            if (plexDl) plexDl.checked = settings.security?.plex_signin_default_can_download || false;
 
             // Check if admin has a PIN set
             const profilesRes = await fetch('/api/profiles');
@@ -3748,6 +3784,18 @@ function setPlexConfigActionButton(isManualConfig) {
     }
 }
 
+// Re-link: Plex is already configured and the user wants a fresh token
+// through plex.tv/link without clearing anything. The PIN box lives in the
+// setup area (hidden once configured), so re-link shows that area on its own.
+let _plexPinRelink = false;
+
+function startPlexRelink() {
+    _plexPinRelink = true;
+    const plexSetup = document.getElementById('plex-setup');
+    if (plexSetup) plexSetup.style.display = '';
+    startPlexPinAuth();
+}
+
 async function startPlexPinAuth() {
     const setupButtons = document.getElementById('plex-setup-buttons');
     const authFlow = document.getElementById('plex-pin-auth-flow');
@@ -3815,9 +3863,31 @@ async function pollPlexPinAuthStatus() {
 
         if (result.success) {
             stopPlexPinAuthPolling();
-            if (statusEl) statusEl.textContent = 'Authorization complete! Saving Plex configuration...';
-            document.getElementById('plex-url').value = result.found_url || '';
-            document.getElementById('plex-token').value = result.token || '';
+            const urlEl = document.getElementById('plex-url');
+            const currentUrl = (urlEl?.value || '').trim();
+            if (_plexPinRelink && currentUrl) {
+                // Re-link keeps the URL that already works (a docker host or a
+                // reverse proxy Plex can't discover) and only saves the new
+                // token once it's proven to reach that server.
+                if (statusEl) statusEl.textContent = 'Authorized. Checking the new token against your server...';
+                const check = await fetch('/api/plex/verify-token', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url: currentUrl, token: result.token || '' })
+                }).then((r) => r.json()).catch(() => ({ success: false }));
+                if (!check.success) {
+                    if (statusEl) statusEl.textContent = (check.error || "The new token couldn't reach your server")
+                        + '. Nothing was changed.';
+                    showToast("Re-link didn't change anything: that Plex account can't reach your server", 'error');
+                    return;
+                }
+                document.getElementById('plex-token').value = result.token || '';
+            } else {
+                if (statusEl) statusEl.textContent = 'Authorization complete! Saving Plex configuration...';
+                if (urlEl) urlEl.value = result.found_url || '';
+                document.getElementById('plex-token').value = result.token || '';
+            }
+            _plexPinRelink = false;
             if (typeof saveSettings === 'function') {
                 await saveSettings(true);
             }
@@ -3850,11 +3920,19 @@ function cancelPlexPinAuth() {
     const authFlow = document.getElementById('plex-pin-auth-flow');
     if (setupButtons) setupButtons.style.display = '';
     if (authFlow) authFlow.style.display = 'none';
+    if (_plexPinRelink) {
+        // back to the configured view, nothing changed
+        _plexPinRelink = false;
+        const plexSetup = document.getElementById('plex-setup');
+        if (plexSetup) plexSetup.style.display = 'none';
+    }
 }
 
 function restartPlexPinAuth() {
+    const relink = _plexPinRelink;
     cancelPlexPinAuth();
-    startPlexPinAuth();
+    if (relink) startPlexRelink();
+    else startPlexPinAuth();
 }
 
 async function clearPlexConfiguration() {
@@ -4108,11 +4186,14 @@ function populateQualityProfileUI(profile) {
     const rankCandidatesCheckbox = document.getElementById('quality-rank-candidates');
     if (rankCandidatesCheckbox) rankCandidatesCheckbox.checked = profile.rank_candidates_by_quality === true;
 
+    const releaseImportSelect = document.getElementById('quality-release-import-mode');
+    if (releaseImportSelect) releaseImportSelect.value = profile.release_import_mode === 'album_tracks' ? 'album_tracks' : 'requested_tracks';
+
     const upgradePolicySelect = document.getElementById('quality-upgrade-policy');
     if (upgradePolicySelect) {
         upgradePolicySelect.value = ['until_cutoff', 'until_top'].includes(profile.upgrade_policy)
             ? 'until_cutoff'
-            : 'acceptable';
+            : profile.upgrade_policy === 'acceptable' ? 'acceptable' : 'none';
     }
     renderUpgradeCutoffOptions(profile.upgrade_cutoff_index);
 
@@ -4146,7 +4227,7 @@ function renderUpgradeCutoffOptions(selectedIndex = null) {
 }
 
 function onUpgradePolicyChange() {
-    const policy = document.getElementById('quality-upgrade-policy')?.value || 'acceptable';
+    const policy = document.getElementById('quality-upgrade-policy')?.value || 'none';
     const cutoffGroup = document.getElementById('quality-upgrade-cutoff-group');
     if (cutoffGroup) cutoffGroup.style.display = policy === 'until_cutoff' ? '' : 'none';
     renderUpgradeCutoffOptions();
@@ -4344,6 +4425,9 @@ async function applyQualityPreset(presetName) {
                 ...preset,
                 search_mode: uiState.search_mode,
                 rank_candidates_by_quality: uiState.rank_candidates_by_quality,
+                upgrade_policy: uiState.upgrade_policy,
+                upgrade_cutoff_index: uiState.upgrade_cutoff_index,
+                release_import_mode: uiState.release_import_mode,
             };
             currentQualityProfile = merged;
             window._suppressSettingsAutoSave = true;
@@ -4446,7 +4530,10 @@ function collectQualityProfileFromUI() {
         fallback_enabled: document.getElementById('quality-fallback-enabled')?.checked ?? true,
         search_mode: document.getElementById('quality-search-mode')?.value === 'best_quality' ? 'best_quality' : 'priority',
         rank_candidates_by_quality: document.getElementById('quality-rank-candidates')?.checked ?? false,
-        upgrade_policy: document.getElementById('quality-upgrade-policy')?.value === 'until_cutoff' ? 'until_cutoff' : 'acceptable',
+        release_import_mode: document.getElementById('quality-release-import-mode')?.value === 'album_tracks' ? 'album_tracks' : 'requested_tracks',
+        upgrade_policy: ['none', 'acceptable', 'until_cutoff'].includes(
+            document.getElementById('quality-upgrade-policy')?.value)
+            ? document.getElementById('quality-upgrade-policy').value : 'none',
         upgrade_cutoff_index: parseInt(document.getElementById('quality-upgrade-cutoff')?.value || '0', 10) || 0,
         ranked_targets,
     };
@@ -4576,10 +4663,14 @@ function qpProfileSummary(profile) {
             ? `retain ${codec} only (acquisition remembered)`
             : `lossless + ${codec} companion`);
     }
-    if (['until_cutoff', 'until_top'].includes(profile.upgrade_policy)) {
+    if (profile.upgrade_policy === 'acceptable') {
+        parts.push('upgrade until any accepted target');
+    } else if (['until_cutoff', 'until_top'].includes(profile.upgrade_policy)) {
         const cutoffIndex = Math.min(Math.max(parseInt(profile.upgrade_cutoff_index || '0', 10) || 0, 0), Math.max(targets.length - 1, 0));
         const cutoff = targets[cutoffIndex]?.label || 'top target';
         parts.push(`upgrade until ${cutoff}`);
+    } else {
+        parts.push('upgrades off');
     }
     return parts.join(' · ');
 }
@@ -6427,7 +6518,8 @@ async function saveSettings(quiet = false) {
             podcasts_path: _cfgStr('podcasts-path', { fallback: './podcasts' }),
             audiobooks_path: _cfgStr('audiobooks-path', { fallback: './audiobooks' }),
             reorganize_preserve_casing: _cfgBool('reorganize-preserve-casing'),
-            write_artist_nfo: _cfgBool('write-artist-nfo')
+            write_artist_nfo: _cfgBool('write-artist-nfo'),
+            redownload_externally_deleted: _cfgBool('redownload-externally-deleted')
         },
         podcasts: {
             download_path: _cfgStr('podcasts-path', { fallback: './podcasts' }),
@@ -6467,6 +6559,25 @@ async function saveSettings(quiet = false) {
                     const rest = ['m4b', 'm4a', 'mp3', 'opus', 'ogg', 'flac']
                         .filter(f => f !== first);
                     return [first, ...rest];
+                })(),
+                // Every format on is stored as [] ("no restriction"), so a format
+                // added later is not refused by a list that predates it.
+                // Undefined when the toggles are not on the page, like _cfgBool,
+                // so a missing panel cannot wipe a stored restriction.
+                allowed_formats: (function () {
+                    const group = document.getElementById('audiobook-allowed-formats');
+                    if (!group) return undefined;
+                    const boxes = [...group.querySelectorAll('input')];
+                    const on = boxes.filter(box => box.checked).map(box => box.value);
+                    return on.length === boxes.length ? [] : on;
+                })(),
+                // Exactly one switch on picks that layout; both on, or both off,
+                // means either. Undefined when the switches are not on the page.
+                file_layout: (function () {
+                    const group = document.getElementById('audiobook-file-layout');
+                    if (!group) return undefined;
+                    const on = [...group.querySelectorAll('input')].filter(box => box.checked);
+                    return on.length === 1 ? on[0].value : 'any';
                 })(),
                 min_bitrate_kbps: Math.max(0,
                     _cfgInt('audiobook-min-bitrate', 0)),
@@ -6550,6 +6661,9 @@ async function saveSettings(quiet = false) {
             trust_reverse_proxy: _cfgBool('security-trust-proxy'),
             auth_proxy_header: _cfgStr('security-auth-proxy-header', { trim: true }),
             require_login: _cfgBool('security-require-login'),
+            plex_signin: _cfgBool('security-plex-signin'),
+            plex_signin_auto_create: _cfgBool('security-plex-signin-auto-create'),
+            plex_signin_default_can_download: _cfgBool('security-plex-signin-can-download'),
         }
     };
 
@@ -8624,7 +8738,16 @@ async function loadImageCacheStatus() {
         if (!data.success) return;
         const entries = document.getElementById('imgcache-entries');
         const size = document.getElementById('imgcache-size');
-        if (entries) entries.textContent = (data.entries || 0).toLocaleString();
+        if (entries) {
+            // A "pending" row is a registered URL nothing ever loaded. When it
+            // dominates the count, the URLs being handed out are changing
+            // between renders (a media-server auth salt used to rotate on every
+            // call), and the entry count alone hides that completely.
+            const pending = data.pending || 0;
+            entries.textContent = pending
+                ? `${(data.entries || 0).toLocaleString()} (${pending.toLocaleString()} pending)`
+                : (data.entries || 0).toLocaleString();
+        }
         if (size) {
             size.textContent = data.max_bytes
                 ? `${_imgCacheBytes(data.bytes)} of ${_imgCacheBytes(data.max_bytes)}`
@@ -8690,6 +8813,151 @@ async function runImageCacheClear() {
         _imgCacheStatus('Could not clear the cache: ' + e.message, 'error');
     } finally {
         if (btn) { btn.disabled = false; btn.textContent = 'Clear cache'; }
+    }
+}
+
+// == SIDEBAR WEATHER (Advanced tab)               ==
+// Opt-in weather line / forecast popover / particle scene in the sidebar.
+// No API keys: the server geocodes the location once and caches Open-Meteo
+// snapshots for 30 minutes.
+
+async function _swApi(method, path, body) {
+    const resp = await fetch('/api/weather' + path, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    return resp.json();
+}
+
+function _swStatus(text) {
+    const el = document.getElementById('sw-status');
+    if (el) el.textContent = text;
+}
+
+function _swRebootSidebar() {
+    // the shell bundle exports bootSidebarWeather on window; re-run it so the
+    // sidebar line/popover/scene pick up the change without a page reload
+    if (typeof window.bootSidebarWeather === 'function') {
+        try {
+            // bootSidebarWeather is async: a .catch keeps a rejected promise
+            // from surfacing as an unhandled rejection
+            Promise.resolve(window.bootSidebarWeather()).catch(function (e) {
+                console.warn('sidebar weather re-boot failed', e);
+            });
+        } catch (e) {
+            console.warn('sidebar weather re-boot failed', e);
+        }
+    } else {
+        console.warn('sidebar weather re-boot skipped: bootSidebarWeather is not on window');
+    }
+}
+
+async function loadSidebarWeatherSettings() {
+    try {
+        const data = await _swApi('GET', '');
+        // GET /api/weather always answers success:true. A missing snapshot just
+        // means no forecast is cached yet — the sidebar stays empty until then.
+        if (!data || data.success !== true) {
+            _swStatus('Could not load weather settings');
+            return;
+        }
+        const loc = document.getElementById('sw-location');
+        if (loc && document.activeElement !== loc) loc.value = data.location ? data.location.query || '' : '';
+        const en = document.getElementById('sw-enabled');
+        if (en) en.checked = data.enabled !== false;
+        const c = document.getElementById('sw-celsius');
+        if (c) c.checked = data.units === 'celsius';
+        if (data.location && data.snapshot) {
+            const cur = data.snapshot.current;
+            const t = cur && typeof cur.temp === 'number' ? Math.round(cur.temp) : null;
+            const unit = data.units === 'celsius' ? '°C' : '°F';
+            _swStatus(t === null
+                ? `${data.location.name} — waiting for first forecast`
+                : `${data.location.name} — ${t}${unit}, updated ${data.snapshot.fetched_at || 'recently'}`);
+        } else if (data.location) {
+            // enabled=false also yields a null snapshot — say so instead of
+            // implying a fetch failure
+            _swStatus(data.enabled === false
+                ? `${data.location.name} — weather display off`
+                : `${data.location.name} — forecast unavailable right now`);
+        } else {
+            _swStatus('Off — set a location to turn it on');
+        }
+    } catch (e) {
+        console.error('sidebar weather settings failed', e);
+        _swStatus('Could not load weather settings');
+    }
+}
+
+async function saveSidebarWeatherLocation() {
+    const input = document.getElementById('sw-location');
+    const location = input ? input.value.trim() : '';
+    if (!location) {
+        if (typeof showToast === 'function') showToast('Enter a ZIP or city first', 'error');
+        return;
+    }
+    try {
+        const data = await _swApi('PUT', '/location', { location });
+        if (data.success) {
+            if (typeof showToast === 'function') showToast(`Weather location set to ${data.location.name}`, 'success');
+            loadSidebarWeatherSettings();
+            _swRebootSidebar();
+        } else if (typeof showToast === 'function') {
+            showToast(data.error || 'Could not resolve that location', 'error');
+        }
+    } catch (e) {
+        if (typeof showToast === 'function') showToast('Could not save location: ' + e.message, 'error');
+    }
+}
+
+async function clearSidebarWeatherLocation() {
+    try {
+        const data = await _swApi('PUT', '/location', { location: '' });
+        if (data.success) {
+            if (typeof showToast === 'function') showToast('Sidebar weather turned off', 'success');
+            const input = document.getElementById('sw-location');
+            if (input) input.value = '';
+            loadSidebarWeatherSettings();
+            _swRebootSidebar();
+        } else if (typeof showToast === 'function') {
+            showToast(data.error || 'Could not clear the location', 'error');
+        }
+    } catch (e) {
+        if (typeof showToast === 'function') showToast('Could not clear location: ' + e.message, 'error');
+    }
+}
+
+async function toggleSidebarWeatherEnabled() {
+    const el = document.getElementById('sw-enabled');
+    const enabled = el ? el.checked : true;
+    try {
+        const data = await _swApi('PUT', '/display', { enabled });
+        if (data.success) {
+            if (typeof showToast === 'function') showToast(enabled ? 'Sidebar weather on' : 'Sidebar weather off', 'success');
+            _swRebootSidebar();
+        } else if (typeof showToast === 'function') {
+            showToast(data.error || 'Could not update the setting', 'error');
+        }
+    } catch (e) {
+        if (typeof showToast === 'function') showToast('Could not update the setting: ' + e.message, 'error');
+    }
+}
+
+async function saveSidebarWeatherUnits() {
+    const el = document.getElementById('sw-celsius');
+    const use_celsius = el ? el.checked : false;
+    try {
+        const data = await _swApi('PUT', '/units', { use_celsius });
+        if (data.success) {
+            if (typeof showToast === 'function') showToast(`Using °${use_celsius ? 'C' : 'F'}`, 'success');
+            loadSidebarWeatherSettings();
+            _swRebootSidebar();
+        } else if (typeof showToast === 'function') {
+            showToast(data.error || 'Could not update units', 'error');
+        }
+    } catch (e) {
+        if (typeof showToast === 'function') showToast('Could not update units: ' + e.message, 'error');
     }
 }
 

@@ -162,7 +162,8 @@ async def _database_only_find_track(spotify_track, candidate_pool=None):
             try:
                 cached = db.read_sync_match_cache(_match_id, active_server)
                 if cached:
-                    db_track_check = db.get_track_by_id(cached['server_track_id'])
+                    db_track_check = db.get_track_by_server_id(
+                        cached['server_track_id'], active_server)
                     if db_track_check:
                         class DatabaseTrackCached:
                             def __init__(self, db_t):
@@ -185,11 +186,16 @@ async def _database_only_find_track(spotify_track, candidate_pool=None):
                 m = db.find_manual_library_match_by_source_track_id(
                     get_current_profile_id(), str(_match_id), active_server)
                 if m:
+                    # the stored id is a catalogue id; every match path here
+                    # answers with the server's id (#1417 records it)
+                    from core.sync.match_overrides import manual_match_server_id
                     lib_id = m.get('library_track_id')
-                    dt = db.get_track_by_id(lib_id) if lib_id is not None else None
+                    sid = manual_match_server_id(db, lib_id, active_server, m.get('library_track_id_kind'))
+                    dt = db.get_track_by_server_id(sid, active_server) if sid else None
                     if not dt and m.get('library_file_path'):
                         new_id = db.find_track_id_by_file_path(m['library_file_path'])
-                        dt = db.get_track_by_id(new_id) if new_id else None
+                        sid = manual_match_server_id(db, new_id, active_server) if new_id else None
+                        dt = db.get_track_by_server_id(sid, active_server) if sid else None
                     if dt:
                         class DatabaseTrackDurable:
                             def __init__(self, db_t):
@@ -316,6 +322,7 @@ def run_sync_task(
     deps: SyncDeps = None,
     sync_mode: str = 'reconcile',  # #1289: safer default (preserves server edits)
     skip_wishlist_add: bool = False,
+    user_initiated: bool | None = None,
 ):
     """The actual sync function that runs in the background thread."""
     sync_states = deps.sync_states
@@ -581,7 +588,8 @@ def run_sync_task(
                 return
 
         # Run the sync (this is a blocking call within this thread)
-        result = deps.run_async(sync_service.sync_playlist(playlist, download_missing=False, profile_id=profile_id, sync_mode=sync_mode))
+        result = deps.run_async(sync_service.sync_playlist(playlist, download_missing=False, profile_id=profile_id, sync_mode=sync_mode,
+                                                        user_initiated=not bool(automation_id) if user_initiated is None else user_initiated))
 
         # Clear progress callback immediately to prevent race condition where a
         # late-firing progress callback overwrites the "finished" state below

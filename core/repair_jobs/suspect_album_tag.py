@@ -1,12 +1,14 @@
 """Suspect Album Tag Detector — finds tracks that are probably filed under the
 wrong album due to bad embedded tags (e.g. a Daughtry song filed under "Hitzone 43").
 
-Detection signals (any one is sufficient):
+Detection signals (singles are never suspects):
   1. The album has exactly 1 locally-owned track AND the album has no cover art.
   2. The album name matches a known compilation / sampler pattern (case-insensitive)
-     BUT the track's artist is NOT "Various Artists" or "Various".
+     BUT the track's artist is NOT "Various Artists" or "Various" -- an artist's
+     own "Greatest Hits" excepted.
   3. The album has exactly 1 locally-owned track AND the DB track_count field says
-     the real release has more than 3 tracks (i.e. a lone track inside a big album).
+     the real release has more than 3 tracks. Only together with another signal:
+     one wished-for track of a big album is the normal Wishlist case.
 
 The fix action is "reidentify" — the existing Re-identify modal handles the actual fix.
 This job only DETECTS and emits findings; it never modifies files itself.
@@ -14,7 +16,7 @@ This job only DETECTS and emits findings; it never modifies files itself.
 
 import re
 from core.repair_jobs import register_job
-from core.repair_jobs.base import JobContext, JobResult, RepairJob, not_locked_sql
+from core.repair_jobs.base import JobContext, JobResult, RepairJob, drop_hand_tagged
 from utils.logging_config import get_logger
 
 logger = get_logger("repair_job.suspect_album_tag")
@@ -29,11 +31,23 @@ _COMPILATION_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
+# The artist's own compilation: suspect only when filed under somebody else.
+_ARTIST_COMPILATION = re.compile(
+    r'\b(best\s+of|greatest\s+hits?|ultimate\s+collection|the\s+collection|essential\s+hits?)\b',
+    re.IGNORECASE,
+)
+
 _VARIOUS_ARTIST_NAMES = {'various artists', 'various', 'va', 'v.a.', 'v.a'}
 
 
 def _is_various_artist(name: str) -> bool:
     return (name or '').strip().lower() in _VARIOUS_ARTIST_NAMES
+
+
+def _owned_track_sql(alias: str) -> str:
+    """``alias`` is a track with a live file in the library the run is for."""
+    from core.library2.sql_util import owned_sql
+    return owned_sql('track', alias)
 
 
 @register_job
@@ -50,7 +64,9 @@ class SuspectAlbumTagDetector(RepairJob):
         '- The album has only 1 of your tracks AND no cover art\n'
         '- The album name matches a known compilation pattern (Hitzone, Now, Vol., '
         'Greatest Hits, etc.) but the artist is not "Various Artists"\n'
-        '- The album has only 1 of your tracks AND the original release has 4+ tracks\n\n'
+        '- The album has only 1 of your tracks AND the original release has 4+ tracks '
+        '(only together with another signal)\n'
+        '- Singles and an artist\'s own "Greatest Hits" are never flagged\n\n'
         'For each finding, click Re-identify to search for the correct album and '
         'let SoulSync re-file the track automatically.\n\n'
         'Settings:\n'
@@ -88,14 +104,12 @@ class SuspectAlbumTagDetector(RepairJob):
             conn = context.db._get_connection()
             try:
                 cur = conn.cursor()
-                album_not_locked = not_locked_sql(cur, 'albums', 'al')
                 cur.execute(f"""
                     SELECT COUNT(*) FROM (
                         SELECT al.id
-                        FROM albums al
-                        JOIN tracks t ON t.album_id = al.id
-                        WHERE t.file_path IS NOT NULL AND t.file_path != ''
-                          {album_not_locked}
+                        FROM lib2_albums al
+                        JOIN lib2_tracks t ON t.album_id = al.id
+                        WHERE {_owned_track_sql('t')}
                         GROUP BY al.id
                         HAVING COUNT(t.id) = 1
                     )
@@ -122,29 +136,37 @@ class SuspectAlbumTagDetector(RepairJob):
         conn = context.db._get_connection()
         try:
             cur = conn.cursor()
-            album_not_locked = not_locked_sql(cur, 'albums', 'al')
             # Pull every album that has exactly 1 locally-owned track.
-            # Include the DB track_count (from the metadata source) so we
-            # can tell if the full release is actually bigger.
-            # Join both track artist and album artist to get accurate track-level identity.
+            # Include the metadata source's track count so we can tell if the
+            # full release is actually bigger. The track's own credit (its
+            # primary track artist) next to the album artist gives the
+            # track-level identity.
+            from core.library2.sql_util import scoped_primary_file_join
             cur.execute(f"""
                 SELECT
                     al.id          AS album_id,
                     al.title       AS album_title,
-                    al.thumb_url   AS thumb_url,
-                    al.track_count AS full_track_count,
+                    al.image_url   AS thumb_url,
+                    al.album_type  AS album_type,
+                    COALESCE(al.expected_track_count, al.track_count) AS full_track_count,
                     COALESCE(tar.id, aar.id)   AS artist_id,
                     COALESCE(tar.name, aar.name, '') AS artist_name,
                     aar.name       AS album_artist_name,
                     t.id           AS track_id,
                     t.title        AS track_title,
-                    t.file_path    AS file_path
-                FROM albums al
-                JOIN tracks  t  ON t.album_id = al.id
-                LEFT JOIN artists tar ON tar.id = t.artist_id
-                LEFT JOIN artists aar ON aar.id = al.artist_id
-                WHERE t.file_path IS NOT NULL AND t.file_path != ''
-                  {album_not_locked}
+                    f.path         AS file_path
+                FROM lib2_albums al
+                JOIN lib2_tracks t ON t.album_id = al.id
+                JOIN lib2_track_files f ON {scoped_primary_file_join('t', 'f')}
+                LEFT JOIN lib2_artists aar ON aar.id = al.primary_artist_id
+                LEFT JOIN lib2_artists tar ON tar.id = (
+                    SELECT ta.artist_id FROM lib2_track_artists ta
+                     WHERE ta.track_id = t.id
+                     ORDER BY CASE ta.role WHEN 'primary' THEN 0 ELSE 1 END,
+                              ta.position, ta.artist_id
+                     LIMIT 1)
+                WHERE {_owned_track_sql('t')}
+                  AND f.path IS NOT NULL AND f.path != ''
                 GROUP BY al.id
                 HAVING COUNT(t.id) = 1
                 ORDER BY al.title
@@ -153,6 +175,9 @@ class SuspectAlbumTagDetector(RepairJob):
             rows = [dict(r) for r in cur.fetchall()]
         finally:
             conn.close()
+        # Library v2 keeps the "tagged it myself" lock on the file: a hand-tagged
+        # release is the user's call, never a suspect.
+        rows = drop_hand_tagged(context, rows, path_key='file_path')
 
         total = len(rows)
         if context.report_progress:
@@ -179,13 +204,18 @@ class SuspectAlbumTagDetector(RepairJob):
             track_title   = (row['track_title'] or '').strip()
 
             reasons = []
+            if (row.get('album_type') or '').lower() == 'single':
+                result.skipped += 1
+                continue
 
             # Signal 1: no cover art + lone track
             if check_art and not thumb_url:
                 reasons.append('no cover art')
 
             # Signal 2: compilation-pattern album name OR Various Artists album with named track artist
-            is_compilation_title = bool(_COMPILATION_PATTERNS.search(album_title))
+            own_album = album_artist.lower() == artist_name.lower()
+            is_compilation_title = bool(_COMPILATION_PATTERNS.search(
+                _ARTIST_COMPILATION.sub('', album_title) if own_album else album_title))
             is_va_track = _is_various_artist(artist_name)
             is_va_album = _is_various_artist(album_artist)
 
@@ -194,8 +224,9 @@ class SuspectAlbumTagDetector(RepairJob):
             elif is_va_album and not is_va_track:
                 reasons.append(f'lone track in Various Artists compilation "{album_title}"')
 
-            # Signal 3: full release has many tracks but we only own 1
-            if full_count >= min_track_count:
+            # Signal 3: full release has many tracks but we only own 1 --
+            # corroboration only, never a reason on its own.
+            if full_count >= min_track_count and reasons:
                 reasons.append(
                     f'only 1 of {full_count} tracks locally owned')
 
@@ -234,7 +265,7 @@ class SuspectAlbumTagDetector(RepairJob):
                         finding_type='suspect_album_tag',
                         severity='warning',
                         entity_type='track',
-                        entity_id=str(track_id),
+                        entity_id=f'lib2:{track_id}',
                         file_path=row['file_path'] or '',
                         title=title,
                         description=description,

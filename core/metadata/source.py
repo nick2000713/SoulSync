@@ -276,6 +276,17 @@ def _collect_source_ids(metadata: dict, cfg) -> dict:
             if metadata.get("itunes_album_id"):
                 source_ids["ITUNES_ALBUM_ID"] = metadata["itunes_album_id"]
 
+    # Native catalogue callers carry every already confirmed identity. Use
+    # the existing namespace/frame map and each provider's embed switch.
+    for provider, ids in (metadata.get('known_source_ids') or {}).items():
+        if not isinstance(ids, dict) or cfg.get(f'{provider}.embed_tags', True) is False:
+            continue
+        names = get_source_tag_names(provider)
+        for kind in ('track', 'artist', 'album'):
+            tag = names.get(kind) or f'{provider.upper()}_{kind.upper()}_ID'
+            if (ids.get(kind) and (names.get(kind) or tag in SOURCE_TAG_CONFIG)
+                    and cfg.get(SOURCE_TAG_CONFIG.get(tag, f'{provider}.tags.{kind}_id'), True) is not False):
+                source_ids[tag] = ids[kind]
     return source_ids
 
 
@@ -469,7 +480,8 @@ def _process_musicbrainz_source(pp: dict, metadata: dict, cfg, runtime, track_ti
         from core.metadata.musicbrainz_tags import release_by_artist
         expected_artists = [pp.get("batch_artist_name"), artist_name, metadata.get("album_artist")]
         if (release_detail and not pinned_release
-                and not release_by_artist(release_detail, expected_artists, pp.get("artist_mbid"))):
+                and not release_by_artist(release_detail, expected_artists, pp.get("artist_mbid"),
+                                          mbid_name=track_artist_name)):
             logger.info("MusicBrainz release %s is not by '%s'; not using it",
                         pp["release_mbid"], pp.get("batch_artist_name") or artist_name)
             release_detail = {}
@@ -1295,20 +1307,22 @@ def _update_album_year_in_database(db, metadata: dict, release_year) -> None:
         album_name_for_db = metadata.get("album", "")
         album_artist_for_db = metadata.get("album_artist", "") or metadata.get("artist", "")
         if album_name_for_db and album_artist_for_db:
+            from core.library2.importer import normalize_name
             conn = db._get_connection()
             try:
                 cursor = conn.cursor()
                 cursor.execute(
                     """
-                    UPDATE albums SET year = ?
+                    UPDATE lib2_albums SET year = ?
                     WHERE (year IS NULL OR year = 0)
                       AND id IN (
-                        SELECT al.id FROM albums al
-                        JOIN artists ar ON ar.id = al.artist_id
-                        WHERE LOWER(al.title) = LOWER(?) AND LOWER(ar.name) = LOWER(?)
+                        SELECT al.id FROM lib2_albums al
+                        JOIN lib2_artists ar ON ar.id = al.primary_artist_id
+                        WHERE LOWER(al.title) = LOWER(?) AND ar.name_key = ?
                       )
                     """,
-                    (int(release_year), album_name_for_db, album_artist_for_db),
+                    (int(release_year), album_name_for_db,
+                     normalize_name(album_artist_for_db)),
                 )
                 if cursor.rowcount > 0:
                     conn.commit()
@@ -1331,6 +1345,25 @@ def _album_artist_names(artists) -> list:
         if name and name != "Unknown Artist" and name not in names:
             names.append(name)
     return names if len(names) > 1 else []
+
+
+def _source_album_genres(album_ctx, source: str, source_ids: dict) -> list:
+    """the album's own genres: from the context when it has them, else from
+    deezer's /album/{id} (cached, the download already looked it up). only
+    deezer is asked, other sources keep genre on the artist. never raises."""
+    names = album_ctx.get("genres") if isinstance(album_ctx, dict) else None
+    if isinstance(names, list) and names:
+        return [str(g) for g in names if isinstance(g, str) and g.strip()]
+    album_id = str((source_ids or {}).get("album_id") or "")
+    if (source or "").strip().lower() != "deezer" or not album_id.isdigit():
+        return []
+    try:
+        from core.metadata.registry import get_deezer_client
+        album = get_deezer_client().get_album_metadata(album_id, include_tracks=False) or {}
+        return [g for g in (album.get("genres") or []) if isinstance(g, str) and g.strip()]
+    except Exception as e:
+        logger.debug("deezer album genres for %s: %s", album_id, e)
+        return []
 
 
 def extract_source_metadata(context: dict, artist: dict, album_info: dict) -> dict:
@@ -1541,15 +1574,15 @@ def extract_source_metadata(context: dict, artist: dict, album_info: dict) -> di
 
     if album_info.get("is_album"):
         metadata["album"] = album_info.get("album_name", "Unknown Album")
-        metadata["track_number"] = album_info.get("track_number", 1)
-        metadata["total_tracks"] = album_ctx.get("total_tracks", 1) if album_ctx else 1
+        metadata["track_number"] = album_info.get("track_number", 0)
+        metadata["total_tracks"] = album_ctx.get("total_tracks") if album_ctx else None
         logger.info("[METADATA] Album track - track_number: %s, album: %s", metadata["track_number"], metadata["album"])
     else:
         if album_ctx and album_ctx.get("name"):
             logger.info("[SAFEGUARD] Using album context name instead of track title for album metadata")
             metadata["album"] = album_ctx["name"]
-            metadata["track_number"] = album_info.get("track_number", 1) if album_info else 1
-            metadata["total_tracks"] = album_ctx.get("total_tracks", 1)
+            metadata["track_number"] = album_info.get("track_number", 0) if album_info else 0
+            metadata["total_tracks"] = album_ctx.get("total_tracks")
         else:
             metadata["album"] = metadata["title"]
             metadata["track_number"] = 1
@@ -1561,13 +1594,22 @@ def extract_source_metadata(context: dict, artist: dict, album_info: dict) -> di
     # as disc-less and ungroup the track in Jellyfin/Plex).
     from core.imports.track_number import resolve_disc_for_track
     metadata["disc_number"] = resolve_disc_for_track(original_search, album_info)
+    reference = context.get('_metadata_reference')
+    if reference:
+        for key, ref_key in (('title', 'title'), ('artist', 'track_artist'), ('album', 'album_title'), ('album_artist', 'artist_name')):
+            if reference.get(ref_key):
+                metadata[key] = reference[ref_key]
+        metadata.update(track_number=reference.get('track_number') or metadata['track_number'], total_tracks=reference.get('track_count'),
+                        disc_number=reference.get('disc_number') or metadata['disc_number'], total_discs=reference.get('total_discs'))
 
     if album_ctx and album_ctx.get("release_date"):
         release_date = _normalize_release_date_tag(album_ctx.get("release_date"))
         if release_date:
             metadata["date"] = release_date
 
-    genres = artist_dict.get("genres") or []
+    # deezer's artist has no genres, its album does. without this every deezer
+    # download got no genre unless musicbrainz or last.fm had one (#1607)
+    genres = artist_dict.get("genres") or _source_album_genres(album_ctx, source, source_ids)
     if genres:
         from core.genre_filter import filter_genres
 
@@ -1583,6 +1625,12 @@ def extract_source_metadata(context: dict, artist: dict, album_info: dict) -> di
             album_image = first_image.get("url") if isinstance(first_image, dict) else None
         metadata["album_art_url"] = album_image
 
+    if reference:
+        for key, ref_key in (('date', 'year'), ('genre', 'genres'), ('album_art_url', 'thumb_url')):
+            if reference.get(ref_key):
+                value = reference[ref_key]
+                metadata[key] = ', '.join(value) if isinstance(value, list) else str(value)
+
     logger.info(
         "[Metadata Summary] title='%s' | artist='%s' | album_artist='%s' | album='%s' | date=%s | track=%s/%s | disc=%s",
         metadata.get("title"),
@@ -1596,6 +1644,19 @@ def extract_source_metadata(context: dict, artist: dict, album_info: dict) -> di
     )
 
     return metadata
+
+
+def known_source_id_tags(metadata: dict, cfg=None) -> dict:
+    """The exact, configured identity tags shared by preview and writing."""
+    cfg = cfg or get_config_manager()
+    tags = _collect_source_ids(metadata, cfg)
+    if cfg.get('musicbrainz.embed_tags', True) is not False:
+        for key, tag in [('musicbrainz_recording_id', 'MUSICBRAINZ_RECORDING_ID'),
+                         ('musicbrainz_release_id', 'MUSICBRAINZ_RELEASE_ID')]:
+            if metadata.get(key):
+                tags[tag] = metadata[key]
+    return {tag: value for tag, value in tags.items()
+            if _tag_enabled(cfg, SOURCE_TAG_CONFIG.get(tag, ''))}
 
 
 def embed_known_source_ids(audio_file, metadata: dict) -> list:
@@ -1617,15 +1678,7 @@ def embed_known_source_ids(audio_file, metadata: dict) -> list:
     if not symbols or audio_file is None:
         return []
     try:
-        id_tags = _collect_source_ids(metadata, cfg)
-        # MusicBrainz ids aren't in _collect_source_ids (they come from the MB
-        # processor at import time); add them from the DB when present, using
-        # the canonical names the frame map already knows.
-        if cfg.get("musicbrainz.embed_tags", True) is not False:
-            if metadata.get("musicbrainz_recording_id"):
-                id_tags["MUSICBRAINZ_RECORDING_ID"] = metadata["musicbrainz_recording_id"]
-            if metadata.get("musicbrainz_release_id"):
-                id_tags["MUSICBRAINZ_RELEASE_ID"] = metadata["musicbrainz_release_id"]
+        id_tags = known_source_id_tags(metadata, cfg)
         if not id_tags:
             return []
         pp = _blank_post_process_state()

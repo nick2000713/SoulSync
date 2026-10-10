@@ -3944,7 +3944,7 @@ function _promptNotifyConfig(groupName) {
         overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:10000;display:flex;align-items:center;justify-content:center;';
 
         overlay.innerHTML = `
-            <div style="background:var(--bg-secondary, #1e1e2e);border:1px solid rgba(255,255,255,0.1);border-radius:14px;padding:28px;max-width:420px;width:90%;color:var(--text-primary, #fff);font-family:inherit;">
+            <div style="background:var(--bg-secondary, #1e1e2e);border:1px solid rgba(255,255,255,0.1);border-radius:14px;padding:28px;max-width:420px;width:90%;color:var(--text-primary);font-family:inherit;">
                 <h3 style="margin:0 0 6px;font-size:1.1em;">Configure Notifications</h3>
                 <p style="margin:0 0 18px;font-size:0.85em;opacity:0.5;">${groupName} includes notification steps. Choose how to get notified.</p>
                 <div style="display:flex;flex-direction:column;gap:10px;margin-bottom:18px;">
@@ -3960,7 +3960,7 @@ function _promptNotifyConfig(groupName) {
                 </div>
                 <div style="display:flex;gap:10px;justify-content:flex-end;">
                     <button id="deploy-notify-cancel" style="padding:8px 20px;border:1px solid rgba(255,255,255,0.1);border-radius:8px;background:transparent;color:rgba(255,255,255,0.7);cursor:pointer;font-size:0.88em;">Cancel</button>
-                    <button id="deploy-notify-confirm" style="padding:8px 20px;border:none;border-radius:8px;background:var(--accent-color,#1db954);color:#fff;cursor:pointer;font-size:0.88em;font-weight:600;">Deploy</button>
+                    <button id="deploy-notify-confirm" style="padding:8px 20px;border:none;border-radius:8px;background:var(--accent);color:#fff;cursor:pointer;font-size:0.88em;font-weight:600;">Deploy</button>
                 </div>
             </div>
         `;
@@ -6063,32 +6063,6 @@ const ENHANCE_TIER_MAP = {
     'unknown': { num: 999, label: 'Unknown', cssClass: 'unknown' },
 };
 
-async function checkArtistEnhanceEligibility(artistId) {
-    const btn = document.getElementById('library-artist-enhance-btn');
-    if (!btn) return;
-    btn.classList.add('hidden');
-    _enhanceArtistId = artistId;
-
-    try {
-        const resp = await fetch(`/api/library/artist/${artistId}/quality-analysis`);
-        if (!resp.ok) return;
-        const data = await resp.json();
-        if (!data.success || !data.tracks || data.tracks.length === 0) return;
-
-        _enhanceQualityData = data;
-
-        // Show button if any tracks are below the user's min acceptable tier
-        const minTier = data.min_acceptable_tier || 1;
-        const belowCount = data.tracks.filter(t => t.tier_num > minTier).length;
-        if (belowCount > 0) {
-            btn.classList.remove('hidden');
-            btn.querySelector('.enhance-text').textContent = `Enhance Quality (${belowCount})`;
-        }
-    } catch (e) {
-        console.debug('Enhance eligibility check failed:', e);
-    }
-}
-
 async function playArtistRadio() {
     const artistId = artistDetailPageState.currentArtistId;
     const artistName = artistDetailPageState.currentArtistName || '';
@@ -6433,15 +6407,6 @@ async function submitEnhanceQuality() {
             if (footerInfo) footerInfo.textContent = msg;
 
             showToast(msg + (result.failed_count > 0 ? ` (${result.failed_count} failed)` : ''), 'success');
-
-            // Update button count
-            const enhBtn = document.getElementById('library-artist-enhance-btn');
-            if (enhBtn && result.enhanced_count > 0) {
-                const remaining = trackIds.length - result.enhanced_count;
-                if (remaining <= 0) {
-                    enhBtn.classList.add('hidden');
-                }
-            }
 
             if (submitBtn) {
                 submitBtn.textContent = '✅ Done';

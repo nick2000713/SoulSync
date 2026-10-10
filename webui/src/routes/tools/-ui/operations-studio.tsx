@@ -38,7 +38,7 @@ import {
   stopBulkFix,
   stopRepairJob,
 } from '../-tools.api';
-import { repairJobBadge } from '../-tools.core';
+import { findingRedownloadTrackId, repairJobBadge } from '../-tools.core';
 import { RedownloadModal } from '../../artist-detail/-ui/redownload-modal';
 import { AlbumInspectionTray } from './album-inspection-tray';
 import { FindingsAlbumGrid } from './findings-album-grid';
@@ -69,12 +69,7 @@ export const STRATEGIC_PILLARS: readonly StrategicPillar[] = [
     tagline: 'Lossless verification, corrupt file detection, and bitrate inspection',
     description:
       'Analyzes spectrums for fake 320kbps upconversions, verifies FLAC frame integrity, and flags truncated preview tracks.',
-    jobIds: [
-      'audio_corruption_detector',
-      'fake_lossless_detector',
-      'quality_upgrade_scanner',
-      'short_preview_track',
-    ],
+    jobIds: ['audio_corruption_detector', 'fake_lossless_detector', 'short_preview_track'],
     findingTypes: ['corrupt_audio', 'fake_lossless', 'quality_upgrade', 'short_preview_track'],
   },
   {
@@ -122,15 +117,10 @@ export const STRATEGIC_PILLARS: readonly StrategicPillar[] = [
     title: 'Storage & Library Hygiene',
     icon: '📦',
     glow: '56, 189, 248',
-    tagline: 'Relocate tracks, clean duplicates, and quarantine unlinked files',
+    tagline: 'Find unlinked files, missing paths, and empty folders',
     description:
-      'Detects duplicate recordings, cleans up unlinked orphan tracks, and moves files into organized directory structures.',
-    jobIds: [
-      'duplicate_detector',
-      'orphan_file_detector',
-      'dead_file_cleaner',
-      'empty_folder_cleaner',
-    ],
+      'Finds orphan audio files, stale library paths, and empty folders. Review recording duplicates from the Library page.',
+    jobIds: ['orphan_file_detector', 'dead_file_cleaner', 'empty_folder_cleaner'],
     findingTypes: ['duplicate_tracks', 'orphan_file', 'dead_file', 'empty_folder'],
   },
 ] as const;
@@ -154,15 +144,15 @@ export const PLAYBOOK_PRESETS: readonly PlaybookPreset[] = [
       'album_tag_consistency',
       'missing_lyrics',
       'missing_cover_art',
-      'duplicate_detector',
+      'empty_folder_cleaner',
     ],
   },
   {
     id: 'audio_sweep',
     title: 'Audio Fidelity Sweep',
-    subtitle: 'Audit FLAC integrity, detect fake transcodes, and check low bitrates',
+    subtitle: 'Audit audio integrity, review suspected transcodes, and detect preview clips',
     icon: '🎵',
-    jobIds: ['audio_corruption_detector', 'fake_lossless_detector', 'quality_upgrade_scanner'],
+    jobIds: ['audio_corruption_detector', 'fake_lossless_detector', 'short_preview_track'],
   },
   {
     id: 'metadata_polish',
@@ -211,6 +201,7 @@ export function OperationsStudio({
   const [bulkStatus, setBulkStatus] = useState<BulkFixStatus | null>(null);
   const [selectedAlbum, setSelectedAlbum] = useState<FindingAlbumGroup | null>(null);
   const [redownloadFinding, setRedownloadFinding] = useState<RepairFinding | null>(null);
+  const redownloadTrackId = redownloadFinding ? findingRedownloadTrackId(redownloadFinding) : null;
   const bulkTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   const loadData = useCallback(async () => {
@@ -275,30 +266,44 @@ export function OperationsStudio({
   }, [jobs]);
 
   // Compute Authority Buckets (Uses both groups & catalog)
-  const { safeCount, suggestionCount, quarantineCount } = useMemo(() => {
-    let safe = 0;
-    let suggestions = 0;
-    let quarantine = 0;
+  const { safeCount, suggestionCount, quarantineCount, topSuggestion, topQuarantine } =
+    useMemo(() => {
+      let safe = 0;
+      let suggestions = 0;
+      let quarantine = 0;
+      // the biggest type in each bucket, which its button opens. the buckets
+      // are destructive / fixable, not severity, so filtering the list by
+      // severity showed something else (orphans are 'info' but quarantined)
+      let topSuggestion = { type: '', count: 0 };
+      let topQuarantine = { type: '', count: 0 };
 
-    for (const g of groups) {
-      const count = g.pending ?? (g as any).count ?? 0;
-      if (count <= 0) continue;
+      for (const g of groups) {
+        const count = g.pending ?? (g as any).count ?? 0;
+        if (count <= 0) continue;
 
-      const info = catalog[g.finding_type];
-      const isDestructive = info ? info.destructive : (g as any).destructive;
-      const isFixable = info ? info.fixable : (g as any).fixable;
+        const info = catalog[g.finding_type];
+        const isDestructive = info ? info.destructive : (g as any).destructive;
+        const isFixable = info ? info.fixable : (g as any).fixable;
 
-      if (isDestructive) {
-        quarantine += count;
-      } else if (isFixable) {
-        safe += count;
-      } else {
-        suggestions += count;
+        if (isDestructive) {
+          quarantine += count;
+          if (count > topQuarantine.count) topQuarantine = { type: g.finding_type, count };
+        } else if (isFixable) {
+          safe += count;
+        } else {
+          suggestions += count;
+          if (count > topSuggestion.count) topSuggestion = { type: g.finding_type, count };
+        }
       }
-    }
 
-    return { safeCount: safe, suggestionCount: suggestions, quarantineCount: quarantine };
-  }, [groups, catalog]);
+      return {
+        safeCount: safe,
+        suggestionCount: suggestions,
+        quarantineCount: quarantine,
+        topSuggestion: topSuggestion.type,
+        topQuarantine: topQuarantine.type,
+      };
+    }, [groups, catalog]);
 
   // Executive Health Score
   const healthScore = useMemo(() => {
@@ -528,7 +533,7 @@ export function OperationsStudio({
                 type="button"
                 className="operations-triage-btn suggestions"
                 disabled={suggestionCount === 0}
-                onClick={() => onShowFindings('', { severity: 'info' })}
+                onClick={() => onShowFindings('', { findingType: topSuggestion })}
               >
                 Review Suggestions ➔
               </button>
@@ -553,7 +558,7 @@ export function OperationsStudio({
                 type="button"
                 className="operations-triage-btn quarantine"
                 disabled={quarantineCount === 0}
-                onClick={() => onShowFindings('', { severity: 'error' })}
+                onClick={() => onShowFindings('', { findingType: topQuarantine })}
               >
                 🛡️ Inspect Quarantine ➔
               </button>
@@ -860,11 +865,11 @@ export function OperationsStudio({
       {/* ── Redownload Modal ──────────────────────────────────────────────── */}
       {/* a finding with no track behind it (a fake-lossless FILE finding) has no
           id to search for; its finding id is not a track id */}
-      {redownloadFinding?.entity_id ? (
+      {redownloadFinding && redownloadTrackId ? (
         <RedownloadModal
           track={{
-            id: String(redownloadFinding.entity_id),
-            track_id: String(redownloadFinding.entity_id),
+            id: redownloadTrackId,
+            track_id: redownloadTrackId,
             title: String(
               (redownloadFinding.details as Record<string, any>)?.track_title ||
                 redownloadFinding.title ||
@@ -889,8 +894,8 @@ export function OperationsStudio({
               '',
             tracks: [
               {
-                id: String(redownloadFinding.entity_id),
-                track_id: String(redownloadFinding.entity_id),
+                id: redownloadTrackId,
+                track_id: redownloadTrackId,
                 title: String(
                   (redownloadFinding.details as Record<string, any>)?.track_title ||
                     redownloadFinding.title ||

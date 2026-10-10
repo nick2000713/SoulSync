@@ -253,4 +253,3 @@ def test_the_artist_page_section_lock_survives_grouping():
     ctx = res.album_groups[0].album_context
     assert ctx['album_type'] == 'album'
     assert ctx['album_type_locked'] is True
-

@@ -23,7 +23,6 @@ import shutil
 import time
 import traceback
 from dataclasses import dataclass
-from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -36,7 +35,7 @@ from core.imports.context import (
     get_import_original_search,
     normalize_import_context,
 )
-from core.imports.filename import extract_track_number_from_filename, parse_filename_metadata
+from core.imports.filename import extract_track_number_from_filename
 from core.metadata import enrichment as metadata_enrichment
 from core.runtime_state import (
     download_tasks,
@@ -78,34 +77,11 @@ def _found_file_matches_expected(found_file: Optional[str],
     )
 
 
-def _normalize_match_text(value: str) -> str:
-    return ''.join(ch.lower() for ch in str(value or '') if ch.isalnum())
-
-
 def _release_audio_match_score(path: str, expected_title: str, expected_artist: str) -> float:
-    parsed = parse_filename_metadata(path)
-    parsed_title = parsed.get('title') or Path(path).stem
-    parsed_artist = parsed.get('artist') or ''
-    expected_title_norm = _normalize_match_text(expected_title)
-    parsed_title_norm = _normalize_match_text(parsed_title)
-    if expected_title_norm and (
-        expected_title_norm in parsed_title_norm or parsed_title_norm in expected_title_norm
-    ):
-        title_score = 1.0
-    else:
-        title_score = SequenceMatcher(
-            None,
-            expected_title_norm,
-            parsed_title_norm,
-        ).ratio()
-    if expected_artist and parsed_artist:
-        artist_score = SequenceMatcher(
-            None,
-            _normalize_match_text(expected_artist),
-            _normalize_match_text(parsed_artist),
-        ).ratio()
-        return (title_score * 0.75) + (artist_score * 0.25)
-    return title_score
+    from core.downloads.release_import import read_release_file, release_match_score
+    return release_match_score(read_release_file(path), {
+        'name': expected_title, 'artists': [{'name': expected_artist}],
+    })
 
 
 def _track_title_from_task(track_info: Any, context: Optional[dict]) -> str:
@@ -156,6 +132,7 @@ class PostProcessDeps:
     post_process_with_verification: Callable
     mark_task_completed: Callable[[str, Optional[dict]], None]
     on_download_completed: Callable[[str, str, bool], None]
+    process_release_file: Optional[Callable] = None
 
 
 def _get_task_context(make_context_key, username, filename, task_id):
@@ -235,8 +212,8 @@ def run_post_processing_worker(task_id: str, batch_id: str, deps: PostProcessDep
         # an own-library profile's batch lands in that profile's folder (#1199);
         # everyone else keeps the folder resolved above, untouched
         try:
-            from core.imports.paths import import_profile_id, library_root_for_profile
-            transfer_dir = library_root_for_profile(import_profile_id({'batch_id': batch_id})) or transfer_dir
+            from core.imports.paths import import_owner_id, library_root_for_profile
+            transfer_dir = library_root_for_profile(import_owner_id({'batch_id': batch_id})) or transfer_dir
         except Exception as _root_err:  # noqa: BLE001 - the shared folder is the fallback
             logger.debug(f"[Post-Processing] per-profile root lookup failed: {_root_err}")
 
@@ -301,6 +278,7 @@ def run_post_processing_worker(task_id: str, batch_id: str, deps: PostProcessDep
         # RESILIENT FILE-FINDING LOOP: Try up to 3 times with delays
         found_file = None
         file_location = None
+        release_album = None
 
         # CRITICAL FIX: For YouTube downloads, the filename in task is 'id||title' (metadata),
         # but the actual file on disk is the remuxed/transcoded audio (e.g. Title.mp3).
@@ -317,6 +295,9 @@ def run_post_processing_worker(task_id: str, batch_id: str, deps: PostProcessDep
                 actual_download_id = task.get('download_id') or task_id
                 status = deps.run_async(deps.download_orchestrator.get_download_status(actual_download_id))
                 if status and task.get('username') in ('torrent', 'usenet'):
+                    if context:
+                        from core.library2.download_catalogue import hydrate_download_album
+                        hydrate_download_album(context)
                     audio_files = list(getattr(status, 'audio_files', None) or [])
                     if not audio_files and getattr(status, 'file_path', None):
                         audio_files = [status.file_path]
@@ -333,32 +314,27 @@ def run_post_processing_worker(task_id: str, batch_id: str, deps: PostProcessDep
                         artist_ctx = get_import_context_artist(context)
                         expected_artist = artist_ctx.get('name', '') if isinstance(artist_ctx, dict) else ''
 
-                    scored_files = [
-                        (_release_audio_match_score(path, expected_title, expected_artist), path)
-                        for path in audio_files
-                        if _is_audio_file(path)
-                    ]
-                    scored_files.sort(reverse=True)
-                    if scored_files:
-                        best_score, best_path = scored_files[0]
-                        logger.info(
-                            "[Post-Processing] Best %s release file for '%s': %s (score %.2f)",
-                            task.get('username'), expected_title, best_path, best_score,
-                        )
-                        if best_score >= 0.80:
-                            copied_path = _copy_release_audio_to_transfer(best_path, transfer_dir)
-                            if copied_path:
-                                found_file = copied_path
-                                file_location = 'download'
-                                logger.info(
-                                    "[Post-Processing] Copied matched %s release file to transfer: %s",
-                                    task.get('username'), copied_path,
-                                )
-                        else:
-                            logger.warning(
-                                "[Post-Processing] No %s release file met match threshold for '%s' (best %.2f)",
-                                task.get('username'), expected_title, best_score,
-                            )
+                    from core.downloads.release_import import (
+                        profile_formats, read_release_file, select_requested_file,
+                    )
+                    from core.quality.selection import load_profile_by_id
+                    release_files = [read_release_file(deps.docker_resolve_path(path))
+                                     for path in audio_files if _is_audio_file(path)]
+                    expected_track = dict(track_info) if isinstance(track_info, dict) else {}
+                    expected_track['name'] = expected_title
+                    if not expected_track.get('artists'):
+                        expected_track['artists'] = [{'name': expected_artist}]
+                    selected = select_requested_file(
+                        release_files, expected_track,
+                        profile_formats(load_profile_by_id(expected_track.get('quality_profile_id'))))
+                    if selected:
+                        logger.info("[Post-Processing] Matched %s release file for %r: %s",
+                                    task.get('username'), expected_title, selected.path)
+                        copied_path = _copy_release_audio_to_transfer(selected.path, transfer_dir)
+                        if copied_path:
+                            found_file = copied_path
+                            file_location = 'download'
+                            release_album = (release_files, selected)
                     if not found_file:
                         with tasks_lock:
                             if task_id in download_tasks:
@@ -538,8 +514,8 @@ def run_post_processing_worker(task_id: str, batch_id: str, deps: PostProcessDep
 
                             # Ensure track_number is valid
                             if not isinstance(track_number, int) or track_number < 1:
-                                logger.error(f"[Verification] Invalid track number ({track_number}), defaulting to 1")
-                                track_number = 1
+                                logger.warning(f"[Verification] Unknown track number ({track_number})")
+                                track_number = 0
 
                             # Get clean track name
                             clean_track_name = get_import_clean_title(context, default=original_search.get('title', 'Unknown Track'))
@@ -586,6 +562,10 @@ def run_post_processing_worker(task_id: str, batch_id: str, deps: PostProcessDep
                             logger.info(f"[Verification] Created proper album_info - track_number: {track_number}, album: {album_info['album_name']}")
 
                             logger.info(f"[Post-Processing] Attempting metadata enhancement for: {found_file}")
+                            from core.library2.validation import import_reference
+                            reference = import_reference(context)
+                            if reference:
+                                context['_metadata_reference'] = reference
                             logger.warning(f"[Metadata Input] Verification worker - artist: '{artist_context.get('name', 'MISSING')}' (id: {artist_context.get('id', 'MISSING')})")
                             logger.warning(f"[Metadata Input] Verification worker - album: '{album_info.get('album_name', 'MISSING')}', track#: {album_info.get('track_number', 'MISSING')}, source: {album_info.get('source', 'unknown')}")
                             enhancement_success = deps.enhance_file_metadata(found_file, context, artist_context, album_info)
@@ -619,6 +599,14 @@ def run_post_processing_worker(task_id: str, batch_id: str, deps: PostProcessDep
             else:
                 logger.info("[Post-Processing] File already has metadata enhancement completed")
 
+            metadata_status = 'unknown'
+            if _found_file_matches_expected(found_file, expected_final_path):
+                try:
+                    from database.music_database import get_database
+                    from core.library2.validation import refresh_imported_metadata
+                    metadata_status = refresh_imported_metadata(get_database(), [found_file])
+                except Exception as exc:
+                    logger.warning('Final metadata read failed for %s: %s', found_file, exc)
             with tasks_lock:
                 if task_id in download_tasks:
                     track_info = download_tasks[task_id].get('track_info')
@@ -629,6 +617,7 @@ def run_post_processing_worker(task_id: str, batch_id: str, deps: PostProcessDep
                     # genuinely published track would be kept on the wishlist
                     # and downloaded twice.
                     download_tasks[task_id].setdefault('final_file_path', found_file)
+                    download_tasks[task_id]['metadata_status'] = metadata_status
                     deps.mark_task_completed(task_id, track_info)
 
             # Clean up context now that both stream processor and verification worker are done
@@ -649,8 +638,19 @@ def run_post_processing_worker(task_id: str, batch_id: str, deps: PostProcessDep
 
             if context:
                 logger.info(f"[Post-Processing] Found matched context, running full post-processing for: {context_key}")
+                if release_album:
+                    context.pop('_pipeline_import_succeeded', None)  # this attempt's outcome only
                 # Run the existing post-processing logic with verification
                 deps.post_process_with_verification(context_key, context, found_file, task_id, batch_id)
+                if release_album and context.get('_pipeline_import_succeeded') and deps.process_release_file:
+                    # The requested track is done and its task completed. The
+                    # profile may also want the album's other tracks from it.
+                    from core.downloads.release_import import import_album_tracks
+                    try:
+                        import_album_tracks(context_key, context, *release_album, transfer_dir,
+                                            deps.process_release_file, _copy_release_audio_to_transfer)
+                    except Exception as album_error:  # the completed request must stay completed
+                        logger.error(f"[Post-Processing] Album tracks import failed: {album_error}")
             else:
                 # No matched context - just mark as completed since file exists
                 #

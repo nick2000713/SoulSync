@@ -39,6 +39,7 @@ export interface AdlDownload {
   progress: number;
   error: string | null;
   verification_status: string | null;
+  metadata_status?: string | null;
   batch_id: string;
   batch_name: string;
   batch_source: string;
@@ -265,6 +266,8 @@ export interface ClientTorrentItem {
   seeding_time?: number | null;
   save_path?: string | null;
   content_path?: string | null;
+  /** the client's own category (qbittorrent category, transmission/deluge label). */
+  category?: string | null;
   error?: string | null;
   /** present when SoulSync itself dispatched this item. */
   soulsync?: { kind?: string; title?: string };

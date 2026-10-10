@@ -18,6 +18,7 @@ from database.music_database import get_database
 from utils.logging_config import get_logger
 
 from .analyze import ANALYZER_VERSION
+from .ids import track_key
 from .fx import RenderFx, fx_from_row
 
 _FX_COLUMNS = ("normalize", "fade_ms", "reverse", "space", "delay_json")
@@ -35,7 +36,7 @@ def sample_data_dir() -> str:
 
 
 def source_signature(path: Optional[str]) -> Optional[str]:
-    """size + mtime of an audio file. changes when the file gets replaced
+    """Path identity + size + mtime. Changes when the file gets replaced
     (an upgrade, a re-tag, a new rip), which is when cached results go stale."""
     if not path:
         return None
@@ -43,7 +44,10 @@ def source_signature(path: Optional[str]) -> Optional[str]:
         st = os.stat(path)
     except OSError:
         return None
-    return f"{st.st_size}:{st.st_mtime_ns}"
+    import hashlib
+
+    identity = hashlib.sha1(os.path.abspath(path).encode("utf-8")).hexdigest()[:16]
+    return f"{identity}:{st.st_size}:{st.st_mtime_ns}"
 
 
 def _sig_tag(sig: Optional[str]) -> str:
@@ -52,7 +56,7 @@ def _sig_tag(sig: Optional[str]) -> str:
     return hashlib.sha1(sig.encode("utf-8")).hexdigest()[:10] if sig else ""
 
 
-def peaks_path(track_id: int, buckets: int = 1500, stem: str | None = None,
+def peaks_path(track_id: str, buckets: int = 1500, stem: str | None = None,
                sig: Optional[str] = None) -> str:
     """cache file for one waveform. the source signature is part of the name,
     so a replaced file never serves the old file's waveform."""
@@ -60,14 +64,14 @@ def peaks_path(track_id: int, buckets: int = 1500, stem: str | None = None,
     os.makedirs(d, exist_ok=True)
     suffix = f"_{stem}" if stem else ""
     tag = f"_{_sig_tag(sig)}" if sig else ""
-    return os.path.join(d, f"{int(track_id)}_{int(buckets)}{suffix}{tag}.json")
+    return os.path.join(d, f"{track_key(track_id)}_{int(buckets)}{suffix}{tag}.json")
 
 
-def drop_stale_peaks(track_id: int, buckets: int, stem: str | None, keep: str) -> None:
+def drop_stale_peaks(track_id: str, buckets: int, stem: str | None, keep: str) -> None:
     """remove older cache files for the same waveform once a new one is written."""
     d = os.path.dirname(keep)
     suffix = f"_{stem}" if stem else ""
-    base = f"{int(track_id)}_{int(buckets)}{suffix}"
+    base = f"{track_key(track_id)}_{int(buckets)}{suffix}"
     try:
         names = os.listdir(d)
     except OSError:
@@ -87,14 +91,14 @@ def drop_stale_peaks(track_id: int, buckets: int, stem: str | None, keep: str) -
                 pass
 
 
-def get_analysis(track_id: int) -> Optional[Dict[str, Any]]:
+def get_analysis(track_id: str) -> Optional[Dict[str, Any]]:
     """Return the cached analysis row, or None when the track was never analyzed."""
     db = get_database()
     conn = db._get_connection()
     try:
         row = conn.execute(
             "SELECT * FROM sample_analysis WHERE track_id = ?",
-            (int(track_id),),
+            (track_key(track_id),),
         ).fetchone()
     finally:
         conn.close()
@@ -105,7 +109,7 @@ def get_analysis(track_id: int) -> Optional[Dict[str, Any]]:
     if "key_name" in keys and row["key_name"]:
         key = {"name": row["key_name"], "confidence": float(row["key_confidence"] or 0)}
     return {
-        "track_id": row["track_id"],
+        "track_id": str(row["track_id"]),
         "bpm": row["bpm"],
         "onsets": json.loads(row["onsets_json"] or "[]"),
         "duration_s": row["duration_s"],
@@ -116,7 +120,7 @@ def get_analysis(track_id: int) -> Optional[Dict[str, Any]]:
     }
 
 
-def is_current(track_id: int, row: Optional[Dict[str, Any]] = None) -> bool:
+def is_current(track_id: str, row: Optional[Dict[str, Any]] = None) -> bool:
     """True when the row was made by the current analyzer from the file that's
     on disk now. a replaced file (upgrade, new rip) makes it stale.
 
@@ -132,7 +136,7 @@ def is_current(track_id: int, row: Optional[Dict[str, Any]] = None) -> bool:
     return sig is None or row.get("source_sig") == sig
 
 
-def save_analysis(track_id: int, result: Dict[str, Any], source_sig: Optional[str] = None) -> None:
+def save_analysis(track_id: str, result: Dict[str, Any], source_sig: Optional[str] = None) -> None:
     """Upsert an analyze_track() result. Idempotent by track_id."""
     key = result.get("key") or {}
     db = get_database()
@@ -153,7 +157,7 @@ def save_analysis(track_id: int, result: Dict[str, Any], source_sig: Optional[st
                    key_confidence = excluded.key_confidence,
                    source_sig = excluded.source_sig""",
             (
-                int(track_id),
+                track_key(track_id),
                 float(result.get("bpm") or 0),
                 json.dumps(result.get("onsets") or []),
                 float(result.get("duration_s") or 0),
@@ -169,12 +173,23 @@ def save_analysis(track_id: int, result: Dict[str, Any], source_sig: Optional[st
         conn.close()
 
 
-def get_track_file_path(track_id: int) -> Optional[str]:
-    """file_path for a library track, or None when the id is unknown."""
+def get_track_file_path(track_id: str) -> Optional[str]:
+    """file_path for a library track, or None when the id is unknown.
+
+    Library v2: the track's primary live file (a track can carry several)."""
+    from core.library2.sql_util import owner_clause
+    from core.library2.track_files import primary_order
+
     db = get_database()
     conn = db._get_connection()
     try:
-        row = conn.execute("SELECT file_path FROM tracks WHERE id = ?", (int(track_id),)).fetchone()
+        row = conn.execute(
+            "SELECT f.path AS file_path FROM lib2_track_files f "
+            "WHERE f.track_id = ? AND COALESCE(f.file_state, 'active') = 'active' "
+            "AND COALESCE(f.path, '') != '' "
+            f"{owner_clause(column='f.owner_profile_id')} "
+            f"ORDER BY {primary_order('f')} LIMIT 1",
+            (track_key(track_id),)).fetchone()
     finally:
         conn.close()
     if row is None or not row["file_path"]:
@@ -185,12 +200,16 @@ def get_track_file_path(track_id: int) -> Optional[str]:
 # ── Stems (Phase 4) ──────────────────────────────────────────────────────
 
 def stems_dir() -> str:
-    d = os.path.join(sample_data_dir(), "stems")
+    from core.library_scope import current_library_scope
+
+    scope = current_library_scope()
+    library = "all" if scope is None else ("shared" if scope == "shared" else f"owner-{int(scope)}")
+    d = os.path.join(sample_data_dir(), "stems", library)
     os.makedirs(d, exist_ok=True)
     return d
 
 
-def save_stems(track_id: int, stem_paths: Dict[str, str], backend: str,
+def save_stems(track_id: str, stem_paths: Dict[str, str], backend: str,
                method: str = "demucs", source_sig: Optional[str] = None) -> None:
     """Upsert one row per output of `method`. Idempotent per (track_id, stem)."""
     from .stems import METHOD_STEMS, SEPARATOR_VERSION
@@ -212,7 +231,7 @@ def save_stems(track_id: int, stem_paths: Dict[str, str], backend: str,
                        created_at = excluded.created_at,
                        source_sig = excluded.source_sig""",
                 (
-                    int(track_id),
+                    track_key(track_id),
                     stem,
                     str(stem_paths.get(stem) or ""),
                     str(backend),
@@ -229,7 +248,7 @@ def save_stems(track_id: int, stem_paths: Dict[str, str], backend: str,
 _UNSET = object()
 
 
-def get_stems(track_id: int, method: str = "demucs", source_sig: Any = _UNSET) -> Optional[Dict[str, Any]]:
+def get_stems(track_id: str, method: str = "demucs", source_sig: Any = _UNSET) -> Optional[Dict[str, Any]]:
     """{'stems': {name: file_path}, 'backend': ...} when every output of
     `method` exists on disk and was cut from the file that's there now."""
     from .stems import METHOD_STEMS, SEPARATOR_VERSION
@@ -242,7 +261,7 @@ def get_stems(track_id: int, method: str = "demucs", source_sig: Any = _UNSET) -
     try:
         rows = conn.execute(
             "SELECT * FROM sample_stems WHERE track_id = ?",
-            (int(track_id),),
+            (track_key(track_id),),
         ).fetchall()
     finally:
         conn.close()
@@ -257,11 +276,17 @@ def get_stems(track_id: int, method: str = "demucs", source_sig: Any = _UNSET) -
         from .worker import track_source
 
         _, source_sig = track_source(track_id)
+        if source_sig is None:
+            # Without a reachable source we cannot prove these global cache
+            # rows describe the caller's library. Explicit source_sig=None
+            # remains available for cache inspection that does not serve audio.
+            return None
     if source_sig is not None:
         for s in wanted:
             row_sig = by_stem[s]["source_sig"] if "source_sig" in by_stem[s].keys() else None
-            # rows from before signatures existed are trusted, a mismatch isn't
-            if row_sig is not None and row_sig != source_sig:
+            # An artifact without source identity cannot prove it came from
+            # this library's copy. Regenerate old rows rather than share audio.
+            if row_sig != source_sig:
                 return None
     return {
         "stems": {s: str(by_stem[s]["file_path"]) for s in wanted},
@@ -269,11 +294,11 @@ def get_stems(track_id: int, method: str = "demucs", source_sig: Any = _UNSET) -
     }
 
 
-def stems_complete(track_id: int, method: str = "demucs") -> bool:
+def stems_complete(track_id: str, method: str = "demucs") -> bool:
     return get_stems(track_id, method) is not None
 
 
-def stem_file_path(track_id: int, stem: str) -> Optional[str]:
+def stem_file_path(track_id: str, stem: str) -> Optional[str]:
     from .stems import method_for_stem
 
     method = method_for_stem(stem)
@@ -302,7 +327,7 @@ def _row_to_entry(row) -> Dict[str, Any]:
         "id": row["id"],
         "name": row["name"],
         "tags": json.loads(row["tags_json"] or "[]"),
-        "track_id": row["track_id"],
+        "track_id": str(row["track_id"]) if row["track_id"] is not None else None,
         "track_title": row["track_title"],
         "artist_name": row["artist_name"],
         "start_s": row["start_s"],
@@ -318,31 +343,41 @@ def _row_to_entry(row) -> Dict[str, Any]:
     }
 
 
-_STASH_SELECT = """
-    SELECT s.id, s.name, s.tags_json, s.track_id,
+# Library v2: a track's artist is its own credit, else its album's artist.
+_TRACK_ARTIST_SQL = """COALESCE(
+           (SELECT ar2.name FROM lib2_track_artists ta
+              JOIN lib2_artists ar2 ON ar2.id = ta.artist_id
+             WHERE ta.track_id = t.id
+             ORDER BY CASE ta.role WHEN 'primary' THEN 0 ELSE 1 END,
+                      ta.position, ta.artist_id LIMIT 1),
+           (SELECT ar3.name FROM lib2_albums al3
+              JOIN lib2_artists ar3 ON ar3.id = al3.primary_artist_id
+             WHERE al3.id = t.album_id))"""
+
+_STASH_SELECT = f"""
+    SELECT s.id, s.name, s.tags_json,
+           CASE WHEN s.track_id_kind='lib2' THEN s.track_id END AS track_id,
            COALESCE(t.title, '') AS track_title,
-           COALESCE(a.name, '') AS artist_name,
+           COALESCE({_TRACK_ARTIST_SQL}, '') AS artist_name,
            s.start_s, s.end_s, s.pitch_st, s.target_bpm,
            s.format, s.file_path, s.created_at, s.stem, s.folder,
            s.normalize, s.fade_ms, s.reverse, s.space, s.delay_json
     FROM sample_stash s
-    LEFT JOIN tracks t ON t.id = s.track_id
-    LEFT JOIN artists a ON a.id = t.artist_id
+    LEFT JOIN lib2_tracks t ON t.id = s.track_id AND s.track_id_kind = 'lib2'
 """
 
 
-def get_track_metadata(track_id: int) -> Dict[str, str]:
+def get_track_metadata(track_id: str) -> Dict[str, str]:
     """title/artist/album for a library track (for templates + tags)."""
     db = get_database()
     conn = db._get_connection()
     try:
         row = conn.execute(
-            """SELECT t.title AS title, a.name AS artist, al.title AS album
-               FROM tracks t
-               LEFT JOIN artists a ON a.id = t.artist_id
-               LEFT JOIN albums al ON al.id = t.album_id
+            f"""SELECT t.title AS title, {_TRACK_ARTIST_SQL} AS artist, al.title AS album
+               FROM lib2_tracks t
+               LEFT JOIN lib2_albums al ON al.id = t.album_id
                WHERE t.id = ?""",
-            (int(track_id),),
+            (track_key(track_id),),
         ).fetchone()
     finally:
         conn.close()
@@ -358,7 +393,7 @@ def get_track_metadata(track_id: int) -> Dict[str, str]:
 def create_stash_entry(
     name: str,
     tags: list,
-    track_id: int,
+    track_id: str,
     start_s: float,
     end_s: float,
     pitch_st: float,
@@ -378,12 +413,12 @@ def create_stash_entry(
             """INSERT INTO sample_stash
                    (name, tags_json, track_id, start_s, end_s, pitch_st,
                     target_bpm, format, file_path, created_at, stem, folder,
-                    normalize, fade_ms, reverse, space, delay_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    normalize, fade_ms, reverse, space, delay_json, track_id_kind)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'lib2')""",
             (
                 name,
                 json.dumps([str(t) for t in (tags or [])]),
-                int(track_id),
+                track_key(track_id),
                 float(start_s),
                 float(end_s),
                 float(pitch_st or 0),

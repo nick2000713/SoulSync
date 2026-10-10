@@ -25,11 +25,15 @@ def track_matches_title(title, track):
         normalized(track.get("title")), normalized((track.get("recording") or {}).get("title"))}
 
 
-def release_by_artist(release, artist_names, artist_mbid=None):
+def release_by_artist(release, artist_names, artist_mbid=None, mbid_name=None):
     """the release is credited to the artist we expect. an id match wins; else a
     credited name or the artist's current name folds equal to one we expect.
     equal, not similar: "Mammoth Mammoth" is a different band from "Mammoth"
-    (#1426). no expected name or no credited name -> can't judge, True."""
+    (#1426). no expected name or no credited name -> can't judge, True.
+
+    mbid_name is the name artist_mbid was resolved from. a credit with that
+    name and a different id is another band with the same name, so the names
+    can't vouch for it: the finnish "Nirvana" single is not by nirvana."""
     from core.text.fold import fold_title
     credits = [c for c in (release or {}).get("artist-credit") or [] if isinstance(c, dict)]
     if isinstance(artist_names, str):
@@ -40,6 +44,13 @@ def release_by_artist(release, artist_names, artist_mbid=None):
         return True
     if artist_mbid and any((c.get("artist") or {}).get("id") == artist_mbid for c in credits):
         return True
+    id_name = fold_title(mbid_name or "", drop_brackets=False)
+    if artist_mbid and id_name:
+        for c in credits:
+            cid = (c.get("artist") or {}).get("id")
+            names = {fold_title(n or "", drop_brackets=False) for n in (c.get("name"), (c.get("artist") or {}).get("name"))}
+            if cid and id_name in names:
+                return False
     joined = "".join((c.get("name") or (c.get("artist") or {}).get("name") or "") + (c.get("joinphrase") or "")
                      for c in credits)
     names = {joined} | {c.get("name") or "" for c in credits} | {(c.get("artist") or {}).get("name") or "" for c in credits}
@@ -168,7 +179,19 @@ def write_tag(audio, tag, value, symbols):
     values = [str(v) for v in (value if isinstance(value, (list, tuple)) else [value]) if v is not None]
     if not values:
         return
-    native = {"DATE": "TDRC", "ARTISTSORT": "TSOP", "ALBUMARTISTSORT": "TSO2", "LABEL": "TPUB", "ISRC": "TSRC"}
+    native = {"COPYRIGHT": "TCOP", "DATE": "TDRC", "ARTISTSORT": "TSOP", "ALBUMARTISTSORT": "TSO2", "LABEL": "TPUB", "ISRC": "TSRC"}
+    if tag == 'LYRICS':
+        if isinstance(audio.tags, symbols.ID3):
+            from mutagen.id3 import USLT
+            audio.tags.add(USLT(encoding=3, lang='eng', desc='', text=values[0]))
+        elif isinstance(audio, symbols.MP4):
+            audio['\xa9lyr'] = values
+        elif is_vorbis_like(audio, symbols):
+            audio['LYRICS'] = values
+        return
+    if tag == 'COPYRIGHT' and isinstance(audio, symbols.MP4):
+        audio['cprt'] = values
+        return
     if isinstance(audio.tags, symbols.ID3):
         frame, desc = ID3_TAG_MAP.get(tag, ("TXXX", tag))
         frame = native.get(tag, frame)
@@ -192,3 +215,26 @@ def write_tag(audio, tag, value, symbols):
         if key != tag and tag in audio:
             del audio[tag]  # Remove SoulSync's legacy alias before writing Picard's key.
         audio[key] = values
+
+
+def read_tag(audio, tag, symbols):
+    """Read the same native frame/atom used by write_tag."""
+    from core.metadata.common import is_vorbis_like
+    from core.metadata.source import ID3_TAG_MAP, MP4_TAG_MAP, VORBIS_TAG_MAP
+    if isinstance(audio.tags, symbols.ID3):
+        frame, desc = ID3_TAG_MAP.get(tag, ('TXXX', tag))
+        frame = {'COPYRIGHT': 'TCOP', 'LABEL': 'TPUB', 'ISRC': 'TSRC'}.get(tag, frame)
+        frames = audio.tags.getall(frame)
+        if frame == 'TXXX':
+            frames = [f for f in frames if f.desc == desc]
+        elif frame == 'UFID':
+            frames = [f for f in frames if f.owner == desc]
+        value = getattr(frames[0], 'data' if frame == 'UFID' else 'text', None) if frames else None
+    elif isinstance(audio, symbols.MP4):
+        value = audio.get('cprt' if tag == 'COPYRIGHT' else '----:com.apple.iTunes:' + MP4_TAG_MAP.get(tag, tag))
+    elif is_vorbis_like(audio, symbols):
+        value = audio.get(VORBIS_TAG_MAP.get(tag, tag))
+    else:
+        value = None
+    first = value[0] if isinstance(value, (list, tuple)) and value else value
+    return first.decode('utf-8') if isinstance(first, bytes) else str(first) if first is not None else None

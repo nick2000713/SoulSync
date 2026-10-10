@@ -167,7 +167,16 @@ function setTrackInfo(track) {
 
     const gotoArtistBtn = document.getElementById('np-goto-artist');
     if (gotoArtistBtn) {
-        if (track.artist_id) {
+        // iss29-B08: a Library V2 track has no LEGACY artist id — `artist_id`
+        // is correctly null — so this button was permanently disabled for the
+        // whole of V2 playback. The V2 id travels separately and routes into
+        // the Library page, which is where that artist actually lives.
+        if (track.lib2_artist_id) {
+            gotoArtistBtn.href = `/library?artist=${encodeURIComponent(track.lib2_artist_id)}`;
+            gotoArtistBtn.style.pointerEvents = '';
+            gotoArtistBtn.setAttribute('aria-disabled', 'false');
+            gotoArtistBtn.tabIndex = 0;
+        } else if (track.artist_id) {
             gotoArtistBtn.href = buildArtistDetailPath(track.artist_id, track.artist_source || null);
             gotoArtistBtn.style.pointerEvents = '';
             gotoArtistBtn.setAttribute('aria-disabled', 'false');
@@ -1468,6 +1477,9 @@ const npQueuePrefetchBatchIds = new Set();
 const NP_QUEUE_PREFETCH_TERMINAL = new Set(['failed', 'not_found', 'cancelled', 'quarantined']);
 
 function npQueueIdentity(track) {
+    if (track?.lib2_track_id != null) {
+        return `lib2:${track.lib2_track_id}:${track.lib2_album_id ?? ''}:${track.release_edition_id ?? ''}:${track.profile_id ?? ''}:${track.library_owner_id ?? 'shared'}:${track.quality_profile_id ?? ''}`;
+    }
     const source = String(track?.source || track?.metadata_source || '').trim().toLowerCase();
     const sourceId = String(track?.source_track_id || track?.spotify_track_id || track?.tidal_track_id ||
         track?.deezer_id || track?.itunes_track_id || track?.musicbrainz_recording_id || track?.track_id || '').trim();
@@ -1548,11 +1560,15 @@ function npQueueStatusLabel(track) {
     }
 }
 
-function npApplyQueuePrefetchState(requestIds, state, finalPath = '', progress = 0, error = '') {
+function npApplyQueuePrefetchState(requestIds, state, finalPath = '', progress = 0, error = '', identity = {}) {
     const ids = new Set((requestIds || []).map(String));
     let changed = false;
     npQueue.forEach(track => {
         if (!ids.has(String(track?._queue_request_id || ''))) return;
+        for (const field of ['lib2_track_id', 'lib2_album_id', 'release_edition_id',
+            'quality_profile_id', 'profile_id', 'library_owner_id']) {
+            if (Object.prototype.hasOwnProperty.call(identity, field)) track[field] = identity[field];
+        }
         if (finalPath) {
             track.file_path = finalPath;
             track.filename = finalPath;
@@ -1591,6 +1607,7 @@ async function npPollQueuePrefetch() {
         const data = await response.json();
         if (!response.ok || !data.success) throw new Error(data.error || 'Queue download status unavailable');
         let changed = false;
+        let refill = false;
         Object.entries(data.batches || {}).forEach(([batchId, batch]) => {
             const tasks = Array.isArray(batch?.tasks) ? batch.tasks : [];
             tasks.forEach(task => {
@@ -1601,19 +1618,26 @@ async function npPollQueuePrefetch() {
                 if (!requestIds.length) return;
                 const state = task.quarantine_entry_id ? 'quarantined' : String(task.status || 'queued');
                 const finalPath = state === 'completed' ? String(task.final_file_path || '') : '';
+                if ((finalPath || NP_QUEUE_PREFETCH_TERMINAL.has(state)) && npQueue.some(track =>
+                    requestIds.includes(track._queue_request_id) && npQueueTrackNeedsDownload(track))) refill = true;
                 changed = npApplyQueuePrefetchState(
                     requestIds,
                     finalPath ? 'ready' : state,
                     finalPath,
                     task.progress,
                     task.error_message,
+                    info,
                 ) || changed;
             });
             const terminal = ['complete', 'error', 'cancelled'].includes(batch?.phase) &&
                 tasks.every(task => ['completed', 'failed', 'not_found', 'cancelled'].includes(task.status));
             if (terminal) npQueuePrefetchBatchIds.delete(batchId);
         });
+        // A batch the server no longer reports (another library is selected
+        // now, or it was cleaned up) can never finish here: stop asking.
+        npQueuePrefetchBatchIds.forEach(id => { if (!data.batches?.[id]) npQueuePrefetchBatchIds.delete(id); });
         if (changed) renderNpQueue();
+        if (refill) npScheduleQueuePrefetch();
         if (npQueuePrefetchBatchIds.size === 0) npStopQueuePrefetchPolling();
     } catch (error) {
         console.warn('Queue prefetch status failed:', error.message);
@@ -1623,7 +1647,10 @@ async function npPollQueuePrefetch() {
 async function npPrefetchMissingQueueTracks() {
     if (!npAutoDownloadQueue) return;
     if (npQueuePrefetchRequest) return npQueuePrefetchRequest;
-    const missing = npQueue.filter(npQueueTrackNeedsDownload);
+    // Keep a short buffer ahead of the current song. A long native artist
+    // queue must not start acquiring every release at once or overflow the
+    // backend's request limit, leaving later rows stuck in "Preparing".
+    const missing = npQueue.slice(Math.max(0, npQueueIndex)).filter(npQueueTrackNeedsDownload).slice(0, 25);
     if (!missing.length) return;
     missing.forEach(track => { track.playback_status = 'requesting'; });
     renderNpQueue();
@@ -1641,6 +1668,9 @@ async function npPrefetchMissingQueueTracks() {
                     item.request_ids || [],
                     item.state || 'queued',
                     item.final_path || '',
+                    0,
+                    item.error || '',
+                    item,
                 );
             });
             (data.batch_ids || []).forEach(id => npQueuePrefetchBatchIds.add(String(id)));
@@ -1990,8 +2020,10 @@ function syncExpandedPlayerUI() {
 
 // a library track: played from the library, with its db ids. streams and
 // queued downloads have nothing an issue could point at.
+// an issue names its item by Library v2 id here (api/issues snapshots lib2):
+// a player row's `id` is a server/legacy id, so only its lib2 id can report
 function npIsReportableTrack(track) {
-    return !!(track && track.is_library && track.id != null && track.id !== '' && track.artist_id != null);
+    return !!(track && track.is_library && track.lib2_track_id != null && track.lib2_track_id !== '');
 }
 
 function updateNpTrackInfo() {
@@ -2080,10 +2112,26 @@ function updateNpTrackInfo() {
             }
         }
 
-        // Action buttons visibility
+        // Action buttons visibility. the row shows for a track with a library
+        // artist OR one that can go on a playlist (a stream has no artist_id)
+        const npPlaylistTrack = npAddToPlaylistTrack(currentTrack);
         if (actionBtns) {
             const hasArtist = currentTrack.artist_id;
-            actionBtns.classList.toggle('hidden', !hasArtist);
+            actionBtns.classList.toggle('hidden', !hasArtist && !npPlaylistTrack);
+            const gotoArtist = document.getElementById('np-goto-artist');
+            if (gotoArtist) gotoArtist.classList.toggle('hidden', !hasArtist);
+        }
+        const addBtn = document.getElementById('np-add-to-playlist');
+        if (addBtn) {
+            addBtn.classList.toggle('hidden', !npPlaylistTrack);
+            if (!addBtn._npAddAttached) {
+                addBtn.addEventListener('click', () => {
+                    const t = npAddToPlaylistTrack(currentTrack);
+                    if (!t || typeof window.openAddToPlaylist !== 'function') return;
+                    window.openAddToPlaylist(t, addBtn);
+                });
+                addBtn._npAddAttached = true;
+            }
         }
         // reporting needs a library row to point at
         const reportBtn = document.getElementById('np-report-issue');
@@ -2094,7 +2142,7 @@ function updateNpTrackInfo() {
                     const t = currentTrack;
                     if (!npIsReportableTrack(t) || typeof window.showReportIssueModal !== 'function') return;
                     try { closeNowPlayingModal(); } catch (e) { /* the report opens either way */ }
-                    window.showReportIssueModal('track', t.id, t.title || 'Track', t.artist || '', t.album || '');
+                    window.showReportIssueModal('track', t.lib2_track_id, t.title || 'Track', t.artist || '', t.album || '');
                 });
                 reportBtn._npReportAttached = true;
             }
@@ -2739,7 +2787,16 @@ async function playQueueItem(index, options = {}) {
                 is_library: true,
                 image_url: track.image_url,
                 id: track.id,
+                // A queue row can come from Library v2 (album/artist Play), and
+                // those rows address the catalogue by TYPED id — `id` is then a
+                // server/legacy id or null. Dropping them here is what left a
+                // queued v2 play without play-log attribution and with a dead
+                // "Go to artist"; playLibraryTrack has threaded them all along.
+                lib2_track_id: track.lib2_track_id || null,
+                legacy_track_id: track.legacy_track_id || null,
+                server_track_id: track.server_track_id || null,
                 artist_id: track.artist_id,
+                lib2_artist_id: track.lib2_artist_id || null,
                 album_id: track.album_id,
                 bitrate: track.bitrate,
                 sample_rate: track.sample_rate
@@ -2756,8 +2813,14 @@ async function playQueueItem(index, options = {}) {
                     album: track.album || '',
                     // Server song id (Navidrome/Subsonic) so playback can fall
                     // back to streaming via the server when the file isn't on
-                    // SoulSync's disk (#809).
-                    track_id: track.id || null
+                    // SoulSync's disk (#809). A Library v2 `id` means nothing
+                    // to the media server, so only a server/legacy id may be
+                    // sent as `track_id` -- same contract as playLibraryTrack.
+                    track_id: track.server_track_id || track.legacy_track_id ||
+                        (track.lib2_track_id ? null : (track.id || null)),
+                    lib2_track_id: track.lib2_track_id || null,
+                    legacy_track_id: track.legacy_track_id || null,
+                    server_track_id: track.server_track_id || null
                 })
             });
             const result = await response.json();
@@ -3140,7 +3203,22 @@ function updateNpPrevNextButtons() {
     if (miniNextBtn) miniNextBtn.disabled = !canNext;
 }
 
+// what the now playing "Add to playlist" hands the picker: artist + title,
+// or null when the track has no artist to identify it by
+function npAddToPlaylistTrack(track) {
+    if (!track) return null;
+    let title = String(track.title || '');
+    const cut = title.indexOf('||');   // some titles are stored "<id>||<title>"
+    if (cut >= 0) title = title.slice(cut + 2);
+    title = title.trim();
+    const artist = String(track.artist || '').trim();
+    if (!title || !artist || artist === 'Unknown Artist') return null;
+    return { track_name: title, artist_name: artist, album_name: String(track.album || '').trim() };
+}
+
 function handlePlayerKeyboardShortcuts(event) {
+    // a popover over the player (add to playlist) owns its own keys
+    if (document.activeElement?.closest?.('[data-popover-layer]')) return;
     // Don't intercept when typing in inputs or when non-player modals are open
     const tag = document.activeElement.tagName.toLowerCase();
     if (tag === 'input' || tag === 'textarea' || tag === 'select' || document.activeElement.isContentEditable) return;
@@ -3737,6 +3815,7 @@ async function playTrackList(tracks, contextName, options = {}) {
     return await playQueueItem(0, options);
 }
 window.playTrackList = playTrackList;
+window.isQueueAutoDownloadEnabled = () => npAutoDownloadQueue;
 
 async function npFetchRadioTracks(forceAdvance = false) {
     // forceAdvance: a manual skip at the tail of the fetched batch (next
@@ -3838,6 +3917,9 @@ function npMaybeLogPlay() {
             body: JSON.stringify({
                 track: {
                     id: currentTrack.id,
+                    lib2_track_id: currentTrack.lib2_track_id || null,
+                    legacy_track_id: currentTrack.legacy_track_id || null,
+                    server_track_id: currentTrack.server_track_id || null,
                     title: currentTrack.title,
                     artist: currentTrack.artist,
                     album: currentTrack.album,

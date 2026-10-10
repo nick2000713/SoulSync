@@ -585,7 +585,7 @@ def add_activity_item(icon, title, subtitle, time_ago="Now", show_toast=True):
 # Fixtures
 # ---------------------------------------------------------------------------
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def test_app():
     """Create a minimal Flask + SocketIO app that mirrors Phase 1+2 endpoints."""
     global _test_socketio
@@ -1142,6 +1142,21 @@ def _inert_video_download_monitor():
 
 
 @pytest.fixture(scope="session", autouse=True)
+def _soulseek_ownership_in_memory():
+    """keep the soulseek ownership registry in memory for the suite.
+
+    production saves it in the metadata table so a restart remembers which
+    slskd transfers are ours. every test client shares one session temp db, so
+    saving would leak one test's "owned" ids into the next. tests of the
+    saved registry turn it back on with their own store.
+    """
+    from core.soulseek_client import SoulseekClient
+    SoulseekClient.PERSIST_OWNERSHIP = False
+    yield
+    SoulseekClient.PERSIST_OWNERSHIP = True
+
+
+@pytest.fixture(scope="session", autouse=True)
 def _inert_music_disk_guard():
     """Pin the music min-free-disk guard OFF for the whole suite.
 
@@ -1549,3 +1564,22 @@ def _web_server_clients_start_as_the_admin():
         yield
     finally:
         ws.app.test_client_class = saved
+
+
+@pytest.fixture
+def server_tz(monkeypatch):
+    """set the server's local timezone for one test. played_at is stored
+    utc and hour-of-day charts read it in local time, so a test that seeds
+    hours picks the zone it means. call with a tz name, e.g. server_tz('UTC')"""
+    def _set(name):
+        monkeypatch.setenv('TZ', name)
+        time.tzset()
+    yield _set
+    monkeypatch.undo()
+    time.tzset()
+
+
+@pytest.fixture
+def utc_server(server_tz):
+    """the server's local time is utc: a stored hour is the hour shown"""
+    server_tz('UTC')

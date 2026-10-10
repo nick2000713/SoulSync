@@ -259,7 +259,14 @@ def find_owned_match(music_database, track_name: str, artists: Any, album: Optio
                          if _same_title(album, candidate.title)]
             if album_ids:
                 for candidate in music_database.get_candidate_tracks_for_albums(album_ids):
-                    if getattr(candidate, 'server_source', active_server) != active_server:
+                    # Library v2: owned means a live file. The row's
+                    # server_source is only a compatibility projection --
+                    # NULL for what SoulSync imported itself -- so only a
+                    # source that names ANOTHER server rules a row out.
+                    if not getattr(candidate, 'file_path', None):
+                        continue
+                    _source = getattr(candidate, 'server_source', None)
+                    if _source and _source != active_server:
                         continue
                     if contains_staging_segment(getattr(candidate, 'file_path', None) or ''):
                         continue

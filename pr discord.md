@@ -1,13 +1,17 @@
-**SoulSync 3.5.1 is out** :musical_note:
+**SoulSync 3.5.3 is out** :musical_note:
 
-Download Discography now has a Wishlist + Watchlist button: grab the releases you picked and start watching the artist in one go, with release types and filters set right in the modal. A new edition preference stops the watchlist from grabbing both the standard and deluxe of the same album.
+My Playlists: make your own playlists and add any track from anywhere in the app, search, library, discover, the now playing view. They identify, sync to your server and download missing like mirrored playlists, and adding a song that's already there asks first, even when it's a remaster or radio edit.
 
-Non-admin profiles can request music videos and single episodes, approved from the same requests page as music. The dashboard got a visual refresh plus a weekly listening digest built from your real plays.
+The Clients tab can match & import downloads SoulSync didn't start, for music, audiobooks and video, including Soulseek folders. Cards got a redesign with one clear action each.
 
-Playlist sync: wishlisted tracks download as a playlist-named batch so the library scan runs after them, new mirrors get their server playlist on the first sync, completion stops claiming 100% when tracks still need identifying, and ListenBrainz weekly playlists stop getting stuck on an old week (thanks @ifedan-ed).
+Audiobooks: choose allowed formats and one file vs several, a failed download tries the next release right away, and Soulseek books survive slskd clearing finished chapters (thanks @curiousmoose24). You can also type your own release search, and the series strip shows what you own.
 
-Tagging: MusicBrainz stops matching the wrong same-named band, wishlist downloads keep featured artists, sort tags follow the primary source, "hip hop" and "hip-hop" merge, full-depth re-tag actually writes, and versioned recordings can be told apart. New opt-in artist.nfo for Jellyfin/Kodi/Emby, original date as DATE, and $label in album paths.
+BPM Backfill now fills BPM across the whole library, from Deezer or local analysis, and downloads get Deezer's BPM and ISRC tags. Sample Studio analyzes MP3 and M4A files without ffmpeg on PATH and lists your tracks before you search (thanks Specialmed).
 
-Fixes: singles no longer show owned because the album has the same song, single-file audiobook torrents import instead of stalling (thanks SeadogsBooty), audiobook search finds "Series 03" volumes (thanks @SimpleSimonLA), Soulseek cleanup only touches its own transfers (thanks @splitsec2), and repair and tools fixes from @mandos21.
+Tidal playlists load every track: SoulSync asked for the US catalogue, so non-US accounts lost tracks. Duplicates and videos are counted too (#1613).
+
+Deezer matching picks the right album for soundtracks and compilations and reaches the original song from more searches (thanks @cremonies). Deezer downloads keep their album artist and genre.
+
+Also: enrichment workers stop staying paused, a dead HiFi pool stops slowing every track, re-tag and release year repairs stop picking the wrong track or album, video episodes import like Sonarr judges them, API key fixes (thanks @splitsec2), and accent colours that never showed now do (thanks @Thundernerd).
 
 Full notes on GitHub.
