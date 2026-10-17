@@ -244,7 +244,12 @@ export function SyncPage() {
         onOpen={(sourceId) => openSourceModal('qobuz', sourceId)}
       />
     ),
-    beatport: <BeatportTab />,
+    beatport: (
+      <BeatportTab
+        vertical={page.verticals.beatport}
+        onOpen={(sourceId) => openSourceModal('beatport', sourceId)}
+      />
+    ),
     deezer: <DeezerArlTab />,
     // The link variant is the same SERVICE: one config, one vertical, one
     // modal id space. Only the way a playlist arrives differs.
@@ -284,6 +289,17 @@ export function SyncPage() {
         pipeline={page.pipeline}
         registerReload={page.registerMirroredReload}
         registerOpenDetail={registerOpenDetail}
+      />
+    ),
+    // the same tab over the playlists made here: one vertical, one pipeline
+    'my-playlists': (
+      <MirroredTab
+        scope="user"
+        vertical={page.verticals.mirrored}
+        onOpen={(sourceId) => openSourceModal('mirrored', sourceId)}
+        sourceName={sourceName}
+        pipeline={page.pipeline}
+        registerReload={page.registerMirroredReload}
       />
     ),
   };

@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List
 
 from core.profile_context import get_background_profile
+from core.playlists.user_playlists import pipeline_runs
 
 
 DISCOVERY_TIMEOUT_SECONDS = 3600
@@ -150,14 +151,21 @@ def run_mirrored_playlist_pipeline(
                 log_line='Refresh only: nothing pushed to the server or downloaded',
                 log_type='info',
             )
-            sync_summary = {'synced': 0, 'skipped': 0, 'wishlist_queued': 0}
+            sync_summary = {'synced': 0, 'skipped': 0, 'errors': 0, 'wishlist_queued': 0}
         else:
             sync_summary = sync_and_wishlist_fn(
                 deps,
                 automation_id,
                 [pl for pl in playlists if pl.get('id')],
                 sync_one_fn=lambda pl: sync_one_fn(
-                    {'playlist_id': str(pl['id']), '_automation_id': None},
+                    {'playlist_id': str(pl['id']), '_automation_id': None,
+                     'user_initiated': bool(config.get('user_initiated')),
+                     # #1689: the resolved skip must also stop the sync
+                     # itself from wishlisting missing tracks as it goes;
+                     # the wishlist-phase skip alone left the adds running.
+                     'skip_wishlist_add': bool(skip_wishlist),
+                     # the pipeline's own mode (#1704), a mirror's own beats it
+                     'sync_mode': config.get('sync_mode') or None},
                     deps,
                 ),
                 sync_id_for_fn=lambda pl: f"auto_mirror_{pl['id']}",
@@ -185,6 +193,11 @@ def run_mirrored_playlist_pipeline(
         if skipped > 0:
             final_log_line += f' — {skipped} track{"s" if skipped != 1 else ""} need identification'
             final_log_type = 'warning'
+        # imported here: core.automation.handlers imports this module
+        from core.automation.handlers._pipeline_shared import apply_sync_errors
+        result_errors: Dict[str, Any] = {}
+        final_log_line, final_log_type = apply_sync_errors(
+            sync_summary, result_errors, final_log_line, final_log_type)
         deps.update_progress(
             automation_id,
             status='finished',
@@ -204,6 +217,7 @@ def run_mirrored_playlist_pipeline(
             'sync_skipped': str(sync_summary['skipped']),
             'wishlist_queued': str(sync_summary['wishlist_queued']),
             'duration_seconds': str(duration),
+            **result_errors,
         }
         try:
             _record_playlist_pipeline_history(
@@ -344,7 +358,7 @@ def _resolve_pipeline_playlists(
 
 
 def _filter_refreshable_playlists(playlists: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return [pl for pl in playlists if pl.get('source', '') not in ('file', 'beatport')]
+    return [pl for pl in playlists if pipeline_runs(pl)]
 
 
 def _summarize_playlist_names(playlists: List[Dict[str, Any]]) -> str:

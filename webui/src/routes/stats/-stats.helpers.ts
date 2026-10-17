@@ -99,7 +99,7 @@ export function formatCompactNumber(value: number | null | undefined): string {
   if (!value) return '0';
   if (value >= 1_000_000) return `${stripTrailingZero((value / 1_000_000).toFixed(1))}M`;
   if (value >= 1_000) return `${stripTrailingZero((value / 1_000).toFixed(1))}K`;
-  return value.toLocaleString();
+  return value.toLocaleString('en-US');
 }
 
 export function formatListeningTime(totalMs: number | null | undefined): string {
@@ -119,7 +119,12 @@ export function formatRelativePlayedAt(
   now = Date.now(),
 ): string {
   if (!dateStr) return '';
-  const diff = now - new Date(dateStr).getTime();
+  // the history stores utc as "YYYY-MM-DD HH:MM:SS". a bare stamp like that
+  // reads as local time in Date(), hours off for anyone not on utc
+  const stamp = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(dateStr)
+    ? `${dateStr.replace(' ', 'T')}Z`
+    : dateStr;
+  const diff = now - new Date(stamp).getTime();
   const minutes = Math.floor(diff / 60_000);
   if (minutes < 60) return `${minutes}m ago`;
   const hours = Math.floor(minutes / 60);
@@ -153,7 +158,7 @@ export function formatDbStorageValue(size: number, method: string | null | undef
     if (size > 1_048_576) return `${(size / 1_048_576).toFixed(1)} MB`;
     return `${Math.round(size / 1024)} KB`;
   }
-  return `${size.toLocaleString()} rows`;
+  return `${size.toLocaleString('en-US')} rows`;
 }
 
 export function getTopArtistBubbles(artists: StatsArtistRow[]) {

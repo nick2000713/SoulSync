@@ -5,10 +5,13 @@ people/airing scans pay off. For wished, RELEASED movies (and aired episodes) it
 Soulseek, picks the best release per the quality profile, and enqueues the download; the
 existing ``download_monitor`` finishes + organises + archives it, exactly like a manual grab.
 
-Shape mirrors the YouTube drain (Boulder: "same standard"): it processes the WHOLE eligible
-wishlist (no total cap), but the slow part — each item needs a ~20s blocking Soulseek search
-— runs only a FEW at a time (``max_concurrent``). A ``guard`` keeps the next hourly tick from
-overlapping a run that's still working, so it can't pile up.
+Shape mirrors the YouTube drain (Boulder: "same standard"): the slow part — each item
+needs a ~20s blocking Soulseek search — runs only a FEW at a time (``max_concurrent``,
+"Max simultaneous searches"), and each run hands at most ``max_simultaneous_downloads``
+items ("Max downloads per run", default 3) to the download clients. The rest stay
+on the wishlist and are picked up on the next tick — no starvation, no loss. A ``guard``
+keeps the next hourly tick from overlapping a run that's still working, so it can't
+pile up.
 
 Movies are gated on ``status='wanted'`` (released; skips 'monitored'/unreleased). Episodes
 are all-wished (the airing scan only adds aired ones). Items already downloading are skipped
@@ -71,6 +74,10 @@ def pick_best(candidates: List[Dict[str, Any]], min_rank: int = 0) -> Optional[D
 # blocking an item without turning a stuck item into an indexer hammer.
 MAX_GRAB_ATTEMPTS = 3
 MIN_SEASON_PACK_EPISODES = 3
+# a season that had an episode this recently is still airing: no pack exists
+# yet, so its episodes are searched one by one (Sonarr only reaches for a
+# season pack once the season has aired)
+SEASON_PACK_QUIET_DAYS = 10
 SOURCE_REFUSAL_LIMIT = 2
 SOURCE_COOLDOWN_SECONDS = 6 * 60 * 60
 _SOURCE_REFUSALS: Dict[tuple, int] = {}
@@ -337,15 +344,41 @@ def _packable_episode(item: Dict[str, Any]) -> bool:
     return bool(item.get("show_tmdb_id") and item.get("show_title"))
 
 
+def season_still_airing(rows: List[Dict[str, Any]], today: Optional[str] = None,
+                        quiet_days: int = SEASON_PACK_QUIET_DAYS) -> bool:
+    """Whether a show season is still airing, from its newest known air date
+    (the library's last episode for the season, or the wished episodes' own
+    dates). nothing known at all counts as aired, the pack try still falls back
+    to the episodes."""
+    import datetime as _dt
+    dates = []
+    for r in rows or []:
+        for value in (r.get("season_last_air"), r.get("air_date")):
+            text = str(value or "")[:10]
+            if len(text) == 10:
+                dates.append(text)
+    if not dates:
+        return False
+    today_d = _dt.date.fromisoformat(today) if today else _dt.date.today()
+    try:
+        newest = _dt.date.fromisoformat(max(dates))
+    except ValueError:
+        return False
+    return newest > today_d - _dt.timedelta(days=quiet_days)
+
+
 def season_pack_requests(items: List[Dict[str, Any]], active: Iterable,
-                         min_missing: int = MIN_SEASON_PACK_EPISODES) -> List[Dict[str, Any]]:
+                         min_missing: int = MIN_SEASON_PACK_EPISODES,
+                         today: Optional[str] = None) -> List[Dict[str, Any]]:
     """Synthetic season-search rows for shows with many missing episodes.
 
     The ordinary drain receives one wishlist row per episode. When several rows
     belong to the same show season, searching each SxxExx first burns indexer
     budget and misses the release shape Sonarr prefers: one season pack. This
     groups only straightforward missing standard episodes; upgrades, daily/anime
-    numbering, and seasons with an in-flight member stay on the per-episode path.
+    numbering, seasons with an in-flight member, and seasons still airing (no
+    pack can exist yet) stay on the per-episode path. Each pack carries its
+    member rows, so a pack search that finds nothing falls back to them.
     """
     try:
         floor = max(2, int(min_missing or MIN_SEASON_PACK_EPISODES))
@@ -368,12 +401,15 @@ def season_pack_requests(items: List[Dict[str, Any]], active: Iterable,
         if any(("episode", show_id, season, int(r.get("episode_number") or 0)) in active_set
                for r in rows):
             continue
+        if season_still_airing(rows, today=today):
+            continue
         first = rows[0]
         pack = dict(first)
         pack["episode_number"] = None
         pack["episode_title"] = None
         pack["_pack_members"] = [
             (int(r.get("season_number") or 0), int(r.get("episode_number") or 0)) for r in rows]
+        pack["_pack_rows"] = list(rows)
         out.append(pack)
     return out
 
@@ -412,6 +448,28 @@ def _acceptable_titles(primary: Any, kind: str, tmdb_id: Any) -> List[str]:
     return out
 
 
+_TITLE_YEAR = re.compile(r"\((\d{4})\)\s*$")
+
+
+def show_year_for(item: Dict[str, Any]) -> Optional[str]:
+    """The SHOW's year (its first-air year) for an episode row, or None.
+
+    never the episode's own air year. that was what this used, so a release
+    named the way the scene names a year-disambiguated show,
+    'Dark.Matter.2024.S02E08', was rejected as "Wrong year (2024, wanted 2026)"
+    by the drain and again by the importer, and the right episode sat on the
+    wishlist forever. the library's show year first, then a "(2024)" in the
+    title, else no year at all (no year means no year judgement)."""
+    year = item.get("show_year")
+    try:
+        if year:
+            return str(int(str(year)[:4]))
+    except (TypeError, ValueError):
+        pass
+    m = _TITLE_YEAR.search(str(item.get("show_title") or "").strip())
+    return m.group(1) if m else None
+
+
 def search_context(item: Dict[str, Any], media_type: str) -> Dict[str, Any]:
     """The ``search_ctx`` the download row carries (drives the monitor's requery).
     Carries ``titles`` — the primary title plus TMDB aliases — so both the initial pick
@@ -424,13 +482,20 @@ def search_context(item: Dict[str, Any], media_type: str) -> Dict[str, Any]:
         ctx = {"scope": scope, "title": item.get("show_title"),
                "season": item.get("season_number"),
                "episode": item.get("episode_number"),
-               "year": (str(item.get("air_date") or "")[:4] or None),
+               "year": show_year_for(item),
                # full air date — daily series (Daily Show / Kimmel / soaps) release by
                # DATE, not SxxExx; the ranker + retry queries key off this.
                "air_date": (str(item.get("air_date") or "")[:10] or None)}
         if scope == "season":
             ctx.pop("episode", None)
             ctx.pop("air_date", None)
+        elif item.get("alt_season") is not None and item.get("alt_episode") is not None:
+            # the scene (TVDB) numbering, when it differs from TMDB's: queried
+            # and accepted alongside it (core/video/numbering.py)
+            ctx["alt_season"] = int(item["alt_season"])
+            ctx["alt_episode"] = int(item["alt_episode"])
+            if item.get("alt_exclusive"):
+                ctx["alt_exclusive"] = True
         # Series type (P8): daily/anime shows QUERY differently. Anime also carries
         # the wanted ABSOLUTE episode number (scene anime is numbered 'Show - 1071',
         # no season) — derived from the library's episode list, best-effort.
@@ -508,7 +573,10 @@ def build_download_record(item: Dict[str, Any], best: Dict[str, Any], candidates
 def _default_fetch_items(media_type: str) -> List[Dict[str, Any]]:
     from api.video import get_video_db
     db = get_video_db()
-    return db.movie_wishlist_to_download() if media_type == "movie" else db.episode_wishlist_to_download()
+    if media_type == "movie":
+        return db.movie_wishlist_to_download()
+    from core.video.numbering import annotate
+    return annotate(db.episode_wishlist_to_download(), db=db)
 
 
 def _backfill_movie_available_dates(limit: int = 25) -> None:
@@ -557,7 +625,8 @@ def _extto_hits_for_context(ctx: Dict[str, Any]) -> tuple:
     from core.video.extto_search import extto_search
     from core.video.slskd_search import build_query
     query = build_query(ctx["scope"], ctx["title"], year=ctx.get("year"),
-                        season=ctx.get("season"), episode=ctx.get("episode"),
+                        season=ctx.get("alt_season", ctx.get("season")),
+                        episode=ctx.get("alt_episode", ctx.get("episode")),
                         air_date=ctx.get("air_date"), absolute=ctx.get("absolute"),
                         series_type=ctx.get("series_type"))
     eres = extto_search(query, limit=30, timeout=35, max_candidates=2,
@@ -577,6 +646,7 @@ def _search_one_source(source: str, item: Dict[str, Any], media_type: str):
     hybrid chain, but normal torrent users should get it automatically."""
     from api.video import get_video_db
     from api.video.downloads import _evaluate_hits
+    from core.video.numbering import ctx_alt
     from core.video.quality_profile import load_for_item
     ctx = search_context(item, media_type)
     profile = load_for_item(get_video_db(), item)   # per-title profile (P2)
@@ -584,8 +654,11 @@ def _search_one_source(source: str, item: Dict[str, Any], media_type: str):
     if source == "soulseek":
         from core.video.download_monitor import _search_for_retry
         from core.video.slskd_search import build_query
+        # one query: the scene's own numbering when it differs (what files
+        # and share folders are named by)
         query = build_query(ctx["scope"], ctx["title"], year=ctx.get("year"),
-                            season=ctx.get("season"), episode=ctx.get("episode"),
+                            season=ctx.get("alt_season", ctx.get("season")),
+                            episode=ctx.get("alt_episode", ctx.get("episode")),
                             air_date=ctx.get("air_date"), absolute=ctx.get("absolute"),
                             series_type=ctx.get("series_type"))
         res = _search_for_retry(query) or {}
@@ -599,7 +672,7 @@ def _search_one_source(source: str, item: Dict[str, Any], media_type: str):
                                air_date=ctx.get("air_date"), absolute=ctx.get("absolute"),
                                series_type=ctx.get("series_type"),
                                imdb_id=ctx.get("imdb_id"), tmdb_id=ctx.get("tmdb_id"),
-                               tvdb_id=ctx.get("tvdb_id"))
+                               tvdb_id=ctx.get("tvdb_id"), alt=ctx_alt(ctx))
         prowlarr_err = None
         if not pres.get("configured"):
             prowlarr_err = "Prowlarr not configured"
@@ -635,10 +708,12 @@ def _search_one_source(source: str, item: Dict[str, Any], media_type: str):
             return None, err
     else:
         return None, "unsupported source %r" % source
+    alt = ctx_alt(ctx)
     cands = _evaluate_hits(hits, profile, ctx["scope"], ctx.get("season"), ctx.get("episode"),
                            want_year=ctx.get("year"),
                            want_title=ctx.get("titles") or ctx.get("title"),
-                           want_date=ctx.get("air_date"), want_absolute=ctx.get("absolute"))
+                           want_date=ctx.get("air_date"), want_absolute=ctx.get("absolute"),
+                           want_alt=alt)
     for c in cands:
         if source == "torrent" and str(c.get("indexer_id") or "").lower() == "extto":
             c["source"] = "extto"
@@ -833,6 +908,40 @@ def _release(media_type: str) -> None:
         _running[media_type] = False
 
 
+# ── stop: "cancel all" on the downloads page halts in-flight wishlist searches ──
+# a run snapshots the generation when it starts; a bump means stop. cancelling the
+# download rows alone left a 700-item search-all grinding on and grabbing more.
+_stop_gen = [0]
+
+
+def request_stop() -> None:
+    """Tell every running drain / search-all to stop searching and grabbing."""
+    with _running_lock:
+        _stop_gen[0] += 1
+
+
+def stop_generation() -> int:
+    with _running_lock:
+        return _stop_gen[0]
+
+
+def stop_requested(gen: int) -> bool:
+    return stop_generation() != gen
+
+
+def _default_max_downloads(media_type: str) -> int:
+    """The drain automation's 'Max downloads per run' for this kind (default 3).
+    search-all honours it too, so one click can't hand the clients the whole wishlist."""
+    action = 'video_process_movie_wishlist' if media_type == 'movie' else 'video_process_episode_wishlist'
+    try:
+        from database.music_database import get_database
+        row = get_database().get_system_automation_by_action(action) or {}
+        cfg = json.loads(row.get('action_config') or '{}')
+        return max(1, int(cfg.get('max_simultaneous_downloads', 3) or 3))
+    except Exception:   # noqa: BLE001 - unreadable config fails open to the default
+        return 3
+
+
 def _wishlist_db_key(item: Dict[str, Any], media_type: str) -> tuple:
     tmdb = item.get('tmdb_id') or item.get('show_tmdb_id')
     kind = 'movie' if media_type == 'movie' else 'episode'
@@ -901,7 +1010,9 @@ def auto_video_process_wishlist(
     record_note: Optional[Callable[[Dict[str, Any], str, str, Optional[str]], None]] = None,
 ) -> Dict[str, Any]:
     """Auto-grab the wished movies (or episodes): search Soulseek, pick the best release,
-    enqueue. Processes the whole eligible wishlist, a few searches at a time.
+    enqueue — at most ``max_simultaneous_downloads`` grabs per run (default 3); the rest
+    stay on the wishlist for the next tick. Searches run a few at a time
+    (``max_concurrent``).
 
     Returns ``{'status': 'completed', 'searched': int, 'grabbed': int, ...}``."""
     fetch_items = fetch_items or _default_fetch_items
@@ -913,6 +1024,16 @@ def auto_video_process_wishlist(
     record_note = record_note or _default_record_note
     automation_id = config.get('_automation_id')
     concurrency = max(1, int(config.get('max_concurrent', 3) or 3))
+    # Grab budget ("Max downloads per run", default 3): how many items one
+    # drain run may hand to slskd / the torrent / usenet client. The rest stay
+    # on the wishlist for the next tick — no starvation, no loss. Distinct from
+    # `concurrency` above, which only sizes the search thread pool. A garbage
+    # value fails open to the default — the drain never strands itself on a
+    # mis-typed config.
+    try:
+        max_downloads = max(1, int(config.get('max_simultaneous_downloads', 3) or 3))
+    except (ValueError, TypeError):
+        max_downloads = 3
     label = 'movie' if media_type == 'movie' else 'episode'
 
     if not _try_claim(media_type):
@@ -921,6 +1042,7 @@ def auto_video_process_wishlist(
         return {'status': 'skipped', 'reason': 'already_running',
                 '_manages_own_progress': True}
     try:
+        gen = stop_generation()   # "cancel all" bumps it: stop searching + grabbing
         root = target_dir(media_type)
         if not root:
             where = 'Movie' if media_type == 'movie' else 'TV'
@@ -978,10 +1100,23 @@ def auto_video_process_wishlist(
         rejected = [0]     # source had hits, but none passed the quality profile
         notrun = [0]       # the search never ran (slskd didn't accept it)
         refused = [0]      # releases passed the profile; the download client said no
-        total = len(todo)
+        deferred = [0]      # budget spent: left on the wishlist for the next run
+        stopped = [0]       # cancel all hit mid-run: left on the wishlist untouched
+        slots_claimed = [0]  # atomic grab-budget claims this run (never > max_downloads)
+        total = [len(todo)]
         lock = threading.Lock()
 
         def _one(it):
+            # Grab budget: once this run has claimed `max_downloads` slots, the
+            # rest wait for the next tick — no search wasted, no outcome
+            # recorded (this is not a fruitless search), no row lost.
+            with lock:
+                if stop_requested(gen):
+                    stopped[0] += 1
+                    return
+                if slots_claimed[0] >= max_downloads:
+                    deferred[0] += 1
+                    return
             found = search(it, media_type)
             # the seam returns (candidates, error); tolerate a bare list/None too (test fakes)
             cands, err = found if isinstance(found, tuple) else (found, None)
@@ -997,20 +1132,50 @@ def auto_video_process_wishlist(
             usable = [c for c, remaining in cooled if remaining <= 0]
             cooldown_wait = max([remaining for _c, remaining in cooled], default=0)
             ok, refusal = False, None
-            for cand in usable[:MAX_GRAB_ATTEMPTS]:
-                out = enqueue_outcome(enqueue(it, cand, cands, media_type, root))
-                if out["ok"]:
-                    clear_source_refusal(it, media_type, cand)
-                    ok = True
-                    break
-                note_source_refusal(it, media_type, cand)
-                refusal = out["error"] or refusal
+            budget_deferred = False
+            if usable:
+                # Atomic claim (YouTube's slots_free() pattern): threads race
+                # here, so the check + increment must be one locked step — at
+                # most `max_downloads` items are ever handed to the clients.
+                with lock:
+                    if stop_requested(gen):
+                        # the search finished after cancel all — grab nothing
+                        stopped[0] += 1
+                        return
+                    slot = slots_claimed[0] < max_downloads
+                    if slot:
+                        slots_claimed[0] += 1
+                if slot:
+                    for cand in usable[:MAX_GRAB_ATTEMPTS]:
+                        out = enqueue_outcome(enqueue(it, cand, cands, media_type, root))
+                        if out["ok"]:
+                            clear_source_refusal(it, media_type, cand)
+                            ok = True
+                            break
+                        note_source_refusal(it, media_type, cand)
+                        refusal = out["error"] or refusal
+                    if not ok:
+                        # A refused grab is not a download — hand the slot back
+                        # so a later item can still use it this run.
+                        with lock:
+                            slots_claimed[0] -= 1
+                else:
+                    # Found releases, but racing threads spent the budget first.
+                    # The item stays on the wishlist for the next tick.
+                    budget_deferred = True
+                    with lock:
+                        deferred[0] += 1
             name = display_name(it, media_type)
             # tell apart: grabbed / search-didn't-run / source-empty / hits-but-all-rejected.
             # `err` alongside RESULTS is a non-fatal note (a chain source was skipped,
             # e.g. 'torrent skipped — Prowlarr not configured') — always show it, or a
             # mis-configured first source silently degrades every search.
-            if ok:
+            if budget_deferred:
+                msg = ("Found release(s) for '%s' but this run already grabbed %d "
+                       "(Max downloads per run) — deferred to the next run"
+                       % (name, max_downloads))
+                lt = 'info'
+            elif ok:
                 msg, lt = "Grabbed '%s'" % name, 'success'
             elif didnt_run:
                 msg = ("Search didn't run for '%s' — %s" % (name, err)) if err \
@@ -1055,8 +1220,13 @@ def auto_video_process_wishlist(
             # A search that never ran (slskd down / rate-limited) says nothing;
             # neither does a client refusing a release we did find, and counting
             # that as a fruitless search is how a row reached 133 "attempts"
-            # while its release was available the whole time.
-            if not didnt_run and not (usable and not ok):
+            # while its release was available the whole time. A budget-deferred
+            # item is skipped for the same reason: the release exists, it just
+            # waits for the next tick.
+            # A pack try that falls back to its episodes records nothing itself:
+            # each episode's own search is the verdict about that episode.
+            pack_falls_back = bool(it.get("_pack_rows")) and not ok
+            if not didnt_run and not (usable and not ok) and not budget_deferred and not pack_falls_back:
                 # Keep the receipt. Every candidate was just judged and is about to
                 # be discarded; the best one refused for a reason about
                 # AVAILABILITY (not "wrong season", which is only search noise) is
@@ -1068,6 +1238,8 @@ def auto_video_process_wishlist(
                 searched[0] += 1
                 if ok:
                     grabbed[0] += 1
+                elif budget_deferred:
+                    pass   # already tallied in deferred[]; not a client refusal
                 elif didnt_run:
                     notrun[0] += 1
                 elif usable_all:
@@ -1078,8 +1250,23 @@ def auto_video_process_wishlist(
                     rejected[0] += 1
                 deps.update_progress(
                     automation_id, phase='Searching + grabbing…',
-                    progress=10 + int(85 * searched[0] / max(total, 1)),
+                    progress=10 + int(85 * min(searched[0], total[0]) / max(total[0], 1)),
                     log_line=msg, log_type=lt)
+            # A season pack that didn't land: search its episodes one by one,
+            # this run. Before, the pack's "Not a full-season pack" verdict was
+            # stamped on every member and they were never searched on their own,
+            # so a season with plenty of single-episode releases sat untouched.
+            fall_back = (it.get("_pack_rows") and not ok and not didnt_run
+                         and not budget_deferred and not stop_requested(gen))
+            if fall_back:
+                rows = list(it["_pack_rows"])
+                with lock:
+                    total[0] += len(rows)
+                deps.update_progress(automation_id, log_type='info',
+                                     log_line="No season pack for '%s' — searching its %d episode(s) one by one"
+                                              % (name, len(rows)))
+                for row in rows:
+                    _one(row)
 
         with ThreadPoolExecutor(max_workers=concurrency) as ex:
             list(ex.map(_one, todo))
@@ -1095,6 +1282,11 @@ def auto_video_process_wishlist(
             tail.append('%d rejected on quality' % rejected[0])
         if refused[0]:
             tail.append('%d refused by the download client' % refused[0])
+        if deferred[0]:
+            tail.append('%d deferred to the next run (download cap %d)'
+                        % (deferred[0], max_downloads))
+        if stopped[0]:
+            tail.append('%d skipped (stopped by cancel all)' % stopped[0])
         breakdown = (' · ' + ', '.join(tail)) if tail else ''
         done = ('Grabbed %d %s(s) of %d searched%s' % (grabbed[0], label, searched[0], breakdown)) if grabbed[0] \
             else ('Searched %d %s(s), grabbed 0%s' % (searched[0], label, breakdown))
@@ -1102,7 +1294,8 @@ def auto_video_process_wishlist(
                              log_line=done, log_type='success' if grabbed[0] else 'info')
         return {'status': 'completed', 'searched': searched[0], 'grabbed': grabbed[0],
                 'noresults': noresults[0], 'rejected': rejected[0], 'notrun': notrun[0],
-                'refused': refused[0], '_manages_own_progress': True}
+                'refused': refused[0], 'deferred': deferred[0],
+                '_manages_own_progress': True}
     except Exception as e:  # noqa: BLE001
         deps.update_progress(automation_id, status='error', phase='Error', log_line=str(e), log_type='error')
         return {'status': 'error', 'error': str(e), '_manages_own_progress': True}

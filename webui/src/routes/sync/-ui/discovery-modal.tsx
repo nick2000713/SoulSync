@@ -57,8 +57,10 @@ import {
   matchLineNumbers,
   progressLineText,
   seededProgress,
+  skippedNoteText,
 } from '../-sync.modal-core';
 import { syncPercent } from '../-sync.state';
+import { BeatportSnapshotButton } from './beatport-snapshot-button';
 import { OrganizeToggle } from './organize-toggle';
 
 declare global {
@@ -188,7 +190,7 @@ function RowActions({
         <button
           type="button"
           className="rematch-btn"
-          style={{ marginLeft: 4, color: '#ff6b6b' }}
+          style={{ marginLeft: 4, color: 'var(--danger-light)' }}
           title="Remove this match"
           onClick={() => onUnmatchTrack?.(row)}
         >
@@ -300,10 +302,13 @@ function FooterActions(props: DiscoveryModalProps) {
     onRediscover,
     onRetryFailed,
   } = props;
-  // The vanilla's gates (9603-9605): results presence, COUNTER-only matches,
-  // and the converted-playlist fallback that keeps Download available.
+  // The vanilla's gates (9603-9605): results presence, matches, and the
+  // converted-playlist fallback that keeps Download available. matches count
+  // the found rows when the counter is 0, same as the progress line: a cached
+  // open has no worker to count them, so it said "4 / 4 tracks matched" with
+  // Push and Download hidden until a re-identify (#1603).
   const hasResults = state.rows.length > 0;
-  const hasMatches = state.spotifyMatches > 0;
+  const hasMatches = seededProgress(state).matches > 0;
   const hasConverted = Boolean(state.convertedSpotifyPlaylistId);
   // retryFailedMirroredDiscovery counts every row that is NOT found (9684).
   const failedCount = state.rows.filter((r) => r.status_class !== 'found').length;
@@ -441,6 +446,7 @@ export function DiscoveryModal(props: DiscoveryModalProps) {
   const sourceLabel = modalSourceLabel(config.id, fakeHash, mirroredSource);
   const metadataLabel = metadataSourceLabel();
   const seeded = seededProgress(state);
+  const skippedNote = skippedNoteText(state.sourceSkipped, sourceLabel);
   const tracks = playlistTracks(state);
   // Seed with the playlist's own count (9518); once payloads flow, their
   // authoritative spotify_total wins (the live painter, 10113) — results can
@@ -490,6 +496,7 @@ export function DiscoveryModal(props: DiscoveryModalProps) {
                   )
                 : initialProgressText(state.phase)}
             </div>
+            {skippedNote && <div className="progress-skipped-note">{skippedNote}</div>}
           </div>
 
           <div className="discovery-table-container">
@@ -571,6 +578,7 @@ export function DiscoveryModal(props: DiscoveryModalProps) {
             </div>
           </div>
           <div className="modal-footer-right">
+            {config.id === 'beatport' && <BeatportSnapshotButton chartRef={state.sourceId} />}
             <button type="button" className="modal-btn modal-btn-secondary" onClick={onClose}>
               🏠 Close
             </button>

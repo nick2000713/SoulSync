@@ -1907,7 +1907,7 @@ async function openDownloadMissingModalForArtistAlbum(virtualPlaylistId, playlis
                                                    onchange="updateTrackSelectionCount('${virtualPlaylistId}')">
                                         </td>
                                         <td class="track-number">${index + 1}</td>
-                                        <td class="track-name" title="${escapeHtml(track.name)}">${renderModalTrackPlayButton(virtualPlaylistId, index)}${escapeHtml(track.name)}</td>
+                                        <td class="track-name" title="${escapeHtml(track.name)}">${renderModalTrackPlayButton(virtualPlaylistId, index)}${renderModalTrackPlaylistButton(virtualPlaylistId, index)}${escapeHtml(track.name)}</td>
                                         <td class="track-artist" title="${escapeHtml(formatArtists(track.artists))}">${escapeHtml(formatArtists(track.artists))}</td>
                                         <td class="track-duration">${formatDuration(track.duration_ms)}</td>
                                         <td class="track-match-status match-checking" id="match-${virtualPlaylistId}-${index}">🔍 Pending</td>
@@ -1986,6 +1986,8 @@ async function openDownloadMissingModalForArtistAlbum(virtualPlaylistId, playlis
     void hydrateDownloadModalQualityProfileSelect(virtualPlaylistId);
     modal.style.display = 'flex';
     hideLoadingOverlay();
+    // owned/missing per track straight away, not after Begin Analysis
+    if (typeof previewModalOwnership === 'function') void previewModalOwnership(virtualPlaylistId);
 
     console.log(`✅ Successfully opened download missing tracks modal for: ${playlistName}`);
 }
@@ -2042,7 +2044,6 @@ function updateArtistDownloadsSection() {
     }
     downloadsUpdateTimeout = setTimeout(() => {
         showArtistDownloadsSection();
-        showLibraryDownloadsSection();
         showBeatportDownloadsSection();
         updateDashboardDownloads();
     }, 300); // 300ms debounce

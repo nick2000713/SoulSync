@@ -625,12 +625,12 @@ const HELPER_CONTENT = {
     },
 
     '[id^="add-to-wishlist-btn"]': {
-        title: 'Add to Wishlist',
-        description: 'Adds all missing tracks from this batch to your Wishlist for later download. Useful when you want to queue tracks but not download them right now.',
+        title: 'Monitor',
+        description: 'Marks the selected tracks as wanted in your library and starts downloading them right away. A track that is not found stays wanted and is searched again on the next wishlist run.',
         tips: [
-            'Only missing tracks are added (already-owned tracks are skipped)',
-            'Tracks appear in the Wishlist modal under the appropriate category',
-            'The Wishlist auto-processes on a schedule via the Automations system'
+            'The Library Status column shows what you already have as soon as the dialog opens',
+            'Monitored tracks appear in the Wishlist and under Wanted in the Library',
+            'Begin Analysis downloads once without monitoring, with Force Download and Skip AcoustID'
         ]
     },
     '.download-control-btn.primary': {
@@ -2387,8 +2387,8 @@ const HELPER_TOURS = {
 
             // Controls
             { page: 'library', selector: '#library-search-input', title: 'Search Artists', description: 'Type to filter your library by artist name. Results update instantly as you type.' },
-            { page: 'library', selector: '#watchlist-filter', title: 'Watchlist Filter', description: 'Filter by watchlist status: All, Watched (artists you follow for new releases), or Unwatched. The "Watch All Unwatched" button adds every remaining artist to your watchlist in one click.' },
-            { page: 'library', selector: '#alphabet-selector', title: 'Alphabet Jump', description: 'Click any letter to jump directly to artists starting with that letter. Great for navigating large libraries.' },
+            { page: 'library', selector: '#watchlist-filter', title: 'Monitoring Filter', description: 'Show all artists, monitored artists, or unmonitored artists.' },
+            { page: 'library', selector: '#library-view-toggle', title: 'Library View', description: 'Switch between the visual card grid and the detailed table view.' },
 
             // Grid
             { page: 'library', selector: '#library-artists-grid', title: 'Artist Grid', description: 'Your artists as cards with photos, track counts, and service badges (Spotify, MusicBrainz, etc.). Click any card to open their artist detail page with full discography.' },
@@ -3460,44 +3460,28 @@ function closeHelperSearch() {
 // release time and add a real `date:` line at the top of the version block.
 const WHATS_NEW = {
     // Keep the current release and one brief Earlier versions summary.
-    '3.5.1': [
-        { date: 'October 2026 · 3.5.1' },
-        { title: 'Wishlist + Watchlist in one go', desc: 'Download Discography has a second button: queue the releases you picked and add the artist to your watchlist with release types, filters and auto-download set right in the modal. The artist page add to watchlist button opens the same settings, and releases that fail to resolve get a retry button (#1553).' },
-        { title: 'One edition per album', desc: 'New edition preference in global watchlist settings: all editions, one per album standard, or one per album most complete. No more standard and deluxe downloading the same songs twice (#1561).', page: 'watchlist' },
-        { title: 'Singles own themselves', desc: 'A single no longer shows owned because the album has the same song. The artist page checks the single release itself, and labels releases your watchlist filters skip (#1556, #1562).' },
-        { title: 'Music video and episode requests', desc: 'Non-admin profiles can request music videos and single episodes. Requests land on the same page as music and approving downloads them (#1500, #1503).' },
-        { title: 'Dashboard refresh', desc: 'Every section redesigned in the same layout, plus a weekly listening digest with hours, tracks, top artist, streak and a 7-day chart (#1552).', page: 'dashboard' },
-        { title: 'Playlist sync fixes', desc: 'Wishlisted tracks download as a playlist-named batch so the scan runs after them, new mirrors get their server playlist on the first sync, completion counts tracks that still need identifying, and origins can be removed without deleting the file (#1545, #1547, #1548, #1549).', page: 'sync' },
-        { title: 'ListenBrainz weeklies stay current', desc: 'Weekly Exploration and Weekly Jams pick up the new week on refresh instead of sticking to the last cached one (#1564).', page: 'sync' },
-        { title: 'Tagging fixes', desc: 'MusicBrainz stops matching the wrong same-named band, wishlist downloads keep featured artists, sort tags follow the primary source, hip hop and hip-hop merge, and full-depth re-tag writes again (#1509, #1508, #1510, #1512, #1511).' },
-        { title: 'New tagging options', desc: 'Opt-in artist.nfo for Jellyfin, Kodi and Emby, original release date as DATE, last.fm artist tags as a genre fallback, and $label in the album path template (#1497, #1520, #1544).', page: 'settings' },
-        { title: 'Audiobook import fixes', desc: 'Single-file torrents import instead of stalling on no audio files, and release search finds series volumes named Series 03 - Title (#1554, #1563).' },
-        { title: 'Soulseek cleanup scope', desc: 'Cleanup only removes this client\'s own transfers and searches, with a scope setting for single-client installs (#1501, #1524).', page: 'settings' },
-        { title: 'Earlier versions', desc: '3.5.0 brought the video discover overhaul, per-profile sync and discover, and repair jobs on the automation engine.' },
+    '3.5.7': [
+        { date: 'October 2026 · 3.5.7' },
+        { title: 'Beatport charts are playlists', desc: 'Every chart opens to be identified, synced and downloaded instead of landing as a fake Various Artists compilation. Tracks match by ISRC, mirrored charts refresh and can join the pipeline, and Save snapshot keeps a dated copy of a chart.', page: 'sync' },
+        { title: 'Beatport enrichment', desc: 'A new last tagging step looks tracks up on Beatport by ISRC and writes the label\'s BPM, key, label and catalog number. Electronic-looking tracks only, unless Look up every track is on.', page: 'settings' },
+        { title: 'A second pass for missed tracks', desc: 'A Spotify track your primary source cannot match is looked up by its own Spotify id before it becomes Wing It, each track of a mirrored playlist shows where it stands, and a stale cached match cannot pin the wrong song (thanks @kevin2xk) (#1721).', page: 'sync' },
+        { title: 'Sync fixes', desc: 'Scheduled auto-sync regenerates Discovery Shuffle mirrors (thanks @Bloopser) (#1724). A refused Navidrome write no longer reads as 0% synced, failed syncs retry next run, and mirrored playlists stop hanging on load (thanks @zikasak) (#1726, #1698).', page: 'sync' },
+        { title: 'Automatic album completion', desc: 'A new automation finishes incomplete albums in your library, with cooldowns and retries (thanks @kiwijar) (#1711).', page: 'automations' },
+        { title: 'Spoken word to audiobooks', desc: 'Route chosen artists, like children\'s audio plays, to the audiobook library instead of music (thanks @SimpleSimonLA) (#1714).' },
+        { title: 'Video wishlist finds more', desc: 'Episodes match releases named by TVDB numbering, shows with a year in the name stop failing the title and year checks, and the dashboard download tiles read the live queue.' },
+        { title: 'Video stats API', desc: 'GET /api/v1/video/stats returns library, database and download counts, and video downloads take a status filter (thanks @hilburn) (#1723).', page: 'settings' },
+        { title: 'Imports you already own', desc: 'Albums you already have no longer fail every track on auto-import: they count as already in library (thanks SeadogsBooty on discord). Plex paths resolve when a folder differs only by case.', page: 'import' },
+        { title: 'Earlier versions', desc: '3.5.6 fixed playlist sync matching, made reorganize resumable and taught auto-import to skip what you own.' },
     ],
-    '3.5.0': [
-        { date: 'October 2026 · 3.5.0' },
-        { title: 'Video discover overhaul', desc: 'The music-side visual treatment lands on video discover: story blocks, trailers, genre art, card elevation, banners, a hero badge, story tickers, and genre tiles that load eagerly with an ambient crossfade and deduped posters (#1427, #1433, #1434, #1435, #1436).' },
-        { title: '"I have this" matching', desc: 'Video detail pages get a manual library match button for when automatic matching says you do not own something you do. Rematching a video clears its artwork so the corrected match re-downloads art (#1438, #1440).' },
-        { title: 'Video import polish', desc: 'The place-file modal got restyled, commercial-free episode cuts pass the duration gate, and the picked-title hero has its styles (#1423, #1439).' },
-        { title: 'Per-profile discover', desc: 'Listening recs, the listening mix and the warmer are per profile now. A deezer editorial playlist opens to a preview first, and built playlists can be named with missing tracks landing on the wishlist (#1418, #1421).', page: 'discover' },
-        { title: 'Per-profile server playlists', desc: 'The sync page shows whose server playlist is whose, same-named mirrors stop overwriting each other, deleted tracks are noticed on the next sync, and deleting a mirror lets go of its server playlist (#1414, #1417, #1420).', page: 'sync' },
-        { title: 'No more false rate limits', desc: 'Providers stop crying rate limit when an id contains 429 or 503. The http status is trusted over digits in the url, across musicbrainz, spotify, tidal, deezer, jiosaavn, audiodb, discogs, genius and last.fm (#1391, #1443).' },
-        { title: 'Smarter canonical lookups', desc: 'Alternate editions use each provider\'s own artist id instead of soulsync\'s local key, so musicbrainz stops returning 400 invalid mbid. Musicbrainz album consistency also checks the artist and stops judging romanized titles against native script (#1415, #1426).' },
-        { title: 'Filing fixes', desc: 'Singles stop merging into same-named album folders, and a customized single path template is honored for explicitly-typed singles (#1441, #1431).', page: 'library' },
-        { title: 'Lossy copies keep their tags', desc: 'FLAC to MP3 copies get native tags and cover art, with ARTISTS following the primary source (#1422, #1425).' },
-        { title: 'Non-admin automations re-arm', desc: 'Scheduled automations owned by other profiles re-arm after a restart instead of running once and never again (#1428, #1430).', page: 'automations' },
-        { title: 'Repair job honesty', desc: 'Acoustid retag keeps the album artist, sfv and srr count as leftover junk, and a run that quit early says so (#1289).', page: 'tools' },
-        { title: 'Extension chat tab', desc: 'The server chat lives in the companion extension popup, with rooms, dms and replies. Video pages get library-status pills and watchlist actions.' },
-        { title: 'Repair jobs join automations', desc: 'Maintenance jobs run on the automation engine now as system automations, scheduled from the automations page. New BPM backfill job (Deezer or local analysis), and manual match opens with a worklist of every unmatched wanted track (#1289, #1476).', page: 'automations' },
-        { title: 'Safer defaults, clearer language', desc: 'Sync defaults to Reconcile, "Transfer is my permanent library" defaults on, Discovery becomes Identify, and the import inbox gets honest about partials, stale rows and match stealing (#1289, #1474, #1477).' },
-        { title: 'Community fix batch', desc: 'Wishlist cleanup respects album scope, discography matching rejects substring-only titles, the discovery pool filter actually filters, Audible gets a marketplace setting, and AudioDB uses the working free key (#1447, #1448, #1452, #1453, #1455, #1458, #1475).' },
-        { title: 'Playlist sync wishlist control', desc: 'Syncing no longer has to re-download everything you deleted: a global toggle plus Sync vs Sync + download buttons (#1455).', page: 'sync' },
-        { title: 'Discovery pool upgrades', desc: 'Matches sort by match percentage and cached matches can be cleared per playlist (#1452).', page: 'discover' },
-        { title: 'Video calendar status badges', desc: 'Episode cards and the hero show Wanted, Downloading, Queued, Failed and Missing — not just the owned check (#1480).' },
-        { title: 'Deezer reissues stop showing as missing', desc: 'The year check no longer vetoes a same-title match when Deezer reports a reissue date (#1492).' },
-        { title: 'New v1 API endpoints', desc: 'Library playlists and tracks, recently played, mirrored playlists, and fixed artists scoping — built for the extension mini player (#1459, #1461, #1469, #1472, #1473).' },
-        { title: 'Earlier versions', desc: '3.4.9 brought the discover glow-up, player theater, sample studio and a calmer sync page.' },
+    '3.5.6': [
+        { date: 'October 2026 · 3.5.6' },
+        { title: 'Playlist sync lands the right songs', desc: 'The album fallback needs the artist to match, so a same-titled song on a same-named album stops standing in for the real one. One song your server no longer has stops blocking the whole playlist: it is skipped and the rest are written (thanks @kevin2xk) (#1715).', page: 'sync' },
+        { title: 'Reorganize resumes where it stopped', desc: 'Library reorganize saves the last album it finished and picks up right after it, queues moves as it goes so a stopped run keeps what it planned, and goes back to the top after a full pass (thanks @QT3496) (#1716).', page: 'tools' },
+        { title: 'Auto-import skips what you own', desc: 'Staging drops run the same library check as the import page. Each import in history says what it did with a per-track list, and an opt-in Clear finished folders switch removes a folder once every track is in.', page: 'import' },
+        { title: 'Album modal knows what you own', desc: 'A release opened from a discography shows found and missing per track as soon as it opens, instead of waiting for Begin Analysis.' },
+        { title: 'Run Now refreshes discovery', desc: 'Run Now on the Update Discovery automation always refreshes, so changed settings apply right away. Scheduled runs keep the 6 hour cooldown (thanks @mikedaf) (#1719).', page: 'automations' },
+        { title: 'YouTube imports on NFS', desc: 'A share that refuses file metadata (errno 524) no longer fails a YouTube import after the file landed (thanks @hilburn) (#1713).' },
+        { title: 'Earlier versions', desc: '3.5.5 brought playable and likeable playlists, per-playlist sync mode, Deezer previews and a big speed pass.' },
     ],
 };
 
@@ -3527,52 +3511,39 @@ const WHATS_NEW = {
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
     {
-        title: '3.5.1: watchlist + editions, requests, dashboard and tagging fixes',
-        description: 'Download Discography learns about watchlists and editions, music videos and episodes become requestable, the dashboard gets a new look, and a stack of tagging, playlist sync and download fixes.',
+        title: '3.5.7: beatport playlists, a second pass for missed tracks and album completion',
+        description: 'Beatport charts become real playlists and an enrichment source, playlist sync gets a second pass for tracks it could not match, albums can complete themselves, spoken-word artists can route to the audiobook library, and video wishlist episodes find their releases.',
         features: [
-            'Wishlist + Watchlist button in Download Discography, with per-artist watchlist settings in the modal (#1553).',
-            'Edition preference: one edition per album instead of standard and deluxe both downloading (#1561).',
-            'Singles stop showing owned from the album copy of the song; watchlist-skipped releases are labeled (#1556, #1562).',
-            'Music video and single-episode requests for non-admin profiles (#1500, #1503).',
-            'Dashboard visual refresh plus a weekly listening digest (#1552).',
-            'Playlist sync: playlist-named batches, server playlist on first sync, honest completion counts, remove origin (#1545, #1547, #1548, #1549).',
-            'ListenBrainz weekly playlists pick up the new week (#1564).',
-            'Tagging: right MusicBrainz band, featured artists kept, sort tags, genre dedupe, full-depth re-tag fixed (#1508 to #1512).',
-            'New options: artist.nfo, original date as DATE, last.fm genre fallback, $label in paths (#1497, #1520, #1544).',
-            'Audiobooks: single-file torrents import, Series 03 volumes found (#1554, #1563).',
-            'Soulseek cleanup scoped to its own transfers; repair and tools fixes from @mandos21 (#1501, #1524, #1535, #1537, #1538).',
+            'Beatport: charts open as playlists to identify, ISRC matching, mirrored charts that refresh and join the pipeline, dated snapshots, and BPM, key, label and catalog enrichment.',
+            'Playlist sync: a Spotify-id pass before Wing It, per-track status on mirrored playlists, and stale matches drop off (thanks @kevin2xk) (#1721).',
+            'Scheduled auto-sync regenerates Discovery Shuffle (thanks @Bloopser) (#1724); Navidrome write failures and mirrored playlist load fixes (thanks @zikasak) (#1726, #1698).',
+            'Automatic album completion (thanks @kiwijar) (#1711).',
+            'Route spoken-word artists to the audiobook library (thanks @SimpleSimonLA) (#1714).',
+            'Video: TVDB scene numbering, show-year fixes, live dashboard tiles, and a video stats API (thanks @hilburn) (#1723).',
+            'Albums you already own no longer fail auto-import, and Plex paths resolve across folder case changes.',
         ],
     },
     {
-        title: 'Earlier in 3.5.0',
-        description: 'Video discover overhaul, per-profile sync and discover, no more false rate limits, and repair jobs on the automation engine.',
+        title: 'Earlier in 3.5.6',
+        description: 'Playlist sync matching fixes, resumable reorganize, auto-import that skips what you own, and Run Now that refreshes discovery.',
         features: [],
     },
     {
-        title: '3.5.0: video discover, per-profile sync, repair engine and community fixes',
-        description: 'Video discover gets the music-side treatment, sync and discover go per-profile, providers stop false rate-limiting, repair jobs join the automation engine, and a community fix batch lands.',
+        title: '3.5.6: playlist sync fixes, reorganize resume and smarter auto-import',
+        description: 'A follow-up to 3.5.5. Playlist sync stops matching the wrong song and stops letting one missing song block a whole playlist, reorganize picks up where it stopped, auto-import skips what you already own, and Run Now on Update Discovery actually runs.',
         features: [
-            'Video discover overhaul: story blocks, trailers, genre art, hero badge, story tickers, eager genre tiles with ambient crossfade (#1427, #1433, #1434, #1435, #1436).',
-            '"I have this" manual matching on video detail pages, and rematches that actually refresh artwork (#1438, #1440).',
-            'Per-profile server playlists and discover: whose is whose, no more overwrites, deleted tracks noticed on next sync (#1414, #1417, #1420).',
-            'Providers trust the http status over digits in urls: no more false 429s across nine providers (#1391, #1443).',
-            'Canonical lookups use each provider\'s artist id; musicbrainz album consistency checks the artist (#1415, #1426).',
-            'Singles stop merging into same-named album folders; custom single path templates honored (#1441, #1431).',
-            'Non-admin automations re-arm after restart (#1428, #1430).',
-            'Companion extension: chat tab in the popup, video badges with watchlist actions.',
-            'Repair jobs run on the automation engine as system automations; new BPM backfill job; manual-match worklist of unmatched wanted tracks (#1289, #1476).',
-            '#1289 clarity batch: safer defaults (Reconcile, permanent-library on), clearer language (Identify, Music Library), 7 import-inbox bug fixes (#1474, #1477).',
-            'Community fixes: wishlist album scope, discography substring matching, discovery pool filter, Audible marketplace, working AudioDB key (#1447, #1448, #1452, #1453, #1455, #1458, #1475).',
-            'Playlist sync wishlist control: global toggle plus Sync / Sync + download buttons (#1455).',
-            'New v1 endpoints: library playlists + tracks, recently-played, mirrored playlists (#1459, #1461, #1469).',
-            'Video calendar status badges; Deezer reissue years stop marking owned albums missing (#1480, #1492).',
+            'Playlist sync: the album fallback needs the artist to match, and one song your server no longer has is skipped instead of blocking the playlist (thanks @kevin2xk) (#1715).',
+            'Library reorganize resumes after the last album it finished and keeps the moves a stopped run planned (thanks @QT3496) (#1716).',
+            'Auto-import runs the library check, says what each import did, and can clear finished staging folders.',
+            'The album modal shows found and missing tracks as soon as it opens.',
+            'Run Now on Update Discovery skips the 6 hour cooldown (thanks @mikedaf) (#1719), and YouTube imports survive NFS shares that refuse file metadata (thanks @hilburn) (#1713).',
         ],
     },
 ];
 
 function _getCurrentVersion() {
     const btn = document.querySelector('.version-button');
-    return btn ? btn.textContent.trim().replace('v', '') : '3.5.1';
+    return btn ? btn.textContent.trim().replace('v', '') : '3.5.7';
 }
 
 // Compare two semver-ish strings ("2.4.0" vs "2.4.1" vs "2.39"). Returns

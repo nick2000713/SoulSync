@@ -80,7 +80,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.restoreAllMocks();
   delete window.showToast;
-  delete window.showConfirmDialog;
+  delete (window as Partial<Window>).showConfirmDialog;
 });
 
 describe('loading (602-650)', () => {
@@ -187,6 +187,22 @@ describe('saving an hourly schedule (2051-2110)', () => {
     });
     expect(api.updateAutomation).toHaveBeenCalledWith(55, expect.anything());
     expect(api.createAutomation).not.toHaveBeenCalled();
+  });
+
+  it('keeps the builder\u2019s config through a reschedule and a weekly swap (#1704)', async () => {
+    const tuned = {
+      ...weeklyAutomation(1, 77),
+      action_config: { playlist_id: 1, sync_mode: 'append' },
+    };
+    const { result } = await mount({ automations: [tuned] });
+    await act(async () => {
+      await result.current.saveHourly(1, 8);
+    });
+    // the weekly row was dropped first, its config still rides on the new one
+    const body = vi.mocked(api.createAutomation).mock.calls[0][0] as {
+      action_config: Record<string, unknown>;
+    };
+    expect(body.action_config).toEqual({ playlist_id: '1', all: false, sync_mode: 'append' });
   });
 
   it('DROPS an existing weekly schedule first — the invariant (2059-2067)', async () => {

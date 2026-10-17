@@ -146,6 +146,21 @@ export interface SearchArtist {
   images?: { url?: string }[];
   source?: string;
   followers?: number;
+  /**
+   * `lib2_artists.id`. The "In Your Library" bucket is Library v2's catalogue
+   * (`_build_db_artists`, core/search/orchestrator.py), so every entry of that
+   * bucket carries one and its `id` is the same value. Absent on provider
+   * results, which have no library row.
+   */
+  library_v2_id?: number | null;
+  /**
+   * iss29-B04c: this row's `id` is a LIB2 id and its artwork is already served
+   * by Library V2. The generic
+   * `/api/artist/<id>/image` resolver forwards whatever id it gets to the
+   * providers, so asking it about a lib2 id returned whichever Deezer/iTunes
+   * artist owned that number. Cards must not lazily resolve these.
+   */
+  image_is_native?: boolean;
 }
 
 export interface SearchAlbum {
@@ -184,6 +199,8 @@ export interface SearchTrack {
    * it as an object silently loses the album from every track's meta line.
    */
   album?: string;
+  /** The album's id in `source`, when the source search gives it (Deezer). */
+  album_id?: string | null;
   duration_ms?: number;
   image_url?: string;
   release_date?: string;

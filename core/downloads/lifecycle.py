@@ -137,27 +137,10 @@ def _publish_atomic_album(batch_id: str, batch: dict, deps=None) -> bool:
 
         db = MusicDatabase()
 
-        # Repoint one file, returning how many library rows moved with it.
-        #
-        # The count is the publish's proof that the library knows where the file
-        # went; an audio file that repoints nothing leaves the library pointing
-        # at a staging path this publish is about to remove. None means the count
-        # carries no meaning — "unknown", not "zero" — and an unknown must not
-        # fail a publish that may well have worked.
-        #
-        # THAT PROOF ONLY EXISTS ON A 'soulsync' SERVER. Rows with a staged path
-        # are written by record_soulsync_library_entry, which is gated on the
-        # active media server being soulsync — on a Plex/Navidrome/Jellyfin
-        # install there is legitimately NO row until the server scans the
-        # PUBLISHED files. Reading that 0 as a failure made every atomic album
-        # publish on a media-server install roll itself back and strand the album
-        # in .soulsync_atomic_staging forever (Lil-Uzi-Chimp, Docker + Navidrome:
-        # two direct albums landed, the one staged album stuck). The UPDATE still
-        # runs — a row from an earlier soulsync-mode session deserves repointing
-        # — but its count is only evidence where the rows are ours to expect.
-        #
-        # Shared with the startup recovery (#1289), which republishes an
-        # abandoned staging tree and needs the identical rule.
+        # Repoint one file, returning how many library rows moved with it --
+        # the publish's proof that the catalogue knows where the file went
+        # (L2-002). Shared with the startup recovery (#1289); the reasoning for
+        # why a zero is evidence on this branch lives with the helper.
         from core.downloads.atomic_recovery import make_db_path_updater
         _db_update = make_db_path_updater(db)
 
@@ -616,6 +599,14 @@ def start_next_batch_of_downloads(batch_id: str, deps: LifecycleDeps) -> None:
 # on_download_completed
 # ---------------------------------------------------------------------------
 
+# Statuses that mean "this task will not do any more work". `already_owned` is
+# here because a task that stood down against a sibling that already has the
+# file has genuinely finished — leaving it out let a deduped task hold its batch
+# in 'downloading' forever, since the batch waits for every queue entry to reach
+# a terminal state.
+_FINISHED_TASK_STATUSES = ('completed', 'failed', 'cancelled', 'not_found',
+                           'already_owned')
+
 
 def _wake_waiting_batches(finished_batch_id: str, deps: LifecycleDeps) -> None:
     """Offer a just-freed worker slot to the batches the global gate is holding.
@@ -713,6 +704,23 @@ def _adopt_loose_tracks(cons_files, tag: str, album_context=None) -> None:
         logger.error(f"{tag} Loose-track adoption failed (non-fatal): {cons_err}")
 
 
+# a batch that downloaded something while others were still going. the last
+# batch to finish scans for it. CALLED UNDER tasks_lock, like its reader.
+_scan_owed = False
+
+
+def _other_music_batches_pending(batch_id: str) -> bool:
+    """any other music batch still queued or running. CALLED UNDER tasks_lock."""
+    for other_id, other in download_batches.items():
+        if other_id == batch_id or not isinstance(other, dict):
+            continue
+        if not is_music_batch(other_id, other):
+            continue
+        if other.get('phase') not in ('complete', 'error', 'cancelled', 'failed'):
+            return True
+    return False
+
+
 def _mark_batch_complete(batch_id: str, batch: dict, deps: LifecycleDeps, *,
                          queue: list, finished_count: int, tag: str) -> dict:
     """Flip a finished batch to 'complete' and do the bookkeeping that has to
@@ -742,8 +750,14 @@ def _mark_batch_complete(batch_id: str, batch: dict, deps: LifecycleDeps, *,
     successful_downloads = finished_count - failed_count
     add_activity_item("", "Download Batch Complete", f"'{playlist_name}' - {successful_downloads} tracks downloaded", "Now")
 
-    # Emit batch_complete event for automation engine (only if something downloaded)
-    if successful_downloads > 0:
+    # Emit batch_complete event for automation engine (only if something downloaded).
+    # #1615: a wishlist run is one batch per album, and each one fired its own
+    # library scan. the scan now waits for the last music batch, which also
+    # pays the scan an earlier batch owed even when it downloaded nothing.
+    global _scan_owed
+    more_pending = _other_music_batches_pending(batch_id)
+    if successful_downloads > 0 or (_scan_owed and not more_pending):
+        _scan_owed = more_pending
         try:
             if deps.automation_engine:
                 deps.automation_engine.emit('batch_complete', {
@@ -751,6 +765,7 @@ def _mark_batch_complete(batch_id: str, batch: dict, deps: LifecycleDeps, *,
                     'total_tracks': str(len(queue)),
                     'completed_tracks': str(successful_downloads),
                     'failed_tracks': str(failed_count),
+                    'more_batches_pending': 'true' if more_pending else 'false',
                 })
         except Exception as e:
             logger.debug("batch_complete emit failed: %s", e)
@@ -884,6 +899,7 @@ def _run_batch_completion_side_effects(batch_id: str, batch: dict, deps: Lifecyc
                         release_mbid=selected_release_id(_cons_album),
                         file_lock_fn=get_file_lock,
                         barcode=_cons_barcode,
+                        total_tracks=_cons_album.get('total_tracks', 0),
                     )
                     if _cons_result.get('success'):
                         logger.info(f"{cons_tag} {_cons_result['tags_written']}/{_cons_result['total_files']} files "
@@ -1092,7 +1108,7 @@ def _on_download_completed(batch_id: str, task_id: str, success: bool, deps: Lif
                         finished_count += 1
                     else:
                         retrying_count += 1
-                elif task_status in ['completed', 'failed', 'cancelled', 'not_found']:
+                elif task_status in _FINISHED_TASK_STATUSES:
                     finished_count += 1
             else:
                 # Task ID in queue but not in download_tasks - treat as completed to prevent blocking
@@ -1236,7 +1252,7 @@ def check_batch_completion_v2(batch_id: str, deps: LifecycleDeps) -> Optional[bo
                             finished_count += 1
                         else:
                             retrying_count += 1
-                    elif task_status in ['completed', 'failed', 'cancelled', 'not_found']:
+                    elif task_status in _FINISHED_TASK_STATUSES:
                         finished_count += 1
                 else:
                     # Task ID in queue but not in download_tasks - treat as completed to prevent blocking

@@ -1,13 +1,13 @@
-**SoulSync 3.5.1 is out** :musical_note:
+**SoulSync 3.5.7 is out** :musical_note:
 
-Download Discography now has a Wishlist + Watchlist button: grab the releases you picked and start watching the artist in one go, with release types and filters set right in the modal. A new edition preference stops the watchlist from grabbing both the standard and deluxe of the same album.
+Beatport charts are real playlists now. Every chart opens to be identified instead of downloading as a fake "Various Artists" compilation, tracks match by ISRC, mirrored charts refresh and can join the pipeline, and you can save a dated snapshot of a chart. Beatport is also an enrichment source for BPM, key, label and catalog number.
 
-Non-admin profiles can request music videos and single episodes, approved from the same requests page as music. The dashboard got a visual refresh plus a weekly listening digest built from your real plays.
+Playlist sync gives Spotify tracks your primary source misses a second pass by their own Spotify id instead of turning them into Wing It, every track of a mirrored playlist shows where it stands, and a stale cached match can't pin the wrong song (thanks @kevin2xk). Scheduled auto-sync regenerates Discovery Shuffle (thanks @Bloopser), and failed Navidrome writes are reported properly (thanks @zikasak).
 
-Playlist sync: wishlisted tracks download as a playlist-named batch so the library scan runs after them, new mirrors get their server playlist on the first sync, completion stops claiming 100% when tracks still need identifying, and ListenBrainz weekly playlists stop getting stuck on an old week (thanks @ifedan-ed).
+New automatic album completion finishes incomplete albums in your library (thanks @kiwijar). Chosen spoken-word artists can route to the audiobook library (thanks @SimpleSimonLA).
 
-Tagging: MusicBrainz stops matching the wrong same-named band, wishlist downloads keep featured artists, sort tags follow the primary source, "hip hop" and "hip-hop" merge, full-depth re-tag actually writes, and versioned recordings can be told apart. New opt-in artist.nfo for Jellyfin/Kodi/Emby, original date as DATE, and $label in album paths.
+Video wishlist episodes find releases named by TVDB's episode numbering, and stop rejecting shows with a year in the name. There's a new video stats API endpoint (thanks @hilburn).
 
-Fixes: singles no longer show owned because the album has the same song, single-file audiobook torrents import instead of stalling (thanks SeadogsBooty), audiobook search finds "Series 03" volumes (thanks @SimpleSimonLA), Soulseek cleanup only touches its own transfers (thanks @splitsec2), and repair and tools fixes from @mandos21.
+Importing albums you already own no longer fails every track: they count as already in library (thanks SeadogsBooty). Plex paths resolve when a folder differs only by case.
 
 Full notes on GitHub.

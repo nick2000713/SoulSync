@@ -1,6 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useEffect, useState } from 'react';
 
+import { AudiobookRouteToggle } from '@/features/audiobook-routes/audiobook-route-toggle';
+
 import type {
   WatchlistArtistConfig,
   WatchlistArtistConfigResponse,
@@ -29,6 +31,7 @@ const CONTENT_FILTER_KEYS = [
   'include_acoustic',
   'include_compilations',
   'include_instrumentals',
+  'include_other_artists',
 ] as const;
 
 type IncludeKey = (typeof RELEASE_TYPE_KEYS)[number] | (typeof CONTENT_FILTER_KEYS)[number];
@@ -65,6 +68,12 @@ const OPTION_COPY: Record<IncludeKey, { icon: string; title: string; description
     icon: '🎹',
     title: 'Include Instrumentals',
     description: 'Check to include instrumental, karaoke, and backing track versions',
+  },
+  include_other_artists: {
+    icon: '👥',
+    title: 'Include Other Artists',
+    description:
+      'Check to include tracks by other artists found on tributes, soundtracks and compilations',
   },
 };
 
@@ -163,6 +172,7 @@ export function WatchlistArtistConfigModal({
       include_acoustic: draft.include_acoustic,
       include_compilations: draft.include_compilations,
       include_instrumentals: draft.include_instrumentals,
+      include_other_artists: draft.include_other_artists,
       // The preference, never the legacy boolean: the server reads
       // `auto_download` as a deliberate choice, so sending it on every save
       // would opt every artist the user ever opened out of the global default.
@@ -319,6 +329,18 @@ export function WatchlistArtistConfigModal({
                     </small>
                   </div>
                 </div>
+
+                {artist?.name ? (
+                  <div className="config-section">
+                    <h3 className="config-section-title">Audiobooks</h3>
+                    <p className="config-section-subtitle">
+                      For spoken-word releases such as children&apos;s audio plays: file this
+                      artist&apos;s downloads in the audiobook library instead of the music library.
+                      Applies to every download, not only the watchlist.
+                    </p>
+                    <AudiobookRouteToggle name={String(artist.name)} />
+                  </div>
+                ) : null}
 
                 <div className="config-section">
                   <h3 className="config-section-title">Download Preferences</h3>

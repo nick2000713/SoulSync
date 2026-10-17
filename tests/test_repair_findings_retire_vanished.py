@@ -51,10 +51,13 @@ def worker(tmp_path):
             resolved_at TIMESTAMP,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            last_error TEXT
+            last_error TEXT,
+            fix_claimed_at TIMESTAMP  -- ours: the fix claim
         )
     """)
-    conn.execute("CREATE TABLE tracks (id INTEGER PRIMARY KEY, file_path TEXT)")
+    # ours: the catalogue's files are Library v2 rows
+    conn.execute("CREATE TABLE lib2_track_files (id INTEGER PRIMARY KEY, track_id INTEGER, "
+                 "path TEXT, file_state TEXT DEFAULT 'active')")
     conn.commit()
     w = RepairWorker.__new__(RepairWorker)
     w.db = _Db(conn)
@@ -208,7 +211,7 @@ def test_orphan_finding_is_retired_after_file_enters_catalogue(worker, tmp_path)
 
     assert worker.retire_tracked_orphan_findings() == 0
     worker.db._conn.execute(
-        "INSERT INTO tracks (file_path) VALUES (?)", ("/music/Artist/Album/01 - Song.flac",))
+        "INSERT INTO lib2_track_files (path) VALUES (?)", ("/music/Artist/Album/01 - Song.flac",))
     worker.db._conn.commit()
 
     assert worker.retire_tracked_orphan_findings() == 1
@@ -225,7 +228,7 @@ def test_orphan_fix_never_changes_file_that_is_now_tracked(worker, tmp_path, act
     fid = _add(worker, track, job_id="orphan_file_detector",
                finding_type="orphan_file")
     worker.db._conn.execute(
-        "INSERT INTO tracks (file_path) VALUES (?)", ("/music/Artist/Album/01 - Song.flac",))
+        "INSERT INTO lib2_track_files (path) VALUES (?)", ("/music/Artist/Album/01 - Song.flac",))
     worker.db._conn.commit()
 
     result = worker.fix_finding(fid, fix_action=action)
@@ -241,7 +244,7 @@ def test_orphan_fix_fails_closed_when_catalogue_cannot_be_read(worker, tmp_path)
     track.write_bytes(b"audio")
     fid = _add(worker, track, job_id="orphan_file_detector",
                finding_type="orphan_file")
-    worker.db._conn.execute("DROP TABLE tracks")
+    worker.db._conn.execute("DROP TABLE lib2_track_files")
 
     result = worker.fix_finding(fid, fix_action="delete")
 
@@ -272,7 +275,7 @@ def test_same_filename_in_another_album_does_not_retire_or_delete_orphan(worker,
     fid = _add(worker, track, job_id="orphan_file_detector",
                finding_type="orphan_file")
     worker.db._conn.execute(
-        "INSERT INTO tracks (file_path) VALUES (?)",
+        "INSERT INTO lib2_track_files (path) VALUES (?)",
         ("/music/Other Artist/Other Album/01 - Intro.flac",),
     )
     worker.db._conn.commit()
@@ -281,6 +284,41 @@ def test_same_filename_in_another_album_does_not_retire_or_delete_orphan(worker,
     result = worker.fix_finding(fid, fix_action="delete")
 
     assert result["success"] is False
-    assert "same filename" in result["error"]
+    assert result["needs_confirm"] is True
+    assert result["library_paths"] == ["/music/Other Artist/Other Album/01 - Intro.flac"]
     assert track.read_bytes() == b"audio"
     assert _row(worker, fid)["status"] == "pending"
+
+
+def _same_name_orphan(worker, tmp_path):
+    track = tmp_path / "Artist" / "Album" / "01 - Intro.flac"
+    track.parent.mkdir(parents=True)
+    track.write_bytes(b"audio")
+    fid = _add(worker, track, job_id="orphan_file_detector", finding_type="orphan_file")
+    worker.db._conn.execute("INSERT INTO lib2_track_files (path) VALUES (?)",
+                            ("/music/Artist/Album (Deluxe)/01 - Intro.flac",))
+    worker.db._conn.commit()
+    return track, fid
+
+
+def test_a_same_name_orphan_deletes_once_the_user_says_yes(worker, tmp_path):
+    # lake (docker + navidrome): leftover transfer copies of tracks already in
+    # the library. both buttons refused with no way past.
+    track, fid = _same_name_orphan(worker, tmp_path)
+
+    result = worker.fix_finding(fid, fix_action="delete_confirmed")
+
+    assert result["action"] == "deleted_file"
+    assert not track.exists()
+    assert _row(worker, fid)["status"] == "resolved"
+
+
+def test_a_same_name_orphan_can_be_moved_to_staging(worker, tmp_path):
+    # staging keeps the file, nothing to confirm
+    track, fid = _same_name_orphan(worker, tmp_path)
+    worker._resolve_path = lambda path: str(tmp_path / "Staging")
+
+    result = worker.fix_finding(fid, fix_action="staging")
+
+    assert result["action"] == "moved_to_staging"
+    assert (tmp_path / "Staging" / track.name).read_bytes() == b"audio"

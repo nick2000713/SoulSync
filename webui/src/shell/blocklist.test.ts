@@ -170,6 +170,7 @@ describe('the window contract', () => {
       '_mlmSourceDebounce',
       '_updateSidebarLibraryBreadcrumb',
       'blockFromSearch',
+      'bootSidebarWeather',
       'clearArtistDetailPageState',
       'closeBlocklistModal',
       'closeDownloadOriginsModal',
@@ -180,6 +181,8 @@ describe('the window contract', () => {
       'connectMyAccount',
       'deleteSelectedOriginEntries',
       'disconnectMyAccount',
+      'getWeatherPreview',
+      'initSidebarWeather',
       'navigateToArtistDetail',
       'onBlocklistSearchInput',
       'openBlocklistModal',
@@ -197,6 +200,7 @@ describe('the window contract', () => {
       'removeSelectedOriginEntries',
       'saveMyAccountToken',
       'setActiveSource',
+      'setWeatherPreview',
       'switchBlocklistTab',
       'switchDownloadOriginTab',
       'switchServiceSwitchTab',
@@ -205,8 +209,10 @@ describe('the window contract', () => {
       'toggleOriginGroup',
       'toggleWatchlistHistoryRun',
       'unblockEntry',
+      'weatherPreviewPresets',
     ]);
     // importing the entry assigned them
     expect(window.openBlocklistModal).toBe(SHELL_WINDOW_EXPORTS.openBlocklistModal);
+    expect(window.bootSidebarWeather).toBe(SHELL_WINDOW_EXPORTS.bootSidebarWeather);
   });
 });

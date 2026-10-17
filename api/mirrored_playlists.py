@@ -21,6 +21,7 @@ from api.source_playlists import (
     youtube_playlist_states,
 )
 from core.api_validation import parse_strict_bool, parse_strict_int
+from core.playlists import user_playlists as _up
 from core.profile_context import get_current_profile_id
 from utils.logging_config import get_logger
 
@@ -45,6 +46,13 @@ def configure(**deps):
         if name not in g:
             raise KeyError(f"mirrored_playlists.configure: unknown dep {name!r}")
         g[name] = value
+
+
+def _cover_base_dir():
+    # uploaded user-playlist covers; deleted with the playlist so orphaned
+    # webp files don't accumulate in storage.
+    base = getattr(config_manager, "base_dir", None) if config_manager else None
+    return str(base) if base else None
 
 
 bp = Blueprint('mirrored_playlists', __name__)
@@ -88,16 +96,12 @@ def _invalidate_mirror_sync_fingerprint(playlist_id):
     the smallest change that makes the very next scheduled run authoritative,
     and it degrades safely: a lost preference write only costs one extra sync.
     """
+    from core.sync.sync_fingerprint import clear_fingerprint
     key = f"auto_mirror_{int(playlist_id)}"
     try:
         sync_statuses = _load_sync_status_file()
-        status = sync_statuses.get(key)
-        if not status:
-            return
-        for field in ('tracks_hash', 'mirror_tracks_hash', 'matched_tracks'):
-            status.pop(field, None)
-        sync_statuses[key] = status
-        _save_sync_status_file(sync_statuses)
+        if clear_fingerprint(sync_statuses, key):
+            _save_sync_status_file(sync_statuses)
     except Exception as e:
         logger.debug("Could not invalidate sync fingerprint for %s: %s", key, e)
 
@@ -142,7 +146,7 @@ def get_mirrored_playlists_endpoint():
         for pl in playlists:
             counts = batch_counts.get(pl['id'], {
                 'total': 0, 'discovered': 0, 'wishlisted': 0,
-                'in_library': 0, 'library_checked': 0,
+                'in_library': 0, 'library_checked': 0, 'needs_match': 0,
             })
             pl['discovered_count'] = counts['discovered']
             pl['total_count'] = counts['total']
@@ -153,6 +157,8 @@ def get_mirrored_playlists_endpoint():
             # owning none of it, and the card must not report the second when it
             # only knows the first.
             pl['library_checked_count'] = counts.get('library_checked', 0)
+            # wing it guesses still waiting on a pick, the card links to them (#1721)
+            pl['needs_match_count'] = counts.get('needs_match', 0)
             source_ref = describe_mirrored_source_ref(pl)
             pl['source_ref'] = source_ref.source_ref
             pl['source_ref_kind'] = source_ref.source_ref_kind
@@ -199,6 +205,21 @@ def _owned_mirrored_playlist(database, playlist_id):
     return database.get_mirrored_playlist(playlist_id, profile_id=_mirror_scope_profile_id())
 
 
+def _stamp_track_statuses(database, playlist):
+    """where each track stands, on the track, plus the totals (#1721).
+    best effort: the tracks still show without it."""
+    try:
+        from core.playlists.track_status import status_counts, track_status, wishlist_ids
+        tracks = playlist.get('tracks') or []
+        ids = {i for t in tracks for i in wishlist_ids(t)}
+        wishlisted = database.get_wishlisted_ids(ids, profile_id=playlist.get('profile_id'))
+        for t in tracks:
+            t['status'] = track_status(t, wishlisted)
+        playlist['status_counts'] = status_counts(t['status'] for t in tracks)
+    except Exception as e:
+        logger.debug(f"track statuses unavailable for mirror {playlist.get('id')}: {e}")
+
+
 @bp.route('/api/mirrored-playlists/<int:playlist_id>', methods=['GET'])
 def get_mirrored_playlist_endpoint(playlist_id):
     """Get a mirrored playlist with its tracks."""
@@ -217,6 +238,7 @@ def get_mirrored_playlist_endpoint(playlist_id):
         playlist['display_name'] = effective_mirrored_name(playlist)
         playlist['pipeline_state'] = _snapshot_playlist_pipeline_state(playlist_id)
         playlist['tracks'] = database.get_mirrored_playlist_tracks(playlist_id)
+        _stamp_track_statuses(database, playlist)
         return jsonify(playlist)
     except Exception as e:
         logger.error(f"Error getting mirrored playlist: {e}")
@@ -306,7 +328,7 @@ def update_mirrored_playlist_preferences_endpoint(playlist_id):
     """Update per-playlist download preferences (e.g. organize by playlist folder)."""
     try:
         data = request.get_json() or {}
-        if not ({'organize_by_playlist', 'quality_profile_id'} & set(data)):
+        if not ({'organize_by_playlist', 'quality_profile_id', 'sync_mode'} & set(data)):
             return jsonify({"error": "No supported preference supplied"}), 400
 
         database = get_database()
@@ -327,6 +349,19 @@ def update_mirrored_playlist_preferences_endpoint(playlist_id):
             if quality_profile_id is None:
                 return jsonify({"error": "Invalid quality_profile_id"}), 400
 
+        # #1704: null or '' clears back to the global mode, else a real mode.
+        # no fingerprint reset needed, the sync status remembers the mode
+        sync_mode = None
+        if 'sync_mode' in data:
+            from core.sync.playlist_edit import VALID_SYNC_MODES
+            raw_mode = data.get('sync_mode')
+            if raw_mode is None or raw_mode == '':
+                sync_mode = ''
+            elif raw_mode in VALID_SYNC_MODES:
+                sync_mode = raw_mode
+            else:
+                return jsonify({"error": "Invalid sync_mode"}), 400
+
         # Both fields are validated and written in ONE transaction: a rejected
         # Quality Profile used to leave the already-committed organize toggle
         # behind while the response said 400 (P2-02).
@@ -335,6 +370,7 @@ def update_mirrored_playlist_preferences_endpoint(playlist_id):
             profile_id=profile_id,
             organize_by_playlist=organize_by_playlist,
             quality_profile_id=quality_profile_id,
+            sync_mode=sync_mode,
         )
         if outcome == 'not_found':
             return jsonify({"error": "Playlist not found"}), 404
@@ -519,6 +555,9 @@ def _run_mirrored_playlist_pipeline_for_ui(playlist_id, skip_wishlist=False, pro
                 'refresh_only': bool(refresh_only),
                 'profile_id': int(profile_id),
                 '_automation_id': _playlist_pipeline_state_key(playlist_id, profile_id),
+                # the user clicked Sync & download, so tracks they once removed
+                # from the wishlist come back; schedules keep the ignore-list (#1603)
+                'user_initiated': True,
             },
             deps,
             refresh_fn=auto_refresh_mirrored,
@@ -583,7 +622,8 @@ def run_mirrored_playlist_pipeline_endpoint(playlist_id):
         playlist = _owned_mirrored_playlist(database, playlist_id)
         if not playlist:
             return jsonify({"error": "Playlist not found"}), 404
-        if playlist.get('source') in ('file', 'beatport'):
+        from core.playlists.user_playlists import pipeline_runs
+        if not pipeline_runs(playlist):
             return jsonify({"error": "This playlist source cannot be refreshed by the pipeline"}), 400
         if _get_automation_deps() is None:
             return jsonify({"error": "Playlist pipeline is not available"}), 503
@@ -690,6 +730,7 @@ def delete_mirrored_playlist_endpoint(playlist_id):
     try:
         database = get_database()
         if database.delete_mirrored_playlist(playlist_id, profile_id=_mirror_scope_profile_id()):
+            _up.remove_cover_file(playlist_id, _cover_base_dir())
             return jsonify({"success": True})
         return jsonify({"error": "Playlist not found"}), 404
     except Exception as e:
@@ -721,6 +762,7 @@ def batch_delete_mirrored_playlists_endpoint():
         deleted, not_deleted = [], []
         for pid in dict.fromkeys(ids):
             if database.delete_mirrored_playlist(pid, profile_id=scope):
+                _up.remove_cover_file(pid, _cover_base_dir())
                 deleted.append(pid)
             else:
                 not_deleted.append(pid)
@@ -906,6 +948,9 @@ def fix_discovery_pool_track():
                 album_obj['image_url'] = image_url
                 album_obj['images'] = [{'url': image_url}]
 
+        # the search endpoint says where the result came from (spotify falls
+        # back to deezer/itunes); old clients that don't send it were spotify
+        source = _picked_source(spotify_track)
         matched_data = {
             'id': spotify_track.get('id', ''),
             'name': spotify_track.get('name', ''),
@@ -913,14 +958,14 @@ def fix_discovery_pool_track():
             'album': album_obj,
             'duration_ms': spotify_track.get('duration_ms', 0),
             'image_url': image_url,
-            'source': 'spotify',
+            'source': source,
         }
 
         # Update the mirrored track's extra_data (merges, so a wing-it track keeps its
         # wing_it_fallback flag — that + manual_match is how the Wing It Pool lists resolved guesses).
         extra_data = {
             'discovered': True,
-            'provider': 'spotify',
+            'provider': source,
             'confidence': 1.0,
             'matched_data': matched_data,
             'manual_match': True,
@@ -981,6 +1026,11 @@ def delete_discovery_pool_cache_entry(entry_id):
         logger.error(f"Error deleting discovery cache entry: {e}")
         return jsonify({"error": str(e)}), 500
 
+def _picked_source(track) -> str:
+    source = str((track or {}).get('source') or '').strip().lower()
+    return source or 'spotify'
+
+
 @bp.route('/api/discovery-pool/rematch', methods=['POST'])
 def rematch_discovery_pool_track():
     """Replace a discovery cache entry with a new match chosen by the user."""
@@ -1020,16 +1070,18 @@ def rematch_discovery_pool_track():
             'album': album_obj,
             'duration_ms': spotify_track.get('duration_ms', 0),
             'image_url': image_url,
-            'source': 'spotify',
+            'source': _picked_source(spotify_track),
         }
 
-        # Save to discovery cache
+        # Save to discovery cache. keyed by the ACTIVE discovery source like
+        # the fix endpoint and the lookup, or a deezer user's rematch was
+        # saved under 'spotify' and never read back (#1565).
         normalized_title = _matching_engine().normalize_string(original_title) if original_title else ''
         normalized_artist = _matching_engine().normalize_string(original_artist) if original_artist else ''
         database.save_discovery_cache_match(
             normalized_title=normalized_title,
             normalized_artist=normalized_artist,
-            provider='spotify',
+            provider=_get_active_discovery_source(),
             confidence=1.0,
             matched_data=matched_data,
             original_title=original_title,
@@ -1197,6 +1249,10 @@ def prepare_mirrored_discovery(playlist_id):
             'url': f"mirrored://{playlist['source']}/{playlist['source_playlist_id']}",
             'source': playlist['source']
         }
+        # what the source skipped when it was mirrored, for the identify window (#1613)
+        skipped = playlist.get('source_skipped') or {}
+        playlist_data['skipped_videos'] = skipped.get('videos', 0)
+        playlist_data['unavailable_tracks'] = skipped.get('unavailable', 0)
 
         youtube_playlist_states[url_hash] = {
             'playlist': playlist_data,

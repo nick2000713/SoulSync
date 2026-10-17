@@ -145,6 +145,10 @@ declare global {
     ) => Promise<boolean | void> | boolean | void;
     /** media-player.js — seedless Library Radio: queues a ranked-random batch
      *  from the whole library and arms radio mode for refills. */
+    npSetRadioMode?: (
+      enabled: boolean,
+      options: { toast: boolean; fetchIfNeeded: boolean },
+    ) => void;
     startLibraryRadio?: () => void | Promise<void>;
     /** media-player.js — the track the player has loaded (title, artist,
      *  album, image_url, artist_id...), or null. */
@@ -152,6 +156,8 @@ declare global {
     /** media-player.js — play a resolved library track list (radio-row shape)
      *  as the queue, labeled with a "Playing from" context. */
     cancelPendingPlayback?: () => void;
+    /** media-player.js — the queue's auto-download switch for missing rows. */
+    isQueueAutoDownloadEnabled?: () => boolean;
     playTrackList?: (
       tracks: unknown[],
       contextName?: string,
@@ -227,6 +233,8 @@ declare global {
     _showMobileTrackActions?: (track: unknown, album: unknown) => void;
     /** media-player.js — the play queue. */
     addToQueue?: (payload: unknown) => void;
+    /** several at once, one toast; starts playing if nothing is. */
+    addTracksToQueue?: (payloads: unknown[]) => void;
     playNext?: (payload: unknown) => void;
     /**
      * shared-helpers.js — the download-missing modal. Called directly rather
@@ -575,6 +583,14 @@ declare global {
     onBlocklistSearchInput?: () => void;
     blockFromSearch?: (payloadEnc: string) => Promise<void>;
     unblockEntry?: (id: number) => Promise<void>;
+    /** src/shell/sidebar-weather.ts: the weather line + particle scene (oct 6). */
+    initSidebarWeather?: () => void;
+    /** re-runnable weather boot, called from settings.js after a location/enabled change. */
+    bootSidebarWeather?: () => Promise<void>;
+    /** settings > advanced > developer: preview a sky in this tab only */
+    getWeatherPreview?: () => { preset: string; date: string | null } | null;
+    setWeatherPreview?: (preview: { preset: string; date: string | null } | null) => void;
+    weatherPreviewPresets?: () => Array<{ key: string; label: string }>;
     /** shared-helpers.js html escaper (also re-declared by downloads.js) */
     escapeHtml?: (text: unknown) => string;
     /** init.js - the active profile, or null before profiles load */
@@ -650,6 +666,11 @@ declare global {
     SoulSyncVideo?: {
       openDetail?: (args: { kind: string; id: number | string; source?: string }) => void;
     };
+    /** video-side.js: flip the shell chrome music <-> video (does NOT navigate). */
+    _switchAppSide?: (side: 'music' | 'video', opts?: { force?: boolean }) => void;
+    /** unified downloads page: true while any video download is active.
+     *  video-wishlist.js's badge poll reads it (typeof-guarded). */
+    _vdpgAnyActive?: () => boolean;
     SoulSyncIssueDomain?: IssueDomainBridge;
     SoulSyncWorkflowActions?: {
       openDownloadMissingAlbum: (input: DownloadMissingAlbumWorkflowInput) => void | Promise<void>;
@@ -686,6 +707,8 @@ declare global {
         pageId: ShellPageId,
         options?: {
           replace?: boolean;
+          /** query params appended to the manifest path (e.g. ?media=video). */
+          query?: Record<string, string | number | boolean | null | undefined>;
           artistId?: string | number;
           artistSource?: string | null;
           artistName?: string;
@@ -694,6 +717,15 @@ declare global {
           labelName?: string;
         },
       ) => Promise<boolean>;
+      /**
+       * Navigate to a full in-app href, query string included.
+       *
+       * `navigateToPage` addresses a page by id and cannot carry search params,
+       * so a plain `<a href="/library?artist=7">` — which is what a search
+       * result card is — had no way in and fell through to the browser as a
+       * full document load (iss29-B03).
+       */
+      navigateToHref: (href: string, options?: { replace?: boolean }) => Promise<boolean>;
     };
     SoulSyncWebShellBridge?: {
       getCurrentProfileContext: () => ShellProfileContext | null;
@@ -721,11 +753,22 @@ declare global {
       showReactHost: (pageId: ShellPageId) => void;
       playLibraryTrack: (
         track: {
-          id: string | number;
+          id?: string | number | null;
+          lib2_track_id?: string | number | null;
+          legacy_track_id?: string | number | null;
+          server_track_id?: string | number | null;
           title: string;
           file_path: string;
           bitrate?: string | number | null;
           artist_id?: string | number | null;
+          /**
+           * iss29-B08: the LIB2 artist id, when the track came from Library V2.
+           * `artist_id` above is a legacy id and is correctly null for a
+           * V2-native track — which left the player's "Go to artist" button
+           * permanently disabled during V2 playback, because nothing routed to
+           * `/library?artist=`.
+           */
+          lib2_artist_id?: string | number | null;
           album_id?: string | number | null;
           _stats_image?: string | null;
           /** Play this exact file: skip the title+artist re-resolve. */

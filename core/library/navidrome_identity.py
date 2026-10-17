@@ -19,18 +19,31 @@ def _request(client, endpoint, params=None):
     return client._make_request(endpoint, params, timeout=(3.05, 10))
 
 
-def _scan_stamp(client):
-    response = _request(client, 'getScanStatus')
-    state = (response or {}).get('scanStatus')
-    if not isinstance(state, dict) or state.get('scanning') is not False:
-        raise IdentityError('Navidrome scan state is unavailable or a scan is running')
-    return state.get('count')
+# How long a playlist write waits out a running library scan. Downloads
+# trigger scans, so a pipeline that just fetched tracks routinely reaches its
+# write mid-scan; refusing outright threw away a whole sync's matching.
+PLAYLIST_WRITE_SCAN_WAIT = 180
+_SCAN_POLL_SECONDS = 5
 
 
-def read_inventory(client, page_size=500):
+def _scan_stamp(client, wait=0):
+    """The scan counter once Navidrome is idle. ``wait`` seconds of polling
+    ride out a running (or briefly unreachable) scan before giving up."""
+    deadline = time.monotonic() + wait
+    while True:
+        response = _request(client, 'getScanStatus')
+        state = (response or {}).get('scanStatus')
+        if isinstance(state, dict) and state.get('scanning') is False:
+            return state.get('count')
+        if time.monotonic() >= deadline:
+            raise IdentityError('Navidrome scan state is unavailable or a scan is running')
+        time.sleep(_SCAN_POLL_SECONDS)
+
+
+def read_inventory(client, page_size=500, scan_wait=0):
     """A fresh, complete OpenSubsonic search3 inventory; never return partial data."""
+    before = _scan_stamp(client, wait=scan_wait)
     deadline = time.monotonic() + 60
-    before = _scan_stamp(client)
     songs = {}
     offset = 0
     while offset < 1000000:
@@ -59,13 +72,62 @@ def read_inventory(client, page_size=500):
     raise IdentityError('Navidrome inventory exceeded its safety limit')
 
 
+def _tail(path):
+    """artist/album/file, the part of a path every mount agrees on. soulsync
+    writes rows in its own view (/Media/Music/...) while navidrome reports
+    its own (/music/...), so a raw compare never matched those rows (#1571)."""
+    parts = [p for p in path.split('/') if p]
+    return '/'.join(parts[-3:]).casefold() if len(parts) >= 3 else ''
+
+
 def _by_path(songs):
     paths = defaultdict(list)
     for sid, song in songs.items():
         path = _path(song.get('path'))
         if path:
             paths[path].append(sid)
+            tail = _tail(path)
+            if tail:
+                paths[('tail', tail)].append(sid)
     return paths
+
+
+def _live_candidates(paths, stored_path):
+    """Live song ids at a stored path: the exact path first, then the same
+    artist/album/file under another mount. Callers still require exactly one
+    and the same recording, so a tail shared by two songs resolves nothing."""
+    path = _path(stored_path)
+    if not path:
+        return []
+    exact = paths.get(path)
+    if exact:
+        return exact
+    tail = _tail(path)
+    return paths.get(('tail', tail), []) if tail else []
+
+
+def _rekey_candidates(same_file_ids, old, paths, songs):
+    """Live ids that may be this stale row's song, best evidence first.
+
+    1. the path Navidrome reported for it (server_path, #1573), or file_path
+       on rows from before that column, exactly
+    2. another row for the same local file whose id is live: navidrome
+       re-keyed the song and the scan already brought the new row in
+    3. the artist/album/file tail of either path (#1571)
+    """
+    server_path, file_path = old.get('server_path'), old.get('file_path')
+    for stored in (server_path, file_path):
+        exact = paths.get(_path(stored)) if stored else None
+        if exact:
+            return exact
+    live = [sid for sid in same_file_ids if sid in songs]
+    if live:
+        return live
+    for stored in (server_path, file_path):
+        candidates = _live_candidates(paths, stored)
+        if candidates:
+            return candidates
+    return []
 
 
 def _same_recording(old, song):
@@ -79,68 +141,152 @@ def _same_recording(old, song):
     return True
 
 
-def resolve_tracks(tracks, songs, db):
+# The catalogue is Library v2, so a Navidrome song id is not a row id: it lives
+# in lib2_media_server_mappings, with lib2_tracks.server_source/server_id kept as
+# a compatibility projection of the last observed one. Both are read, mapping
+# first, exactly as get_all_track_ids_for_server resolves a server id.
+_TRACK_BY_SERVER_ID = """
+    SELECT t.id AS track_id, t.title AS title, t.duration AS duration,
+           (SELECT f.path FROM lib2_track_files f
+             WHERE f.track_id = t.id
+               AND COALESCE(f.file_state, 'active') = 'active'
+               AND f.path IS NOT NULL AND TRIM(f.path) <> ''
+             ORDER BY f.is_primary DESC, f.id LIMIT 1) AS file_path
+      FROM lib2_tracks t
+     WHERE t.id = (
+             SELECT m.entity_id FROM lib2_media_server_mappings m
+              WHERE m.entity_type='track' AND m.server_source='navidrome'
+                AND m.server_id = ?
+           )
+        OR (t.server_source='navidrome' AND t.server_id = ?)
+     LIMIT 1
+"""
+
+
+def resolve_tracks(tracks, songs, db, skipped=None):
+    """live navidrome tracks for these ids. an id we can't safely resolve is
+    left out and noted in ``skipped`` instead of sinking the whole write (#1715):
+    one deleted song used to block every other track on the playlist. nothing
+    resolving at all still raises."""
     from core.navidrome_client import NavidromeTrack
     paths = _by_path(songs)
     resolved = []
+    unresolved = []
     for track in tracks:
         sid = str(getattr(track, 'ratingKey', None) or getattr(track, 'id', None)
                   or (track.get('id', '') if isinstance(track, dict) else ''))
         if sid not in songs:
             with db._get_connection() as conn:
-                row = conn.execute("SELECT file_path,title,duration FROM tracks WHERE id=? AND server_source='navidrome'", (sid,)).fetchone()
-            old = dict(row) if row else {}
-            path = _path(old.get('file_path'))
-            candidates = paths.get(path, [])
+                row = conn.execute(_TRACK_BY_SERVER_ID, (sid, sid)).fetchone()
+                old = dict(row) if row else {}
+                # Upstream #1573, on the mapping table: a Navidrome id the scan
+                # already filed for another catalogue row of the same local
+                # file is the song the server re-keyed to.
+                same_file = [str(r[0]) for r in conn.execute(
+                    "SELECT m.server_id FROM lib2_media_server_mappings m "
+                    "JOIN lib2_track_files f ON f.track_id = m.entity_id "
+                    "WHERE m.entity_type='track' AND m.server_source='navidrome' "
+                    "AND f.path=? AND COALESCE(f.file_state, 'active')='active' "
+                    "AND m.server_id<>?",
+                    (old['file_path'], sid))] if old.get('file_path') else []
+            candidates = _rekey_candidates(same_file, old, paths, songs) if old else []
             if len(candidates) != 1 or not _same_recording(old, songs[candidates[0]]):
-                raise IdentityError(f'Cannot safely resolve Navidrome song {sid}; playlist left unchanged. Run a library scan.')
+                unresolved.append(sid)
+                continue
             sid = candidates[0]
         resolved.append(NavidromeTrack(songs[sid], None))
+    if unresolved and not resolved:
+        raise IdentityError(f'Cannot safely resolve Navidrome song {unresolved[0]}; playlist left unchanged. Run a library scan.')
+    if skipped is not None:
+        skipped.extend(unresolved)
     return resolved
 
 
 def repair_rekeyed_tracks(db, songs):
-    """Merge only obsolete IDs with one live same-path row already imported.
+    """Re-point Navidrome song ids that the server has reissued.
 
-    Never delete an unmatched file, an ID still on the server, or an ambiguous
-    path. Keep live server fields and fill missing enrichment from the old row.
+    Upstream merges two rows of the legacy ``tracks`` table here, because there
+    the song id IS the row id: a rekey mints a second row and the repair has to
+    move every enrichment column and foreign key onto it before deleting the
+    old one. The catalogue does not work that way. A lib2 track keeps its
+    identity for life and the server's id is held beside it in
+    ``lib2_media_server_mappings``, so a rekey is a stale *mapping* and nothing
+    else -- no row is merged, no column is copied, and no catalogue row is ever
+    deleted here. Only the mapping table and the two projection columns on
+    lib2_tracks are written.
+
+    The safety rules are upstream's, unchanged: never touch an id the server
+    still lists, never an unmatched file, never an ambiguous path, and only
+    when the file at that path is recognisably the same recording.
     """
     paths = _by_path(songs)
     repaired = 0
     with db._get_connection() as conn:
         conn.execute('BEGIN IMMEDIATE')
-        rows = conn.execute("SELECT * FROM tracks WHERE server_source='navidrome'").fetchall()
-        by_id = {str(r['id']): r for r in rows}
-        owned = {'id', 'album_id', 'artist_id', 'title', 'track_number', 'disc_number',
-                 'duration', 'file_path', 'bitrate', 'file_size', 'server_source', 'track_artist',
-                 'created_at', 'updated_at'}
-        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        references = []
-        for table in tables:
-            for fk in conn.execute(f'PRAGMA foreign_key_list("{table}")').fetchall():
-                if fk[2] == 'tracks' and fk[4] == 'id':
-                    references.append((table, fk[3]))
-        for old_id, old in by_id.items():
+        rows = conn.execute("""
+            SELECT m.id AS mapping_id, m.server_id AS server_id,
+                   t.id AS track_id, t.title AS title, t.duration AS duration,
+                   (SELECT f.path FROM lib2_track_files f
+                     WHERE f.track_id = t.id
+                       AND COALESCE(f.file_state, 'active') = 'active'
+                       AND f.path IS NOT NULL AND TRIM(f.path) <> ''
+                     ORDER BY f.is_primary DESC, f.id LIMIT 1) AS file_path
+              FROM lib2_media_server_mappings m
+              JOIN lib2_tracks t ON t.id = m.entity_id
+             WHERE m.entity_type='track' AND m.server_source='navidrome'
+        """).fetchall()
+        live_ids = {str(r['server_id']) for r in rows if str(r['server_id']) in songs}
+        # one pass, not a query per stale row (upstream): the Navidrome ids
+        # filed for each local file
+        by_file = defaultdict(list)
+        for r in rows:
+            if r['file_path']:
+                by_file[r['file_path']].append(str(r['server_id']))
+        for row in rows:
+            old_id = str(row['server_id'])
             if old_id in songs:
                 continue
-            candidates = paths.get(_path(old['file_path']), [])
-            if len(candidates) != 1 or candidates[0] not in by_id:
+            same_file = [i for i in by_file.get(row['file_path'], []) if i != old_id]
+            candidates = _rekey_candidates(same_file, dict(row), paths, songs)
+            if len(candidates) != 1:
                 continue
             new_id = candidates[0]
-            if not _same_recording(dict(old), songs[new_id]):
+            if not _same_recording(dict(row), songs[new_id]):
                 continue
-            columns = [column for column in old.keys() if column not in owned and old[column] not in (None, '')]
-            if columns:
-                assignments = ', '.join(f'"{c}"=CASE WHEN "{c}" IS NULL OR "{c}"=? THEN ? ELSE "{c}" END' for c in columns)
-                values = [value for c in columns for value in ('', old[c])]
-                conn.execute(f'UPDATE tracks SET {assignments} WHERE id=?', values + [new_id])
-            for table, column in [('manual_library_track_matches', 'library_track_id'), ('sync_match_cache', 'server_track_id')]:
-                if table in tables:
-                    conn.execute(f'UPDATE {table} SET {column}=? WHERE {column}=? AND server_source=?', (new_id, old_id, 'navidrome'))
-            # Preserve declared foreign-key references before removing the old row.
-            for table, column in references:
-                conn.execute(f'UPDATE "{table}" SET "{column}"=? WHERE "{column}"=?', (new_id, old_id))
-            conn.execute("DELETE FROM tracks WHERE id=? AND server_source='navidrome'", (old_id,))
+            if new_id in live_ids:
+                # The sync already filed the live id, on this row or on a twin
+                # it created for the same file. UNIQUE(entity_type,
+                # server_source, server_id) would reject a second claim, and a
+                # duplicate catalogue row is core/library2/dedup_repair.py's
+                # business, not ours. Drop the obsolete mapping and stop.
+                conn.execute("DELETE FROM lib2_media_server_mappings WHERE id=?",
+                             (row['mapping_id'],))
+                repaired += 1
+                continue
+            conn.execute(
+                "UPDATE lib2_media_server_mappings "
+                "SET server_id=?, last_seen_at=CURRENT_TIMESTAMP WHERE id=?",
+                (new_id, row['mapping_id']))
+            # the projection follows the mapping, so the compatibility reads
+            # (get_all_track_ids_for_server, the server_source CASE in the
+            # ownership queries) do not keep answering with the dead id
+            conn.execute(
+                "UPDATE lib2_tracks SET server_id=?, updated_at=CURRENT_TIMESTAMP "
+                "WHERE id=? AND server_source='navidrome' AND server_id=?",
+                (new_id, row['track_id'], old_id))
+            for table, column in (('manual_library_track_matches', 'library_track_id'),
+                                  ('sync_match_cache', 'server_track_id')):
+                try:
+                    conn.execute(
+                        f'UPDATE {table} SET {column}=? WHERE {column}=? AND server_source=?',
+                        (new_id, old_id, 'navidrome'))
+                except Exception as exc:  # noqa: BLE001
+                    # these two are caches; a schema that predates either of
+                    # them must not abort the repair
+                    from utils.logging_config import get_logger
+                    get_logger('navidrome_identity').debug(
+                        "identity repoint skipped for %s.%s: %s", table, column, exc)
+            live_ids.add(new_id)
             repaired += 1
         conn.commit()
     return repaired
@@ -188,9 +334,19 @@ def validated_playlist_write(method):
                           or (t.get('id', '') if isinstance(t, dict) else '')) for t in tracks}
             # An unchanged/subset playlist already supplies live song evidence.
             # Only new or stale IDs require a complete catalogue read.
-            songs = current if wanted <= current.keys() else read_inventory(client)
-            tracks = resolve_tracks(tracks, songs, get_database())
+            songs = (current if wanted <= current.keys()
+                     else read_inventory(client, scan_wait=PLAYLIST_WRITE_SCAN_WAIT))
+            skipped = []
+            tracks = resolve_tracks(tracks, songs, get_database(), skipped)
             expected = {str(t.ratingKey) for t in tracks}
+            if skipped:
+                # a skipped id might be a song navidrome re-keyed, and the new
+                # key could be sitting in this playlist. a write that would drop
+                # anything already there waits until we can tell.
+                if method.__name__ != 'append_to_playlist' and set(current) - expected:
+                    raise IdentityError(f'Cannot safely resolve Navidrome song {skipped[0]}; playlist left unchanged. Run a library scan.')
+                logger.warning('Playlist %r: skipped %d track(s) navidrome no longer has (%s)',
+                               name, len(skipped), ', '.join(skipped[:5]))
             if method.__name__ == 'append_to_playlist':
                 expected.update(current)
             token = _active_write.set(client)

@@ -566,7 +566,7 @@ class ConfigManager:
                 "hybrid_primary": "soulseek",  # Legacy: primary source for hybrid mode
                 "hybrid_secondary": "youtube",  # Legacy: fallback source for hybrid mode
                 "hybrid_order": [],  # Ordered list of sources for hybrid mode (overrides primary/secondary)
-                "stream_source": "youtube",  # Options: "youtube" (instant, default), "active" (use download source; falls back to youtube if soulseek)
+                "stream_source": "youtube",  # Options: "youtube" (instant, default), "active" (use download source; falls back to youtube if soulseek), "deezer_preview" (30s deezer clip, youtube when there is none)
                 # Album-bundle (torrent / usenet single-source) poll tuning.
                 # Downloader is polled every N seconds until the release
                 # lands; whole job aborts at the timeout. Defaults match
@@ -719,6 +719,7 @@ class ConfigManager:
                 "username": "",
                 "password": "",
                 "category": "soulsync",
+                "acquisition_monitor_interval_seconds": 15,
             },
             "soundcloud_download": {
                 # Anonymous-only for now — SoundCloud Go+ OAuth tier could be
@@ -899,6 +900,10 @@ class ConfigManager:
                 # the artist instead of guessing by name. Off by default —
                 # the Artist NFO Backfill repair job covers existing folders.
                 "write_artist_nfo": False,
+                # Library v2: a monitored track whose file was deleted outside
+                # SoulSync is downloaded again (Lidarr behaviour). Off, the
+                # deletion counts as "don't download again" for that track.
+                "redownload_externally_deleted": True,
             },
             "file_organization": {
                 "enabled": True,
@@ -972,11 +977,16 @@ class ConfigManager:
                 # setting, read directly by `core/auto_import_worker.py` — a
                 # Staging folder-layout quirk, not a quality preference, so it
                 # deliberately does NOT live on a quality profile.
-                "folder_artist_override": True
+                "folder_artist_override": True,
+                # off: staging keeps whatever an import didn't move (the user's
+                # own files). on: a folder whose every track was imported or
+                # found already in the library is removed from staging.
+                "clear_finished_from_staging": False
             },
             "m3u_export": {
                 "enabled": False,
                 "entry_base_path": "",
+                "relative_paths": False,
                 "library_enabled": False,
                 "library_path": ""
             },
@@ -1052,6 +1062,12 @@ class ConfigManager:
                     # GraphicAudio and the like. On by default because they are
                     # already shown-but-outranked; turning this off removes them.
                     "allow_dramatized": True,
+                    # Formats a release may be in at all; empty allows every
+                    # format. Unlike format_order this rejects, not ranks.
+                    "allowed_formats": [],
+                    # "single", "multiple" or "any": whether a book arrives as
+                    # one file or several. Rejects only where the count is known.
+                    "file_layout": "any",
                 },
                 # How long a short book is kept staged before giving up. Torrents
                 # finish late and uploaders repair releases, so patience is right;
@@ -1067,6 +1083,11 @@ class ConfigManager:
                 # Off keeps an owned book on the wishlist as "In library";
                 # on drops it, like the music wishlist does.
                 "remove_owned_from_wishlist": False,
+                # Optional post-import fold of multi-file books into one
+                # chaptered .m4b. Off by default: it rewrites the library
+                # copy, and a listener who prefers the per-file layout opts
+                # out by leaving this off.
+                "merge_m4b": False,
             },
             "podcasts": {
                 "download_path": default_podcast_path,

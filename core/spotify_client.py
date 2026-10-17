@@ -676,23 +676,29 @@ class SpotifyClient:
 
     @property
     def _fallback_source(self) -> str:
-        """Get configured primary metadata source for internal fallback routing."""
+        """The source ``_fallback`` really is. Callers label fallback results
+        with it, so it never says 'spotify': with the primary source stored as
+        'spotify' the fallback is iTunes, and that label put numeric iTunes ids
+        into Spotify slots."""
         try:
-            return config_manager.get('metadata.fallback_source', 'deezer') or 'deezer'
+            configured = config_manager.get('metadata.fallback_source', 'deezer') or 'deezer'
         except Exception:
             return 'deezer'
+        if configured == 'deezer':
+            return 'deezer'
+        # Discogs only with a token configured
+        if configured == 'discogs' and config_manager.get('discogs.token', ''):
+            return 'discogs'
+        return 'itunes'
 
     @property
     def _fallback(self):
         """Get the active fallback metadata client based on settings"""
-        if self._fallback_source == 'deezer':
+        source = self._fallback_source
+        if source == 'deezer':
             return self._deezer
-        if self._fallback_source == 'discogs':
-            # Only use Discogs if token is configured
-            token = config_manager.get('discogs.token', '')
-            if token:
-                return self._discogs
-            return self._itunes  # Fall back to iTunes if no Discogs token
+        if source == 'discogs':
+            return self._discogs
         return self._itunes
 
     def _free_selected(self) -> bool:
@@ -1482,7 +1488,10 @@ class SpotifyClient:
             raise
 
     @rate_limited
-    def _get_playlist_tracks(self, playlist_id: str) -> List[Track]:
+    def _get_playlist_tracks(self, playlist_id: str, raise_errors: bool = False) -> List[Track]:
+        """All tracks of a playlist. A failed fetch returns [] unless
+        ``raise_errors``, so callers that would store the result as the
+        playlist's contents can tell a failure from an empty playlist."""
         if not self.is_spotify_authenticated():
             return []
 
@@ -1515,6 +1524,8 @@ class SpotifyClient:
             return tracks
 
         except Exception as e:
+            if raise_errors:
+                raise
             logger.error(f"Error fetching playlist tracks: {e}")
             return []
     
@@ -1532,11 +1543,20 @@ class SpotifyClient:
 
         try:
             playlist_data = self.sp.playlist(playlist_id)
-            tracks = self._get_playlist_tracks(playlist_id)
+            # A failed track fetch must not come back as an empty playlist: a
+            # mirror refresh would store it, deleting every track it had.
+            tracks = self._get_playlist_tracks(playlist_id, raise_errors=True)
             return Playlist.from_spotify_playlist(playlist_data, tracks)
 
         except Exception as e:
-            logger.error(f"Error fetching playlist {playlist_id}: {e}")
+            if http_error_status(e) == 403:
+                logger.error(
+                    f"Spotify refused the tracks of playlist {playlist_id} (403). Spotify only "
+                    f"serves the items of playlists you own or collaborate on, so a playlist "
+                    f"you follow can't be read. Copy it into a playlist of your own instead."
+                )
+            else:
+                logger.error(f"Error fetching playlist {playlist_id}: {e}")
             return None
 
     def _liked_songs_as_playlist(self) -> Optional[Playlist]:
@@ -1690,8 +1710,9 @@ class SpotifyClient:
         # Free should serve (no-auth / rate-limited / budget / worker prefer-free) OR
         # when it's simply available (opted-in) and official above returned nothing —
         # so an authed-but-broken official Spotify falls back to Free instead of empty.
-        if allow_fallback and (self._free_active() or self._free_available()
-                               or (prefer_free and self._free_installed())):
+        # not allow_fallback-gated: free IS Spotify (see get_track_details)
+        if (self._free_active() or self._free_available()
+                or (prefer_free and self._free_installed())):
             try:
                 objs = [Track.from_spotify_track(t)
                         for t in self._free_meta.search_tracks(query, effective_limit)]
@@ -1773,8 +1794,9 @@ class SpotifyClient:
         # No-creds Spotify (SpotipyFree): keep Spotify catalog/matching when official
         # can't serve (no auth / rate-limited / worker prefer-free) OR when it's opted-in
         # and official above returned nothing — before the iTunes/Deezer fallback.
-        if allow_fallback and (self._free_active() or self._free_available()
-                               or (prefer_free and self._free_installed())):
+        # not allow_fallback-gated: free IS Spotify (see get_track_details)
+        if (self._free_active() or self._free_available()
+                or (prefer_free and self._free_installed())):
             try:
                 objs = [Artist.from_spotify_artist(a)
                         for a in self._free_meta.search_artists(query, limit)]
@@ -1859,8 +1881,9 @@ class SpotifyClient:
         # opted-in and official above returned nothing — before the iTunes/Deezer fallback.
         # Albums have no name-search upstream, so resolve via the artist's discography —
         # needs artist + album names.
-        if allow_fallback and (self._free_active() or self._free_available()
-                               or (prefer_free and self._free_installed())) and artist and album:
+        # not allow_fallback-gated: free IS Spotify (see get_track_details)
+        if (self._free_active() or self._free_available()
+                or (prefer_free and self._free_installed())) and artist and album:
             try:
                 objs = [Album.from_spotify_album(a)
                         for a in self._free_meta.search_albums_via_artist(artist, album, min(limit, 10))]

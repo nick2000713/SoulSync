@@ -19,6 +19,7 @@ function initializeMediaPlayer() {
         audioPlayer.addEventListener('timeupdate', npCrossfadeTick);
         audioPlayer.addEventListener('timeupdate', npThrottledPositionState);
         audioPlayer.addEventListener('timeupdate', npMaybeLogPlay);
+        audioPlayer.addEventListener('timeupdate', npMaybeMarkScrobbleEligible);
         audioPlayer.addEventListener('ended', onAudioEnded);
         audioPlayer.addEventListener('error', onAudioError);
         audioPlayer.addEventListener('loadstart', onAudioLoadStart);
@@ -137,6 +138,9 @@ function setTrackInfo(track) {
         window.getCurrentTrack = function () { return currentTrack; };
     }
     npPlayLogged = false;   // new track — allow one play-log once it's heard a bit
+    npPlayId = null;   // listening_history id for this play (for the scrobble-eligibility ping)
+    npScrobbleEligibleSent = false;
+    npPlayGeneration++;   // invalidate any in-flight log-play response for the previous track
     // Chat now-playing (opt-in, chat.js owns the gate + throttle). Never let a
     // chat problem break playback.
     try {
@@ -151,6 +155,7 @@ function setTrackInfo(track) {
 
     document.getElementById('artist-name').textContent = _stripSourceIdPrefix(track.artist) || 'Unknown Artist';
     document.getElementById('album-name').textContent = _stripSourceIdPrefix(track.album) || 'Unknown Album';
+    npSetPreviewBadge(!!track.is_preview);
 
     // Check if title needs scrolling (similar to GUI app)
     setTimeout(() => {
@@ -167,7 +172,16 @@ function setTrackInfo(track) {
 
     const gotoArtistBtn = document.getElementById('np-goto-artist');
     if (gotoArtistBtn) {
-        if (track.artist_id) {
+        // iss29-B08: a Library V2 track has no LEGACY artist id — `artist_id`
+        // is correctly null — so this button was permanently disabled for the
+        // whole of V2 playback. The V2 id travels separately and routes into
+        // the Library page, which is where that artist actually lives.
+        if (track.lib2_artist_id) {
+            gotoArtistBtn.href = `/library?artist=${encodeURIComponent(track.lib2_artist_id)}`;
+            gotoArtistBtn.style.pointerEvents = '';
+            gotoArtistBtn.setAttribute('aria-disabled', 'false');
+            gotoArtistBtn.tabIndex = 0;
+        } else if (track.artist_id) {
             gotoArtistBtn.href = buildArtistDetailPath(track.artist_id, track.artist_source || null);
             gotoArtistBtn.style.pointerEvents = '';
             gotoArtistBtn.setAttribute('aria-disabled', 'false');
@@ -209,6 +223,14 @@ function setTrackInfo(track) {
         is_library: track.is_library,
         filename: track.filename,
     });
+}
+
+// a deezer clip (#1312) is 30 seconds of the song, not the song. the mini
+// player says so here and now playing in its format badges, so a clip
+// ending early never reads as a broken stream.
+function npSetPreviewBadge(on) {
+    const badge = document.getElementById('player-preview-badge');
+    if (badge) badge.hidden = !on;
 }
 
 function checkAndEnableScrolling(element, text) {
@@ -255,6 +277,7 @@ function clearTrack() {
 
     document.getElementById('artist-name').textContent = 'Unknown Artist';
     document.getElementById('album-name').textContent = 'Unknown Album';
+    npSetPreviewBadge(false);
     // Reset play button SVGs (don't use textContent — it destroys SVG children)
     const clearPlayBtn = document.getElementById('play-button');
     const clearPlayIcon = clearPlayBtn.querySelector('.play-icon');
@@ -492,7 +515,8 @@ async function startStream(searchResult) {
             album: searchResult.album || 'Unknown Album',
             username: searchResult.username,
             filename: searchResult.filename,
-            image_url: searchResult.image_url || searchResult.album_cover_url || null
+            image_url: searchResult.image_url || searchResult.album_cover_url || null,
+            is_preview: !!searchResult.preview
         });
 
         showLoadingAnimation();
@@ -685,6 +709,7 @@ async function updateStreamStatus() {
                         album: ti.album || 'Unknown Album',
                         filename: ti.filename || '',
                         is_library: !!ti.is_library,
+                        is_preview: !!ti.is_preview,
                         image_url: ti.image_url || null,
                         id: ti.id || null,
                         artist_id: ti.artist_id || null,
@@ -1258,7 +1283,7 @@ function onAudioEnded() {
     }
 
     // Radio mode: auto-fetch similar tracks when queue is exhausted
-    if (npRadioMode && currentTrack && currentTrack.id && !npLoadingQueueItem) {
+    if (npRadioMode && npRadioTrackId(currentTrack) && !npLoadingQueueItem) {
         npFetchRadioTracks();
     }
 }
@@ -1468,6 +1493,9 @@ const npQueuePrefetchBatchIds = new Set();
 const NP_QUEUE_PREFETCH_TERMINAL = new Set(['failed', 'not_found', 'cancelled', 'quarantined']);
 
 function npQueueIdentity(track) {
+    if (track?.lib2_track_id != null) {
+        return `lib2:${track.lib2_track_id}:${track.lib2_album_id ?? ''}:${track.release_edition_id ?? ''}:${track.profile_id ?? ''}:${track.library_owner_id ?? 'shared'}:${track.quality_profile_id ?? ''}`;
+    }
     const source = String(track?.source || track?.metadata_source || '').trim().toLowerCase();
     const sourceId = String(track?.source_track_id || track?.spotify_track_id || track?.tidal_track_id ||
         track?.deezer_id || track?.itunes_track_id || track?.musicbrainz_recording_id || track?.track_id || '').trim();
@@ -1548,11 +1576,15 @@ function npQueueStatusLabel(track) {
     }
 }
 
-function npApplyQueuePrefetchState(requestIds, state, finalPath = '', progress = 0, error = '') {
+function npApplyQueuePrefetchState(requestIds, state, finalPath = '', progress = 0, error = '', identity = {}) {
     const ids = new Set((requestIds || []).map(String));
     let changed = false;
     npQueue.forEach(track => {
         if (!ids.has(String(track?._queue_request_id || ''))) return;
+        for (const field of ['lib2_track_id', 'lib2_album_id', 'release_edition_id',
+            'quality_profile_id', 'profile_id', 'library_owner_id']) {
+            if (Object.prototype.hasOwnProperty.call(identity, field)) track[field] = identity[field];
+        }
         if (finalPath) {
             track.file_path = finalPath;
             track.filename = finalPath;
@@ -1591,6 +1623,7 @@ async function npPollQueuePrefetch() {
         const data = await response.json();
         if (!response.ok || !data.success) throw new Error(data.error || 'Queue download status unavailable');
         let changed = false;
+        let refill = false;
         Object.entries(data.batches || {}).forEach(([batchId, batch]) => {
             const tasks = Array.isArray(batch?.tasks) ? batch.tasks : [];
             tasks.forEach(task => {
@@ -1601,19 +1634,26 @@ async function npPollQueuePrefetch() {
                 if (!requestIds.length) return;
                 const state = task.quarantine_entry_id ? 'quarantined' : String(task.status || 'queued');
                 const finalPath = state === 'completed' ? String(task.final_file_path || '') : '';
+                if ((finalPath || NP_QUEUE_PREFETCH_TERMINAL.has(state)) && npQueue.some(track =>
+                    requestIds.includes(track._queue_request_id) && npQueueTrackNeedsDownload(track))) refill = true;
                 changed = npApplyQueuePrefetchState(
                     requestIds,
                     finalPath ? 'ready' : state,
                     finalPath,
                     task.progress,
                     task.error_message,
+                    info,
                 ) || changed;
             });
             const terminal = ['complete', 'error', 'cancelled'].includes(batch?.phase) &&
                 tasks.every(task => ['completed', 'failed', 'not_found', 'cancelled'].includes(task.status));
             if (terminal) npQueuePrefetchBatchIds.delete(batchId);
         });
+        // A batch the server no longer reports (another library is selected
+        // now, or it was cleaned up) can never finish here: stop asking.
+        npQueuePrefetchBatchIds.forEach(id => { if (!data.batches?.[id]) npQueuePrefetchBatchIds.delete(id); });
         if (changed) renderNpQueue();
+        if (refill) npScheduleQueuePrefetch();
         if (npQueuePrefetchBatchIds.size === 0) npStopQueuePrefetchPolling();
     } catch (error) {
         console.warn('Queue prefetch status failed:', error.message);
@@ -1623,7 +1663,10 @@ async function npPollQueuePrefetch() {
 async function npPrefetchMissingQueueTracks() {
     if (!npAutoDownloadQueue) return;
     if (npQueuePrefetchRequest) return npQueuePrefetchRequest;
-    const missing = npQueue.filter(npQueueTrackNeedsDownload);
+    // Keep a short buffer ahead of the current song. A long native artist
+    // queue must not start acquiring every release at once or overflow the
+    // backend's request limit, leaving later rows stuck in "Preparing".
+    const missing = npQueue.slice(Math.max(0, npQueueIndex)).filter(npQueueTrackNeedsDownload).slice(0, 25);
     if (!missing.length) return;
     missing.forEach(track => { track.playback_status = 'requesting'; });
     renderNpQueue();
@@ -1641,6 +1684,9 @@ async function npPrefetchMissingQueueTracks() {
                     item.request_ids || [],
                     item.state || 'queued',
                     item.final_path || '',
+                    0,
+                    item.error || '',
+                    item,
                 );
             });
             (data.batch_ids || []).forEach(id => npQueuePrefetchBatchIds.add(String(id)));
@@ -1705,6 +1751,11 @@ function npQueueHasNext() {
         : (npQueueIndex < npQueue.length - 1 || npRepeatMode === 'all');
 }
 
+// Radio endpoints read the native catalogue; player `id` can be a server id.
+function npRadioTrackId(track) {
+    return track && (track.lib2_track_id || track.id) || null;
+}
+
 function npEnsureCurrentTrackInQueue() {
     if (!currentTrack || !currentTrack.is_library || npQueue.length > 0) return;
     npQueue.push({
@@ -1716,6 +1767,11 @@ function npEnsureCurrentTrackInQueue() {
         is_library: true,
         image_url: currentTrack.image_url,
         id: currentTrack.id,
+        lib2_track_id: currentTrack.lib2_track_id || null,
+        lib2_album_id: currentTrack.lib2_album_id || null,
+        lib2_artist_id: currentTrack.lib2_artist_id || null,
+        server_track_id: currentTrack.server_track_id || null,
+        legacy_track_id: currentTrack.legacy_track_id || null,
         artist_id: currentTrack.artist_id,
         album_id: currentTrack.album_id,
         bitrate: currentTrack.bitrate,
@@ -1742,7 +1798,7 @@ function npSetRadioMode(enabled, options = {}) {
         // (non-library) track has none, so promising auto-queue would be a
         // lie. Mode stays armed either way: it engages on the next library
         // track that plays.
-        if (npRadioMode && currentTrack && !currentTrack.id) {
+        if (npRadioMode && currentTrack && !npRadioTrackId(currentTrack)) {
             showToast('Radio armed - it kicks in when a library track plays', 'info');
         } else {
             showToast(npRadioMode ? 'Radio mode on - similar tracks will auto-queue' : 'Radio mode off', 'success');
@@ -1755,7 +1811,7 @@ function npSetRadioMode(enabled, options = {}) {
     } else if (/radio/i.test(npPlayContext)) {
         npSetPlayContext('');
     }
-    if (npRadioMode && fetchIfNeeded && currentTrack && currentTrack.id && !npLoadingQueueItem && !npQueueHasNext()) {
+    if (npRadioMode && fetchIfNeeded && npRadioTrackId(currentTrack) && !npLoadingQueueItem && !npQueueHasNext()) {
         npEnsureCurrentTrackInQueue();
         npFetchRadioTracks();
     }
@@ -1990,8 +2046,10 @@ function syncExpandedPlayerUI() {
 
 // a library track: played from the library, with its db ids. streams and
 // queued downloads have nothing an issue could point at.
+// an issue names its item by Library v2 id here (api/issues snapshots lib2):
+// a player row's `id` is a server/legacy id, so only its lib2 id can report
 function npIsReportableTrack(track) {
-    return !!(track && track.is_library && track.id != null && track.id !== '' && track.artist_id != null);
+    return !!(track && track.is_library && track.lib2_track_id != null && track.lib2_track_id !== '');
 }
 
 function updateNpTrackInfo() {
@@ -2058,7 +2116,12 @@ function updateNpTrackInfo() {
         if (badgesEl) {
             badgesEl.innerHTML = '';
             const filename = currentTrack.filename || '';
-            if (filename) {
+            if (currentTrack.is_preview) {
+                const badge = document.createElement('span');
+                badge.className = 'np-format-badge preview';
+                badge.textContent = '30s preview';
+                badgesEl.appendChild(badge);
+            } else if (filename) {
                 const ext = getFileExtension(filename);
                 if (ext) {
                     let label = ext.toUpperCase();
@@ -2080,10 +2143,26 @@ function updateNpTrackInfo() {
             }
         }
 
-        // Action buttons visibility
+        // Action buttons visibility. the row shows for a track with a library
+        // artist OR one that can go on a playlist (a stream has no artist_id)
+        const npPlaylistTrack = npAddToPlaylistTrack(currentTrack);
         if (actionBtns) {
             const hasArtist = currentTrack.artist_id;
-            actionBtns.classList.toggle('hidden', !hasArtist);
+            actionBtns.classList.toggle('hidden', !hasArtist && !npPlaylistTrack);
+            const gotoArtist = document.getElementById('np-goto-artist');
+            if (gotoArtist) gotoArtist.classList.toggle('hidden', !hasArtist);
+        }
+        const addBtn = document.getElementById('np-add-to-playlist');
+        if (addBtn) {
+            addBtn.classList.toggle('hidden', !npPlaylistTrack);
+            if (!addBtn._npAddAttached) {
+                addBtn.addEventListener('click', () => {
+                    const t = npAddToPlaylistTrack(currentTrack);
+                    if (!t || typeof window.openAddToPlaylist !== 'function') return;
+                    window.openAddToPlaylist(t, addBtn);
+                });
+                addBtn._npAddAttached = true;
+            }
         }
         // reporting needs a library row to point at
         const reportBtn = document.getElementById('np-report-issue');
@@ -2094,15 +2173,16 @@ function updateNpTrackInfo() {
                     const t = currentTrack;
                     if (!npIsReportableTrack(t) || typeof window.showReportIssueModal !== 'function') return;
                     try { closeNowPlayingModal(); } catch (e) { /* the report opens either way */ }
-                    window.showReportIssueModal('track', t.id, t.title || 'Track', t.artist || '', t.album || '');
+                    window.showReportIssueModal('track', t.lib2_track_id, t.title || 'Track', t.artist || '', t.album || '');
                 });
                 reportBtn._npReportAttached = true;
             }
         }
 
         // Track recently played for radio mode
-        if (currentTrack.id && !npRecentlyPlayedIds.includes(currentTrack.id)) {
-            npRecentlyPlayedIds.push(currentTrack.id);
+        const radioTrackId = npRadioTrackId(currentTrack);
+        if (radioTrackId && !npRecentlyPlayedIds.includes(radioTrackId)) {
+            npRecentlyPlayedIds.push(radioTrackId);
             if (npRecentlyPlayedIds.length > 50) npRecentlyPlayedIds.shift();
         }
     } else {
@@ -2592,6 +2672,23 @@ function playNext(track) {
     npScheduleQueuePrefetch();
 }
 
+// a whole album onto the end of the queue: one toast, one render, not one per
+// track the way calling addToQueue in a loop did.
+function addTracksToQueue(tracks) {
+    const list = npPrepareQueueTracks((tracks || []).filter(Boolean));
+    if (!list.length) return;
+    const firstNew = npQueue.length;
+    npQueue.push(...list);
+    showToast(list.length === 1 ? 'Added to queue' : `Added ${list.length} songs to queue`, 'success');
+    renderNpQueue();
+    updateNpPrevNextButtons();
+    npScheduleQueuePrefetch();
+    // same as addToQueue: nothing playing, so start with what was just added
+    if (!currentTrack) {
+        playQueueItem(firstNew);
+    }
+}
+
 function removeFromQueue(index) {
     if (index < 0 || index >= npQueue.length) return;
     const wasCurrentTrack = (index === npQueueIndex);
@@ -2629,7 +2726,7 @@ function playNextInQueue() {
     if (npQueue.length === 0) {
         // Radio with an empty queue (e.g. cleared mid-session): a skip should
         // re-seed from the current track, not go dead.
-        if (npRadioMode && currentTrack && currentTrack.id && !npLoadingQueueItem) {
+        if (npRadioMode && npRadioTrackId(currentTrack) && !npLoadingQueueItem) {
             npEnsureCurrentTrackInQueue();
             npFetchRadioTracks(true);
         }
@@ -2655,7 +2752,7 @@ function playNextInQueue() {
             // Radio mode: a skip at the tail of the fetched batch used to do
             // nothing (more tracks only arrived when the song ENDED naturally)
             // — fetch the next batch now and advance as soon as it lands.
-            if (npRadioMode && currentTrack && currentTrack.id && !npLoadingQueueItem) {
+            if (npRadioMode && npRadioTrackId(currentTrack) && !npLoadingQueueItem) {
                 npFetchRadioTracks(true);
             }
             return;
@@ -2684,6 +2781,30 @@ function playPreviousInQueue() {
     playQueueItem(prev);
 }
 
+// a missing queue song with auto-download off was skipped. with the stream
+// source on deezer previews it plays its 30s clip instead (#1312). null
+// means no clip (another stream source, or deezer doesn't have the song),
+// and the caller skips like before.
+async function npFindQueuePreview(track, signal) {
+    try {
+        const response = await fetch('/api/enhanced-search/stream-track', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                track_name: track.title || '',
+                artist_name: track.artist || '',
+                album_name: track.album || '',
+                preview_only: true,
+            }),
+            signal,
+        });
+        const data = await response.json();
+        return (data && data.success && data.result && data.result.preview) ? data.result : null;
+    } catch (e) {
+        return null;
+    }
+}
+
 async function playQueueItem(index, options = {}) {
     const generation = npPlaybackGeneration;
     const signal = npPlaybackAbort.signal;
@@ -2702,9 +2823,14 @@ async function playQueueItem(index, options = {}) {
     npLoadingQueueItem = true;
     npQueueIndex = index;
     const track = npQueue[index];
+    let preview = null;
 
     try {
-        if (!track.file_path) {
+        if (!track.file_path && !npAutoDownloadQueue) {
+            preview = await npFindQueuePreview(track, signal);
+            if (!isCurrent()) return { status: 'superseded' };
+        }
+        if (!track.file_path && !preview) {
             setTrackInfo({
                 title: track.title,
                 artist: track.artist,
@@ -2723,7 +2849,41 @@ async function playQueueItem(index, options = {}) {
             track.is_library = true;
             if (loadingText) loadingText.textContent = 'Loading track…';
         }
-        if (track.is_library) {
+        if (preview) {
+            const previousSetup = npPlaybackSetup;
+            npPlaybackSetup = new Promise(resolve => { releaseSetup = resolve; });
+            await previousSetup;
+            if (!isCurrent()) return { status: 'superseded' };
+            await stopStream();
+            if (!isCurrent()) return { status: 'superseded' };
+            setTrackInfo({
+                title: track.title,
+                artist: track.artist,
+                album: track.album,
+                username: preview.username,
+                filename: preview.filename,
+                is_library: false,
+                is_preview: true,
+                image_url: track.image_url || preview.image_url || null,
+                artist_id: track.artist_id,
+                album_id: track.album_id,
+            });
+            showLoadingAnimation();
+            const response = await fetch(API.stream.start, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(preview),
+            });
+            const result = await response.json();
+            if (!isCurrent()) return { status: 'superseded' };
+            if (!result.success) throw new Error(result.error || 'Preview unavailable');
+            if (audioPlayer) audioPlayer.loop = (npRepeatMode === 'one');
+            const playback = await startAudioPlayback(isCurrent, signal);
+            if (playback?.status !== 'played') {
+                if (playback?.status === 'superseded') return playback;
+                throw new Error(playback?.error || 'Playback did not start');
+            }
+        } else if (track.is_library) {
             const previousSetup = npPlaybackSetup;
             npPlaybackSetup = new Promise(resolve => { releaseSetup = resolve; });
             await previousSetup;
@@ -2739,7 +2899,17 @@ async function playQueueItem(index, options = {}) {
                 is_library: true,
                 image_url: track.image_url,
                 id: track.id,
+                // A queue row can come from Library v2 (album/artist Play), and
+                // those rows address the catalogue by TYPED id — `id` is then a
+                // server/legacy id or null. Dropping them here is what left a
+                // queued v2 play without play-log attribution and with a dead
+                // "Go to artist"; playLibraryTrack has threaded them all along.
+                lib2_track_id: track.lib2_track_id || null,
+                lib2_album_id: track.lib2_album_id || null,
+                legacy_track_id: track.legacy_track_id || null,
+                server_track_id: track.server_track_id || null,
                 artist_id: track.artist_id,
+                lib2_artist_id: track.lib2_artist_id || null,
                 album_id: track.album_id,
                 bitrate: track.bitrate,
                 sample_rate: track.sample_rate
@@ -2756,8 +2926,14 @@ async function playQueueItem(index, options = {}) {
                     album: track.album || '',
                     // Server song id (Navidrome/Subsonic) so playback can fall
                     // back to streaming via the server when the file isn't on
-                    // SoulSync's disk (#809).
-                    track_id: track.id || null
+                    // SoulSync's disk (#809). A Library v2 `id` means nothing
+                    // to the media server, so only a server/legacy id may be
+                    // sent as `track_id` -- same contract as playLibraryTrack.
+                    track_id: track.server_track_id || track.legacy_track_id ||
+                        (track.lib2_track_id ? null : (track.id || null)),
+                    lib2_track_id: track.lib2_track_id || null,
+                    legacy_track_id: track.legacy_track_id || null,
+                    server_track_id: track.server_track_id || null
                 })
             });
             const result = await response.json();
@@ -2812,7 +2988,7 @@ async function playQueueItem(index, options = {}) {
 
     renderNpQueue();
     updateNpPrevNextButtons();
-    return { status: track.is_library ? 'played' : 'unsupported' };
+    return { status: (track.is_library || preview) ? 'played' : 'unsupported' };
 }
 
 function npFocusQueueAction(index, action) {
@@ -3123,7 +3299,7 @@ function npFireSleepTimer() {
 function updateNpPrevNextButtons() {
     const canPrev = npQueueIndex > 0 || (audioPlayer && audioPlayer.currentTime > 3);
     // Radio keeps next alive at the batch tail — a skip there fetches more.
-    const radioCanFetch = npRadioMode && currentTrack && currentTrack.id;
+    const radioCanFetch = npRadioMode && npRadioTrackId(currentTrack);
     const canNext = (npQueue.length > 0 && (npShuffleOn ? npQueue.length > 1 : (npQueueIndex < npQueue.length - 1 || npRepeatMode === 'all')))
         || Boolean(radioCanFetch);
 
@@ -3140,7 +3316,22 @@ function updateNpPrevNextButtons() {
     if (miniNextBtn) miniNextBtn.disabled = !canNext;
 }
 
+// what the now playing "Add to playlist" hands the picker: artist + title,
+// or null when the track has no artist to identify it by
+function npAddToPlaylistTrack(track) {
+    if (!track) return null;
+    let title = String(track.title || '');
+    const cut = title.indexOf('||');   // some titles are stored "<id>||<title>"
+    if (cut >= 0) title = title.slice(cut + 2);
+    title = title.trim();
+    const artist = String(track.artist || '').trim();
+    if (!title || !artist || artist === 'Unknown Artist') return null;
+    return { track_name: title, artist_name: artist, album_name: String(track.album || '').trim() };
+}
+
 function handlePlayerKeyboardShortcuts(event) {
+    // a popover over the player (add to playlist) owns its own keys
+    if (document.activeElement?.closest?.('[data-popover-layer]')) return;
     // Don't intercept when typing in inputs or when non-player modals are open
     const tag = document.activeElement.tagName.toLowerCase();
     if (tag === 'input' || tag === 'textarea' || tag === 'select' || document.activeElement.isContentEditable) return;
@@ -3666,7 +3857,12 @@ function npMapRadioTrack(t) {
         filename: t.file_path,
         is_library: true,
         image_url: t.image_url || null,
-        id: t.id,
+        id: t.server_track_id || t.legacy_track_id || null,
+        lib2_track_id: t.lib2_track_id || t.id,
+        lib2_album_id: t.lib2_album_id || t.album_id,
+        lib2_artist_id: t.lib2_artist_id || t.artist_id,
+        server_track_id: t.server_track_id || null,
+        legacy_track_id: t.legacy_track_id || null,
         artist_id: t.artist_id,
         album_id: t.album_id,
         bitrate: t.bitrate,
@@ -3737,16 +3933,18 @@ async function playTrackList(tracks, contextName, options = {}) {
     return await playQueueItem(0, options);
 }
 window.playTrackList = playTrackList;
+window.isQueueAutoDownloadEnabled = () => npAutoDownloadQueue;
 
 async function npFetchRadioTracks(forceAdvance = false) {
     // forceAdvance: a manual skip at the tail of the fetched batch (next
     // button / 'n' key) — the user asked for the next track, so advance as
     // soon as the new batch lands even though something is still playing.
-    if (!currentTrack || !currentTrack.id) return;
+    const trackId = npRadioTrackId(currentTrack);
+    if (!trackId) return;
     try {
         npLoadingQueueItem = true;
         const excludeIds = npRecentlyPlayedIds.join(',');
-        const resp = await fetch(`/api/library/radio?track_id=${currentTrack.id}&limit=50&exclude=${encodeURIComponent(excludeIds)}`);
+        const resp = await fetch(`/api/library/radio?track_id=${encodeURIComponent(trackId)}&limit=50&exclude=${encodeURIComponent(excludeIds)}`);
         if (!resp.ok) {
             console.warn('Radio endpoint returned', resp.status);
             npLoadingQueueItem = false;
@@ -3824,13 +4022,21 @@ function initMediaSession() {
     } catch (e) { /* some browsers don't support seekto — handlers above still work */ }
 }
 
-// Log a SoulSync play once a track has been heard ~10s (the standard "counts
-// as a play" threshold) — feeds 'recently played' + smart-radio recency.
+// Log a SoulSync play once a track has been heard ~10s — feeds 'recently
+// played' + smart-radio recency. 10s is a "play" for SoulSync's own stats,
+// but it is NOT a scrobble: the row only becomes scrobble-eligible via
+// npMaybeMarkScrobbleEligible once the Last.fm threshold is reached.
 let npPlayLogged = false;
+let npPlayId = null;
+let npPlayGeneration = 0;
 function npMaybeLogPlay() {
     if (npPlayLogged || !currentTrack || !audioPlayer) return;
+    // a 30s clip isn't a listen: it would land in recently played and
+    // smart-radio recency for a song nobody heard
+    if (currentTrack.is_preview) return;
     if (!isFinite(audioPlayer.currentTime) || audioPlayer.currentTime < 10) return;
     npPlayLogged = true;   // set first so a slow request can't double-fire
+    const gen = npPlayGeneration;   // a late response for a skipped track must not claim this track's id
     try {
         fetch('/api/library/log-play', {
             method: 'POST',
@@ -3838,13 +4044,41 @@ function npMaybeLogPlay() {
             body: JSON.stringify({
                 track: {
                     id: currentTrack.id,
+                    lib2_track_id: currentTrack.lib2_track_id || null,
+                    legacy_track_id: currentTrack.legacy_track_id || null,
+                    server_track_id: currentTrack.server_track_id || null,
                     title: currentTrack.title,
                     artist: currentTrack.artist,
                     album: currentTrack.album,
                 },
                 duration_ms: Math.round((audioPlayer.duration || 0) * 1000),
             }),
-        }).catch(() => {});   // fire-and-forget; logging must never affect playback
+        }).then(r => (r && r.ok) ? r.json() : null)
+          .then(d => { if (d && d.play_id != null && gen === npPlayGeneration) npPlayId = d.play_id; })
+          .catch(() => {});   // fire-and-forget; logging must never affect playback
+    } catch (e) { /* non-fatal */ }
+}
+
+// Mark the current play scrobble-eligible once it satisfies the Last.fm rule:
+// played for at least half the track's duration or 4 minutes, whichever comes
+// first (tracks of 30s or less never scrobble). Unknown durations (streams)
+// fall back to the 4-minute cap. Seeking past the threshold counts — this is
+// a heuristic for "actually listened", not an audit.
+let npScrobbleEligibleSent = false;
+function npMaybeMarkScrobbleEligible() {
+    if (npScrobbleEligibleSent || npPlayId == null || !currentTrack || !audioPlayer) return;
+    const dur = audioPlayer.duration;
+    const effectiveDur = (isFinite(dur) && dur > 0) ? dur : Infinity;
+    if (effectiveDur <= 30) return;
+    if (!isFinite(audioPlayer.currentTime)) return;
+    if (audioPlayer.currentTime < Math.min(effectiveDur / 2, 240)) return;
+    npScrobbleEligibleSent = true;   // set first so a slow request can't double-fire
+    try {
+        fetch('/api/library/log-play/eligible', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ play_id: npPlayId }),
+        }).catch(() => {});   // fire-and-forget; scrobbling must never affect playback
     } catch (e) { /* non-fatal */ }
 }
 

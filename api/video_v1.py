@@ -12,8 +12,13 @@ here rather than by a client.
 
 from flask import current_app, request
 
+from core.video.stats import ACTIVE_STATUSES, DOWNLOAD_STATUSES, FAILED_STATUSES, video_stats
+from utils.logging_config import get_logger
+
 from .auth import require_api_key
 from .helpers import api_error, api_success
+
+logger = get_logger("api.video_v1")
 
 VIDEO_BLUEPRINT = "video_api"
 
@@ -44,7 +49,48 @@ def _relay(view_name, *, error_code="VIDEO_ERROR", conflict_message=None):
     return api_success(payload)
 
 
+_STATUS_WORDS = ("active", "failed") + DOWNLOAD_STATUSES
+
+
+def _download_statuses(raw):
+    """?status= as a set of row statuses. None when absent, False when a word
+    is not one we know (a typo should say so, not quietly return nothing)."""
+    words = [w.strip().lower() for w in (raw or "").split(",") if w.strip()]
+    if not words:
+        return None
+    out = set()
+    for w in words:
+        if w == "active":
+            out.update(ACTIVE_STATUSES)
+        elif w == "failed":
+            out.update(FAILED_STATUSES)
+        elif w in DOWNLOAD_STATUSES:
+            out.add(w)
+        else:
+            return False
+    return out
+
+
 def register_routes(bp):
+
+    # ---- stats ----
+
+    @bp.route("/video/stats", methods=["GET"])
+    @require_api_key
+    def video_stats_view():
+        """Library, database, download and wishlist counts in one call (#1723)."""
+        if f"{VIDEO_BLUEPRINT}.video_downloads_active" not in current_app.view_functions:
+            return api_error("NOT_AVAILABLE", "The video side is not enabled on this server.", 503)
+        try:
+            from api.video import get_video_db
+            from core.profile_context import get_current_profile_id
+            from core.video.sources import resolve_video_server
+            db = get_video_db()
+            return api_success(video_stats(db, server_source=resolve_video_server(db),
+                                           profile_id=int(get_current_profile_id() or 1)))
+        except Exception:
+            logger.exception("video stats failed")
+            return api_error("VIDEO_ERROR", "Failed to load video stats.", 500)
 
     # ---- library ----
 
@@ -126,6 +172,26 @@ def register_routes(bp):
         """Body: {kind, tmdb_id}"""
         return _relay("video_watchlist_remove", error_code="WATCHLIST_ERROR")
 
+    # ---- youtube channels (followed channels live on the video watchlist) ----
+
+    @bp.route("/video/youtube/resolve", methods=["GET"])
+    @require_api_key
+    def video_youtube_channel_resolve():
+        """Preview a channel URL without committing. ?url=&limit="""
+        return _relay("video_youtube_resolve", error_code="YOUTUBE_ERROR")
+
+    @bp.route("/video/youtube/follow", methods=["POST"])
+    @require_api_key
+    def video_youtube_channel_follow():
+        """Follow a channel + wish its recent uploads. Body: {url}"""
+        return _relay("video_youtube_follow", error_code="YOUTUBE_ERROR")
+
+    @bp.route("/video/youtube/unfollow", methods=["POST"])
+    @require_api_key
+    def video_youtube_channel_unfollow():
+        """Un-follow a channel. Body: {youtube_id}"""
+        return _relay("video_youtube_unfollow", error_code="YOUTUBE_ERROR")
+
     # ---- scan ----
 
     @bp.route("/video/scan", methods=["POST"])
@@ -145,7 +211,21 @@ def register_routes(bp):
     @bp.route("/video/downloads", methods=["GET"])
     @require_api_key
     def video_downloads_active():
-        return _relay("video_downloads_active")
+        """The download list, active rows first then newest. ?status= takes one
+        status or a comma list; active and failed are shorthand for their group."""
+        wanted = _download_statuses(request.args.get("status"))
+        if wanted is False:
+            return api_error("BAD_REQUEST", "status must be one or more of: "
+                             + ", ".join(_STATUS_WORDS) + ".", 400)
+        if not wanted:
+            return _relay("video_downloads_active")
+        payload, status = _call("video_downloads_active")
+        if payload is None:
+            return api_error("NOT_AVAILABLE", "The video side is not enabled on this server.", 503)
+        if status >= 400:
+            return api_error("VIDEO_ERROR", payload.get("error") or "Request failed.", status)
+        rows = [r for r in payload.get("downloads") or [] if r.get("status") in wanted]
+        return api_success({"downloads": rows, "count": len(rows)})
 
     @bp.route("/video/downloads/status", methods=["GET"])
     @require_api_key
