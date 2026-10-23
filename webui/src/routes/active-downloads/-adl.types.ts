@@ -39,6 +39,7 @@ export interface AdlDownload {
   progress: number;
   error: string | null;
   verification_status: string | null;
+  metadata_status?: string | null;
   batch_id: string;
   batch_name: string;
   batch_source: string;
@@ -75,6 +76,16 @@ export interface AdlDownload {
   download_source?: string;
   /** In-flight rows only — what the engine is doing right now (#1156). */
   live_detail?: AdlLiveDetail;
+
+  /** The artist's photo from the library or watchlist (core/downloads/row_art.py). */
+  artist_image?: string;
+  /** History rows only: 'download' | 'podcast' (library_history.event_type). */
+  event_type?: string;
+  /** History rows only: what acoustid said about the file. */
+  acoustid_result?: string;
+  /** History rows only: what we asked for, to show beside what we got. */
+  expected_title?: string;
+  expected_artist?: string;
 }
 
 /**
@@ -132,6 +143,18 @@ export interface AdlTaskDetail {
   thumb_url: string;
   expected: { title?: string; artist?: string };
   downloaded: { title?: string; artist?: string; album?: string };
+  /** why the search took what it took, or why nothing passed. */
+  decision?: AdlDecision | null;
+}
+
+/** core/downloads/track_detail.py _decision_payload. */
+export interface AdlDecision {
+  outcome?: string;
+  accepted_total?: number;
+  rejected_total?: number;
+  rejected_counts?: Record<string, number>;
+  search_mode?: string;
+  searched_at?: string;
 }
 
 /** One live batch. `album_bundle` is present only for release downloads. */
@@ -211,6 +234,15 @@ export interface AdlReviewSummary {
 
 /** A quarantined file plus its sidecar. */
 export interface AdlQuarantineEntry {
+  library_status?: 'present' | 'missing' | 'unknown';
+  library_match?: {
+    album: string;
+    filename: string;
+    quality: string;
+    verification_status: string;
+  } | null;
+  /** Only tracks added by the album_tracks expansion carry this provenance. */
+  album_extra?: { album: string; download_source: string } | null;
   id: string;
   filename: string;
   original_filename: string;
@@ -265,6 +297,8 @@ export interface ClientTorrentItem {
   seeding_time?: number | null;
   save_path?: string | null;
   content_path?: string | null;
+  /** the client's own category (qbittorrent category, transmission/deluge label). */
+  category?: string | null;
   error?: string | null;
   /** present when SoulSync itself dispatched this item. */
   soulsync?: { kind?: string; title?: string };

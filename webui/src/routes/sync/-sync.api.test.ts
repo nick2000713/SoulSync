@@ -207,11 +207,25 @@ describe('page-level endpoints', () => {
   it('account sync status + arl status hit the account endpoints', async () => {
     stubFetch({ status: 'syncing' });
     await fetchAccountSyncStatus('deezer_arl_9');
+    await fetchAccountSyncStatus('deezer_arl_9', { probe: true });
     await fetchDeezerArlStatus();
     expect(calls.map((c) => c.url)).toEqual([
       '/api/sync/status/deezer_arl_9',
+      '/api/sync/status/deezer_arl_9?probe=1',
       '/api/deezer/arl-status',
     ]);
+  });
+
+  it('#1613: buildMirrorPayload sends source_skipped only when the source set it', () => {
+    expect(buildMirrorPayload('deezer', 5, 'L', [])).not.toHaveProperty('source_skipped');
+    expect(buildMirrorPayload('tidal', 5, 'L', [], { source_skipped: null })).toHaveProperty(
+      'source_skipped',
+      null,
+    );
+    expect(
+      buildMirrorPayload('tidal', 5, 'L', [], { source_skipped: { unavailable: 29 } })
+        .source_skipped,
+    ).toEqual({ unavailable: 29 });
   });
 
   it('postMirrorPlaylist ships a buildMirrorPayload body verbatim', async () => {
@@ -436,6 +450,12 @@ describe('Auto-Sync pipeline endpoints (auto-sync.js 2467-2497)', () => {
     stubFetch({ state: { status: 'running', progress: 0 } });
     await runMirroredPipeline(7, { refreshOnly: true });
     expect(calls[0]).toMatchObject({ method: 'POST', body: { refresh_only: true } });
+  });
+
+  it.each([false, true])('preserves the explicit skipWishlist choice: %s', async (skipWishlist) => {
+    stubFetch({ state: { status: 'running' } });
+    await runMirroredPipeline(7, { skipWishlist });
+    expect(calls[0]).toMatchObject({ method: 'POST', body: { skip_wishlist: skipWishlist } });
   });
 
   it('status GETs, and the whole body IS the state', async () => {

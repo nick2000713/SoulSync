@@ -102,7 +102,7 @@ export function DiscographyModal({
   editionSuperseded?: Set<unknown>;
   onClose: () => void;
   /** canonical identity for the watchlist add; null hides the combined button */
-  watchlistIdentity?: { id: unknown; name: string } | null;
+  watchlistIdentity?: { id: unknown; name: string; source?: string } | null;
 }) {
   const [data, setData] = useState<DiscogModalData | null>(null);
   const [filters, setFilters] = useState<DiscogFilters>(DISCOG_DEFAULT_FILTERS);
@@ -247,7 +247,12 @@ export function DiscographyModal({
     await runStream(entries, visibleChecked, (finished) => {
       setTotals(finished);
       if (!settings || !watchlistIdentity) return;
-      void watchArtistWithSettings(watchlistIdentity.id, watchlistIdentity.name, settings)
+      void watchArtistWithSettings(
+        watchlistIdentity.id,
+        watchlistIdentity.name,
+        settings,
+        watchlistIdentity.source,
+      )
         .then(({ message }) => {
           setWatchNote(`👁 Watching ${watchlistIdentity.name}${message ? ` — ${message}` : ''}`);
           if (typeof window.updateWatchlistCount === 'function') window.updateWatchlistCount();
@@ -434,6 +439,7 @@ export function DiscographyModal({
                     ['include_acoustic', 'Acoustic'],
                     ['include_compilations', 'Compilations'],
                     ['include_instrumentals', 'Instrumentals'],
+                    ['include_other_artists', 'Other artists'],
                   ]}
                   future={future}
                   onToggle={(key) => setFuture((prev) => ({ ...prev, [key]: !prev[key] }))}

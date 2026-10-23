@@ -1,5 +1,5 @@
 import { createMemoryHistory } from '@tanstack/react-router';
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AppRouterProvider, createAppRouter } from '@/app/router';
@@ -24,19 +24,34 @@ function albumRow(artist: string, album: string, name: string, retry = 0) {
   };
 }
 
+/** The server's answer to "which of these artists are filed as audiobooks". */
+async function routedAnswer(input: RequestInfo | URL, routed: string[]) {
+  const body = (await (input as Request).clone().json()) as { names?: string[] };
+  return res({ success: true, routed: (body.names ?? []).filter((name) => routed.includes(name)) });
+}
+
 function stubFetch(
-  opts: { total?: number; albums?: unknown[]; singles?: unknown[]; processing?: boolean } = {},
+  opts: {
+    total?: number;
+    albums?: unknown[];
+    singles?: unknown[];
+    processing?: boolean;
+    /** Artists the server reports as filed under audiobooks. */
+    routed?: string[];
+  } = {},
 ) {
   const {
     albums = [albumRow('Aphex Twin', 'SAW', 'Xtal')],
     singles = [],
     processing = false,
+    routed = [],
   } = opts;
   const total = opts.total ?? albums.length + singles.length;
   vi.stubGlobal(
     'fetch',
     vi.fn(async (input: RequestInfo | URL) => {
       const url = input instanceof Request ? input.url : String(input);
+      if (url.includes('/api/audiobook-routes/check')) return routedAnswer(input, routed);
       if (url.includes('/api/wishlist/stats'))
         return res({
           total,
@@ -93,9 +108,10 @@ describe('wishlist route', () => {
     // ...whose album fan is NOT mounted until the orb is opened — a
     // 400-track wishlist used to render every track row on first paint
     // (perf sweep, Aug 2026). Expanding mounts the single grouped tile.
-    expect(document.querySelectorAll('.wl-album-tile')).toHaveLength(0);
+    // the artist panel only exists once an orb is opened
+    expect(document.querySelectorAll('.wlp-sheet-album')).toHaveLength(0);
     fireEvent.click(document.querySelector('.wl-orb')!);
-    expect(document.querySelectorAll('.wl-album-tile')).toHaveLength(1);
+    expect(document.querySelectorAll('.wlp-sheet-album')).toHaveLength(1);
     expect(screen.getByText('Album Tracks')).toBeInTheDocument();
     // cycle 'albums' renders as the friendly label
     expect(screen.getByText('Albums/EPs')).toBeInTheDocument();
@@ -109,11 +125,14 @@ describe('wishlist route', () => {
     expect(screen.queryByText('Album Tracks')).not.toBeInTheDocument();
   });
 
-  it('marks an artist as failing once a track hits the threshold', async () => {
+  it('marks an artist as stuck once a track hits the threshold', async () => {
     stubFetch({ albums: [albumRow('Aphex Twin', 'SAW', 'Xtal', 4)] });
     renderRoute();
 
-    await waitFor(() => expect(screen.getByText(/1 failing/)).toBeInTheDocument());
+    // the orb names its tries and files the artist under a trouble zone
+    await waitFor(() => expect(screen.getByText('4 tries')).toBeInTheDocument());
+    expect(document.querySelector('.wl-orb-meta--stuck')).toBeTruthy();
+    expect(document.querySelector('.wlp-zone--hunting')).toBeNull();
   });
 
   it('does not mark failing below the threshold', async () => {
@@ -122,9 +141,11 @@ describe('wishlist route', () => {
 
     await waitFor(() => expect(screen.getAllByText('Aphex Twin').length).toBeGreaterThan(0));
     expect(screen.queryByText(/failing/)).not.toBeInTheDocument();
+    expect(document.querySelector('.wl-orb-meta--stuck')).toBeNull();
+    expect(document.querySelector('.wlp-zone--hunting')).toBeTruthy();
   });
 
-  it('expands one orb at a time and reveals its album fan', async () => {
+  it('opens one artist panel at a time', async () => {
     stubFetch({
       albums: [
         albumRow('Aphex Twin', 'SAW', 'Xtal'),
@@ -139,15 +160,97 @@ describe('wishlist route', () => {
 
     fireEvent.click(orbs()[0].querySelector('.wl-orb')!);
     expect(orbs()[0].classList.contains('expanded')).toBe(true);
+    expect(screen.getByRole('complementary', { name: 'Aphex Twin on the wishlist' })).toBeTruthy();
+    // the nebula lifts above the sticky command bar while a panel floats
+    expect(document.querySelector('.wl-nebula.has-sheet')).toBeTruthy();
 
     // Accordion: opening the second closes the first.
     fireEvent.click(orbs()[1].querySelector('.wl-orb')!);
     expect(orbs()[0].classList.contains('expanded')).toBe(false);
     expect(orbs()[1].classList.contains('expanded')).toBe(true);
 
+    expect(document.querySelectorAll('.wlp-sheet')).toHaveLength(1);
+    expect(
+      screen.getByRole('complementary', { name: 'Boards of Canada on the wishlist' }),
+    ).toBeTruthy();
+
     // Clicking the open one closes it.
     fireEvent.click(orbs()[1].querySelector('.wl-orb')!);
     expect(orbs()[1].classList.contains('expanded')).toBe(false);
+    expect(document.querySelector('.wlp-sheet')).toBeNull();
+    expect(document.querySelector('.wl-nebula.has-sheet')).toBeNull();
+
+    // and the panel's own close button does the same
+    fireEvent.click(orbs()[0].querySelector('.wl-orb')!);
+    fireEvent.click(screen.getByLabelText('Close artist panel'));
+    expect(document.querySelector('.wlp-sheet')).toBeNull();
+    expect(orbs()[0].classList.contains('expanded')).toBe(false);
+
+    // escape closes it, and so does a tap on the backdrop (tablet / phone)
+    fireEvent.click(orbs()[0].querySelector('.wl-orb')!);
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(document.querySelector('.wlp-sheet')).toBeNull();
+    fireEvent.click(orbs()[0].querySelector('.wl-orb')!);
+    fireEvent.click(document.querySelector('.wlp-sheet-scrim')!);
+    expect(document.querySelector('.wlp-sheet')).toBeNull();
+
+    // a hidden dialog the shell keeps in the page (the profile picker is one)
+    // must not swallow escape: that broke it in the real app
+    const parked = document.createElement('div');
+    parked.setAttribute('role', 'dialog');
+    parked.hidden = true;
+    document.body.appendChild(parked);
+    fireEvent.click(orbs()[0].querySelector('.wl-orb')!);
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(document.querySelector('.wlp-sheet')).toBeNull();
+    parked.remove();
+    // nor one parked faded out (the track detail overlay: opacity 0, no pointer events)
+    const faded = document.createElement('div');
+    faded.style.opacity = '0';
+    faded.style.pointerEvents = 'none';
+    faded.innerHTML = '<div role="dialog" aria-modal="true"></div>';
+    document.body.appendChild(faded);
+    fireEvent.click(orbs()[0].querySelector('.wl-orb')!);
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(document.querySelector('.wlp-sheet')).toBeNull();
+    faded.remove();
+
+    // but not while a dialog opened from the panel is the thing being closed
+    fireEvent.click(orbs()[0].querySelector('.wl-orb')!);
+    const dialog = document.createElement('div');
+    dialog.setAttribute('role', 'dialog');
+    document.body.appendChild(dialog);
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(document.querySelector('.wlp-sheet')).toBeTruthy();
+    dialog.remove();
+  });
+
+  it('files artists into zones by what went wrong, worst first', async () => {
+    const stuck = (artist: string, reason: string) => ({
+      ...albumRow(artist, `${artist} LP`, 'Song', 4),
+      failure_reason: reason,
+    });
+    stubFetch({
+      albums: [
+        albumRow('Healthy', 'Fine', 'Waiting', 0),
+        stuck('Nomatch', 'No matching track found'),
+        stuck(
+          'Clipped',
+          'File integrity check failed: Incomplete audio: only ~30s actually decodes of a 234s file (13%)',
+        ),
+      ],
+    });
+    renderRoute();
+
+    await waitFor(() => expect(document.querySelectorAll('.wlp-zone')).toHaveLength(3));
+    const zones = [...document.querySelectorAll('.wlp-zone')].map((z) =>
+      z.getAttribute('aria-label'),
+    );
+    expect(zones).toEqual(['Downloaded, then rejected', 'No match found', 'Still hunting']);
+
+    // the panel explains the rejection in words, not the raw log line
+    fireEvent.click(document.querySelector('[data-artist="Clipped"] .wl-orb')!);
+    expect(screen.getByRole('note')).toHaveTextContent('Only ~30s of 3:54 actually played');
   });
 
   it('opening the artist link does not also expand the orb', async () => {
@@ -215,17 +318,9 @@ describe('wishlist route', () => {
     await waitFor(() => expect(document.querySelector('.wl-orb')).toBeTruthy());
     fireEvent.click(document.querySelector('.wl-orb')!);
 
-    const tile = document.querySelector('.wl-album-tile')!;
-    expect(tile.classList.contains('tile-expanded')).toBe(false);
-
     fireEvent.click(screen.getByLabelText('Remove album SAW'));
     await waitFor(() => expect(calls.some((u) => u.includes('remove-album'))).toBe(true));
     expect(window.showConfirmDialog).toHaveBeenCalled();
-    // The remove button sits INSIDE the clickable tile, so it must not also
-    // toggle the tile open — that is what its stopPropagation is for.
-    expect(document.querySelector('.wl-album-tile')!.classList.contains('tile-expanded')).toBe(
-      false,
-    );
 
     // Track removal is deliberately confirm-free, matching the vanilla handler.
     const confirmCallsBefore = (window.showConfirmDialog as ReturnType<typeof vi.fn>).mock.calls
@@ -274,12 +369,12 @@ describe('wishlist route', () => {
     window._nebulaDownload = vi.fn();
     renderRoute();
 
-    await waitFor(() =>
-      expect(screen.getByRole('button', { name: 'Ignored' })).toBeInTheDocument(),
-    );
-    fireEvent.click(screen.getByRole('button', { name: 'Ignored' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Cleanup' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Clear All' }));
+    // the three rare jobs live behind the ⋯ menu; each pick closes it
+    const more = await screen.findByRole('button', { name: 'More wishlist actions' });
+    for (const name of ['Ignored', 'Cleanup', 'Clear All']) {
+      fireEvent.click(more);
+      fireEvent.click(screen.getByRole('menuitem', { name }));
+    }
     fireEvent.click(screen.getByRole('button', { name: 'Download Wishlist' }));
 
     // These own module-scoped state (activeDownloadProcesses, WishlistModalState),
@@ -341,6 +436,7 @@ describe('wishlist route', () => {
       vi.fn(async (i: RequestInfo | URL) => {
         const url = i instanceof Request ? i.url : String(i);
         calls.push(url);
+        if (url.includes('/api/audiobook-routes/check')) return routedAnswer(i, []);
         if (url.includes('/api/wishlist/stats'))
           return res({ total: 1, albums: 1, singles: 0, next_run_in_seconds: 600 });
         if (url.includes('/api/wishlist/cycle')) return res({ cycle: 'albums' });
@@ -365,17 +461,159 @@ describe('wishlist route', () => {
     });
   });
 
-  it('keeps the audiobook tab on its original presentation', async () => {
+  it('gives the audiobook tab the same premier presentation as music', async () => {
     stubFetch();
+    // The shared stub doesn't know the audiobook wishlist endpoint; wrap it
+    // so the hero renders with real counts, not just its empty shell.
+    const base = globalThis.fetch as unknown as (
+      i: RequestInfo | URL,
+      init?: RequestInit,
+    ) => Promise<Response>;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (i: RequestInfo | URL, init?: RequestInit) => {
+        const url = i instanceof Request ? i.url : String(i);
+        if (url.includes('/api/audiobooks/wishlist'))
+          return res({
+            success: true,
+            items: [],
+            counts: {
+              total: 3,
+              wanted: 1,
+              searching: 0,
+              grabbed: 1,
+              done: 1,
+              failed: 1,
+              cancelled: 0,
+            },
+            worker: {
+              retry_after_seconds: 21600,
+              batch_size: 5,
+              action_type: 'audiobook_process_wishlist',
+              automation_name: 'Auto-Process Audiobook Wishlist',
+            },
+          });
+        return base(i, init);
+      }),
+    );
     renderRoute(['/wishlist?media=audiobooks']);
 
-    // Legacy header, not the music hero: the star title and the count meta.
+    // Same wlp hero as the music tab, not the legacy header.
+    await waitFor(() => expect(document.querySelector('.wlp-hero')).toBeInTheDocument());
+    expect(document.querySelector('.wishlist-page-title')).not.toBeInTheDocument();
+    // The hero is wired to the live counts: stats strip + automation card.
     await waitFor(() =>
-      expect(document.querySelector('.wishlist-page-title')?.textContent).toContain('Wishlist'),
+      expect(document.querySelector('.wlp-stats')?.textContent).toContain('Not Found Yet'),
     );
-    expect(document.querySelector('.wlp-hero')).not.toBeInTheDocument();
-    // Its original Clear All action is still there.
+    expect(document.querySelector('.wlp-stats')?.textContent).toContain('In Library');
+    expect(document.querySelector('.wlp-nextrun')?.textContent).toContain(
+      'Auto-Process Audiobook Wishlist',
+    );
+    // A failed title raises the triage banner, like failing tracks do on music.
+    expect(screen.getByRole('alert')).toHaveTextContent('1 title not found yet');
+    // Its Clear All action is still there.
     expect(screen.getByRole('button', { name: 'Clear All' })).toBeInTheDocument();
+  });
+
+  describe('artists filed as audiobooks', () => {
+    const albums = [
+      albumRow('Aphex Twin', 'SAW', 'Xtal'),
+      albumRow('Aphex Twin', 'SAW', 'Ageispolis'),
+      albumRow('Bobby & Max', 'Folge 93', 'Teil 1'),
+      albumRow('Bobby & Max', 'Folge 93', 'Teil 2'),
+      albumRow('Bobby & Max', 'Folge 93', 'Teil 3'),
+    ];
+
+    it('leaves them out of the music tab and its counts', async () => {
+      stubFetch({ albums, routed: ['Bobby & Max'] });
+      renderRoute();
+
+      await waitFor(() => expect(screen.getAllByText('Aphex Twin').length).toBeGreaterThan(0));
+      await waitFor(() =>
+        expect(document.querySelector('.wishlist-page-count')?.textContent).toBe('2 tracks'),
+      );
+      expect(screen.queryByText('Bobby & Max')).not.toBeInTheDocument();
+      expect(document.querySelectorAll('.wl-orb-group')).toHaveLength(1);
+      expect(document.getElementById('wishlist-stat-albums')?.textContent).toBe('2');
+    });
+
+    it('lists them under the audiobook tab instead', async () => {
+      stubFetch({ albums, routed: ['Bobby & Max'] });
+      const base = globalThis.fetch as unknown as (i: RequestInfo | URL) => Promise<Response>;
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (i: RequestInfo | URL) => {
+          const url = i instanceof Request ? i.url : String(i);
+          if (url.includes('/api/audiobooks/wishlist')) {
+            return res({ success: true, items: [], counts: {}, worker: {} });
+          }
+          return base(i);
+        }),
+      );
+      renderRoute(['/wishlist?media=audiobooks']);
+
+      const section = await waitFor(() => {
+        const found = document.querySelector('.wlp-routed');
+        expect(found).toBeInTheDocument();
+        return found as HTMLElement;
+      });
+      expect(section.textContent).toContain('Bobby & Max');
+      expect(section.textContent).toContain('3 tracks');
+      expect(section.textContent).not.toContain('Aphex Twin');
+    });
+
+    it('"Search now" on the audiobook tab also sends them to downloads', async () => {
+      const bulkCalls: { action: string; ids: string[] }[] = [];
+      let passes = 0;
+      stubFetch({ albums, routed: ['Bobby & Max'] });
+      const base = globalThis.fetch as unknown as (i: RequestInfo | URL) => Promise<Response>;
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (i: RequestInfo | URL) => {
+          const url = i instanceof Request ? i.url : String(i);
+          if (url.includes('/api/audiobooks/wishlist/search')) {
+            passes += 1;
+            return res({ success: true, summary: { checked: 0, grabbed: 0 } });
+          }
+          if (url.includes('/api/audiobooks/wishlist')) {
+            return res({ success: true, items: [], counts: {}, worker: {} });
+          }
+          if (url.includes('wishlist/bulk')) {
+            const body = (await (i as Request).json()) as { action: string; track_ids: string[] };
+            bulkCalls.push({ action: body.action, ids: body.track_ids });
+            return res({
+              success: true,
+              results: body.track_ids.map((id) => ({ id, ok: true, message: 'Queued' })),
+            });
+          }
+          return base(i);
+        }),
+      );
+      renderRoute(['/wishlist?media=audiobooks']);
+      await waitFor(() => expect(document.querySelector('.wlp-routed')).toBeInTheDocument());
+
+      fireEvent.click(screen.getByRole('button', { name: 'Search now' }));
+
+      await waitFor(() => expect(bulkCalls).toHaveLength(1));
+      // the audiobook pass still runs, and ONLY the audio plays are grabbed
+      expect(passes).toBe(1);
+      expect(bulkCalls[0].action).toBe('grab');
+      expect(bulkCalls[0].ids).toEqual([
+        'Bobby & Max-Folge 93-Teil 1',
+        'Bobby & Max-Folge 93-Teil 2',
+        'Bobby & Max-Folge 93-Teil 3',
+      ]);
+      await waitFor(() =>
+        expect(document.body.textContent).toContain('Sent 3 of 3 tracks from the music search'),
+      );
+    });
+
+    it('shows no audiobook section when no artist is filed there', async () => {
+      stubFetch({ albums, routed: [] });
+      renderRoute(['/wishlist?media=audiobooks']);
+      await waitFor(() => expect(document.querySelector('.wlp-hero')).toBeInTheDocument());
+      expect(document.querySelector('.wlp-routed')).not.toBeInTheDocument();
+    });
   });
 
   it('redirects away when the profile may not see the wishlist', async () => {
@@ -429,7 +667,76 @@ describe('wishlist route', () => {
     expect(bulkCalls[0].ids).toEqual(['Aphex Twin-SAW-Xtal']);
   });
 
-  it('grabs a whole artist and a single album from the orb fan', async () => {
+  it('a zone retries only its own stuck tracks, the panel only its artist', async () => {
+    const bulkCalls: { action: string; ids: string[] }[] = [];
+    stubFetch({
+      albums: [
+        { ...albumRow('Lost One', 'A', 'x', 4), failure_reason: 'No matching track found' },
+        { ...albumRow('Lost Two', 'B', 'y', 5), failure_reason: 'No matching track found' },
+        {
+          ...albumRow('Bad File', 'C', 'z', 4),
+          failure_reason: 'AcoustID verification failed: Audio mismatch',
+        },
+        albumRow('Calm', 'D', 'w', 0),
+      ],
+    });
+    const base = globalThis.fetch as unknown as (
+      i: RequestInfo | URL,
+      init?: RequestInit,
+    ) => Promise<Response>;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (i: RequestInfo | URL, init?: RequestInit) => {
+        const url = i instanceof Request ? i.url : String(i);
+        if (url.includes('wishlist/bulk')) {
+          const body = (await (i as Request).json()) as { action: string; track_ids: string[] };
+          bulkCalls.push({ action: body.action, ids: body.track_ids });
+          return res({
+            success: true,
+            results: body.track_ids.map((id) => ({ id, ok: true, message: 'Retrying' })),
+          });
+        }
+        return base(i, init);
+      }),
+    );
+    renderRoute();
+
+    await waitFor(() => expect(screen.getByText('Retry all 2')).toBeInTheDocument());
+    // the healthy zone has nothing to retry
+    expect(document.querySelector('.wlp-zone--hunting .wlp-zone-retry')).toBeNull();
+
+    fireEvent.click(screen.getByText('Retry all 2'));
+    await waitFor(() => expect(bulkCalls).toHaveLength(1));
+    expect(bulkCalls[0]).toEqual({ action: 'retry', ids: ['Lost One-A-x', 'Lost Two-B-y'] });
+
+    fireEvent.click(document.querySelector('[data-artist="Bad File"] .wl-orb')!);
+    const panel = screen.getByRole('complementary', { name: 'Bad File on the wishlist' });
+    fireEvent.click(within(panel).getByText('Retry now'));
+    await waitFor(() => expect(bulkCalls).toHaveLength(2));
+    expect(bulkCalls[1]).toEqual({ action: 'retry', ids: ['Bad File-C-z'] });
+  });
+
+  it('the list view splits into the same zones', async () => {
+    window.localStorage.setItem('wishlistView', 'list');
+    stubFetch({
+      albums: [
+        { ...albumRow('Lost One', 'A', 'x', 4), failure_reason: 'No matching track found' },
+        albumRow('Calm', 'D', 'w', 0),
+      ],
+    });
+    try {
+      renderRoute();
+
+      await waitFor(() => expect(document.querySelectorAll('.wl-list-zone')).toHaveLength(2));
+      expect(
+        [...document.querySelectorAll('.wl-list-zone .wlp-zone-title')].map((z) => z.textContent),
+      ).toEqual(['No match found', 'Still hunting']);
+    } finally {
+      window.localStorage.removeItem('wishlistView');
+    }
+  });
+
+  it('grabs a whole artist and a single album from the artist panel', async () => {
     const bulkCalls: { action: string; ids: string[] }[] = [];
     stubFetch({
       albums: [albumRow('Aphex Twin', 'SAW', 'Xtal'), albumRow('Aphex Twin', 'SAW', 'Ageispolis')],

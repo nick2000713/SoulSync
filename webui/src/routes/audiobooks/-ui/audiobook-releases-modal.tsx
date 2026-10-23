@@ -1,5 +1,9 @@
+import type { FormEvent } from 'react';
+
 import { Link } from '@tanstack/react-router';
 import { useEffect, useMemo, useRef, useState } from 'react';
+
+import { EmptyState, Spinner } from '@/components/primitives';
 
 import type { AudiobookReleaseContents } from '../-audiobooks.api';
 import type { AudiobookDownload } from '../-audiobooks.types';
@@ -82,6 +86,13 @@ export function AudiobookReleasesModal({ asin, title, onClose }: AudiobookReleas
   const [grabbedRefs, setGrabbedRefs] = useState<Record<string, string>>({});
   const [downloads, setDownloads] = useState<Record<string, AudiobookDownload>>({});
   const jobRef = useRef('');
+  // What the search box holds, and what was last searched. An empty query is
+  // the automatic search. `run` re-runs the same query when asked again.
+  const [draft, setDraft] = useState('');
+  const [query, setQuery] = useState('');
+  const [defaultQuery, setDefaultQuery] = useState('');
+  const [run, setRun] = useState(0);
+  const draftTouched = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -93,7 +104,7 @@ export function AudiobookReleasesModal({ asin, title, onClose }: AudiobookReleas
     setStage('Starting the search');
 
     void (async () => {
-      const job = await startReleaseSearch(asin);
+      const job = await startReleaseSearch(asin, query);
       if (cancelled) return;
       if (!job) {
         setLoading(false);
@@ -101,6 +112,11 @@ export function AudiobookReleasesModal({ asin, title, onClose }: AudiobookReleas
         return;
       }
       jobRef.current = job.id;
+      if (job.defaultQuery) {
+        setDefaultQuery(job.defaultQuery);
+        // fill the box once, and never over something the user is typing
+        if (!draftTouched.current) setDraft(job.defaultQuery);
+      }
 
       const tick = async () => {
         if (cancelled) return;
@@ -138,7 +154,23 @@ export function AudiobookReleasesModal({ asin, title, onClose }: AudiobookReleas
       if (jobRef.current) void cancelReleaseSearch(jobRef.current);
       jobRef.current = '';
     };
-  }, [asin]);
+  }, [asin, query, run]);
+
+  const submitQuery = (event: FormEvent) => {
+    event.preventDefault();
+    const typed = draft.trim();
+    // the automatic search is more than its first query, so asking for exactly
+    // that runs the automatic search rather than a narrower copy of it
+    setQuery(typed === defaultQuery ? '' : typed);
+    setRun((n) => n + 1);
+  };
+
+  const resetQuery = () => {
+    draftTouched.current = false;
+    setDraft(defaultQuery);
+    setQuery('');
+    setRun((n) => n + 1);
+  };
 
   const grab = async (release: AudiobookReleaseCandidate) => {
     const key = rowKey(release);
@@ -150,7 +182,13 @@ export function AudiobookReleasesModal({ asin, title, onClose }: AudiobookReleas
     if (result.ok && result.ref) {
       setGrabbedRefs((prev) => ({ ...prev, [key]: result.ref }));
     }
-    setMessage(result.ok ? 'Sent to your download client.' : result.error || 'Grab failed.');
+    setMessage(
+      !result.ok
+        ? result.error || 'Grab failed.'
+        : result.adopted
+          ? 'Already in your download client. Picking it up from there, and it imports once complete.'
+          : 'Sent to your download client.',
+    );
   };
 
   /**
@@ -299,12 +337,46 @@ export function AudiobookReleasesModal({ asin, title, onClose }: AudiobookReleas
           </button>
         </header>
 
+        <form className={styles.querySearch} onSubmit={submitQuery} role="search">
+          <input
+            type="search"
+            className={styles.queryInput}
+            value={draft}
+            onChange={(event) => {
+              draftTouched.current = true;
+              setDraft(event.target.value);
+            }}
+            aria-label="Search query"
+            placeholder="Search your indexers"
+            maxLength={200}
+          />
+          <button type="submit" className={styles.queryButton}>
+            Search
+          </button>
+          {query && (
+            <button type="button" className={styles.queryReset} onClick={resetQuery}>
+              Reset
+            </button>
+          )}
+        </form>
+        {query && (
+          <p className={styles.queryNote}>
+            Searching for exactly what you typed, so results are not checked against this
+            book&apos;s title. Make sure a release is the book before you download it.
+          </p>
+        )}
+
         {message && (
           <p className={styles.modalMessage}>
             {message}
             {/* A grab with no way to go and watch it is a dead end. */}
             {grabbed && (
-              <Link to="/active-downloads" className={styles.modalMessageLink} onClick={onClose}>
+              <Link
+                to="/active-downloads"
+                search={{ media: 'music' }}
+                className={styles.modalMessageLink}
+                onClick={onClose}
+              >
                 View downloads
               </Link>
             )}
@@ -321,29 +393,34 @@ export function AudiobookReleasesModal({ asin, title, onClose }: AudiobookReleas
               role="status"
               aria-live="polite"
             >
-              <span className={styles.spinner} aria-hidden="true" />
+              <Spinner size={18} />
               {stage || 'Searching your indexers…'}
             </div>
           )}
 
           {!loading && searchError && (
-            <div className={styles.emptyState}>
-              <h3>The search could not finish</h3>
-              <p>{searchError}</p>
+            <EmptyState
+              className={styles.emptyState}
+              title="The search could not finish"
+              description={searchError}
+            >
               <p>
                 That is a source failing, not proof the book is unavailable, so nothing has been
                 added to your wishlist.
               </p>
-            </div>
+            </EmptyState>
           )}
 
           {!loading && !searchError && releases.length === 0 ? (
-            <div className={styles.emptyState}>
-              <h3>Nothing found</h3>
-              <p>
-                No indexer has this one right now. Add it to your wishlist and it will keep looking
-                on its own.
-              </p>
+            <EmptyState
+              className={styles.emptyState}
+              title="Nothing found"
+              description={
+                query
+                  ? 'Nothing matched that search. Try fewer words, or reset to the automatic search.'
+                  : 'No indexer has this one right now. Add it to your wishlist and it will keep looking on its own.'
+              }
+            >
               <button
                 type="button"
                 className={styles.emptyAction}
@@ -352,7 +429,7 @@ export function AudiobookReleasesModal({ asin, title, onClose }: AudiobookReleas
               >
                 {wishlisting ? 'Adding…' : 'Add to wishlist'}
               </button>
-            </div>
+            </EmptyState>
           ) : (
             <ul className={styles.releaseList}>
               {ordered.map((release) => {

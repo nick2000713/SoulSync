@@ -132,6 +132,7 @@ describe('addArtistToWatchlist', () => {
       include_acoustic: false,
       include_compilations: false,
       include_instrumentals: false,
+      include_other_artists: false,
       auto_download_pref: 'on',
     });
     expect(seen.map((s) => s.url)).toEqual([
@@ -142,5 +143,34 @@ describe('addArtistToWatchlist', () => {
     expect(config.include_eps).toBe(false);
     expect(config.include_live).toBe(true);
     expect(config.auto_download_pref).toBe('on');
+  });
+
+  it('passes the source on to the add', async () => {
+    const bodies: unknown[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input) === '/api/watchlist/add') bodies.push(JSON.parse(String(init?.body)));
+        return new Response(JSON.stringify({ success: true }));
+      }),
+    );
+    await addArtistToWatchlist(
+      '262836961',
+      'Adele',
+      {
+        include_albums: true,
+        include_eps: true,
+        include_singles: true,
+        include_live: false,
+        include_remixes: false,
+        include_acoustic: false,
+        include_compilations: false,
+        include_instrumentals: false,
+        include_other_artists: false,
+        auto_download_pref: null,
+      },
+      'itunes',
+    );
+    expect(bodies).toEqual([{ artist_id: '262836961', artist_name: 'Adele', source: 'itunes' }]);
   });
 });

@@ -29,11 +29,20 @@ from utils.logging_config import get_logger
 
 logger = get_logger("database.quality_schema")
 
+RELEASE_IMPORT_MODES = ("requested_tracks", "album_tracks")
+
+
+def normalize_release_import_mode(value: Any) -> str:
+    """Album track imports are opt-in; missing or malformed policy keeps requested tracks only."""
+    return value if isinstance(value, str) and value in RELEASE_IMPORT_MODES else "requested_tracks"
+
 
 # --- Quality profiles --------------------------------------------------------
 # ``upgrade_policy='until_cutoff'`` is the Lidarr-like "keep searching/
 # upgrading until the selected ranked target is reached" mode. The selected
 # target is stored as ``upgrade_cutoff_index``; index 0 means "top quality".
+# ``none`` disables upgrades of existing files entirely. It is the safe
+# default for fresh installs; missing files still use the quality ladder.
 # ``until_top`` is kept as a compatibility alias for rows created by the first
 # quality-profile branch.
 # ``acoustid_required`` is the STRICTNESS dial (same meaning as the
@@ -60,8 +69,9 @@ CREATE TABLE IF NOT EXISTS quality_profiles (
     fallback_enabled INTEGER NOT NULL DEFAULT 1,
     search_mode TEXT NOT NULL DEFAULT 'priority',
     rank_candidates_by_quality INTEGER NOT NULL DEFAULT 0,
-    upgrade_policy TEXT NOT NULL DEFAULT 'acceptable', -- 'acceptable'|'until_cutoff'|'until_top'
+    upgrade_policy TEXT NOT NULL DEFAULT 'none', -- 'none'|'acceptable'|'until_cutoff'|'until_top'
     upgrade_cutoff_index INTEGER NOT NULL DEFAULT 0,
+    release_import_mode TEXT NOT NULL DEFAULT 'requested_tracks',
     acoustid_required INTEGER NOT NULL DEFAULT 0,
     downsample_enabled INTEGER NOT NULL DEFAULT 0,
     deep_audio_verify INTEGER NOT NULL DEFAULT 0,
@@ -85,8 +95,10 @@ _INDEXES = (
 # Columns added after the initial schema shipped -- applied to existing installs via
 # a PRAGMA-probe ALTER (SQLite has no ADD COLUMN IF NOT EXISTS). (table, column, ddl).
 _ADDED_COLUMNS = (
+    ("quality_profiles", "release_import_mode",
+     "ALTER TABLE quality_profiles ADD COLUMN release_import_mode TEXT NOT NULL DEFAULT 'requested_tracks'"),
     ("quality_profiles", "upgrade_policy",
-     "ALTER TABLE quality_profiles ADD COLUMN upgrade_policy TEXT NOT NULL DEFAULT 'acceptable'"),
+     "ALTER TABLE quality_profiles ADD COLUMN upgrade_policy TEXT NOT NULL DEFAULT 'none'"),
     ("quality_profiles", "upgrade_cutoff_index",
      "ALTER TABLE quality_profiles ADD COLUMN upgrade_cutoff_index INTEGER NOT NULL DEFAULT 0"),
     ("quality_profiles", "acoustid_required",
@@ -159,7 +171,7 @@ def _seed_quality_profiles(cursor: Any) -> None:
              repair_job_id, repair_settings, is_default)
         VALUES
             (1, 'Balanced', 'Lossless preferred, high-quality lossy accepted.',
-             ?, 1, 'priority', 0, 'acceptable', 0, 'quality_upgrade', '{}', 1),
+             ?, 1, 'priority', 0, 'none', 0, 'quality_upgrade', '{}', 1),
             (2, 'Upgrade until top quality', 'Keep proposing upgrades until the first ranked target is reached.',
              ?, 1, 'best_quality', 1, 'until_cutoff', 0, 'quality_upgrade',
              '{"require_top_target": true}', 0)
@@ -203,5 +215,7 @@ def ensure_quality_profiles_schema(connection: Any) -> None:
 
 __all__ = [
     "ensure_quality_profiles_schema",
+    "RELEASE_IMPORT_MODES",
+    "normalize_release_import_mode",
     "QUALITY_PROFILES_DDL",
 ]

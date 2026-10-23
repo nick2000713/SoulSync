@@ -585,7 +585,7 @@ def add_activity_item(icon, title, subtitle, time_ago="Now", show_toast=True):
 # Fixtures
 # ---------------------------------------------------------------------------
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def test_app():
     """Create a minimal Flask + SocketIO app that mirrors Phase 1+2 endpoints."""
     global _test_socketio
@@ -1142,6 +1142,21 @@ def _inert_video_download_monitor():
 
 
 @pytest.fixture(scope="session", autouse=True)
+def _soulseek_ownership_in_memory():
+    """keep the soulseek ownership registry in memory for the suite.
+
+    production saves it in the metadata table so a restart remembers which
+    slskd transfers are ours. every test client shares one session temp db, so
+    saving would leak one test's "owned" ids into the next. tests of the
+    saved registry turn it back on with their own store.
+    """
+    from core.soulseek_client import SoulseekClient
+    SoulseekClient.PERSIST_OWNERSHIP = False
+    yield
+    SoulseekClient.PERSIST_OWNERSHIP = True
+
+
+@pytest.fixture(scope="session", autouse=True)
 def _inert_music_disk_guard():
     """Pin the music min-free-disk guard OFF for the whole suite.
 
@@ -1153,6 +1168,22 @@ def _inert_music_disk_guard():
     dg._floor_override = 0.0
     yield
     dg._floor_override = None
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _inert_spotify_second_pass_fetch():
+    """no real spotify fetch from the #1721 second pass, anywhere in the suite.
+
+    a mirrored spotify track that misses its metadata source gets fetched by
+    id through SpotipyFree, which is the network. tests of the second pass
+    monkeypatch _free_track with a fake; everything else gets nothing back and
+    the track stays wing it, same as before the second pass existed.
+    """
+    import core.discovery.spotify_second_pass as ssp
+    original = ssp._free_track
+    ssp._free_track = lambda track_id: None
+    yield
+    ssp._free_track = original
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -1549,3 +1580,32 @@ def _web_server_clients_start_as_the_admin():
         yield
     finally:
         ws.app.test_client_class = saved
+
+
+@pytest.fixture
+def server_tz(monkeypatch):
+    """set the server's local timezone for one test. played_at is stored
+    utc and hour-of-day charts read it in local time, so a test that seeds
+    hours picks the zone it means. call with a tz name, e.g. server_tz('UTC')"""
+    def _set(name):
+        monkeypatch.setenv('TZ', name)
+        time.tzset()
+    yield _set
+    monkeypatch.undo()
+    time.tzset()
+
+
+@pytest.fixture
+def utc_server(server_tz):
+    """the server's local time is utc: a stored hour is the hour shown"""
+    server_tz('UTC')
+
+
+@pytest.fixture(autouse=True)
+def _no_background_playlist_identify(monkeypatch):
+    """an edit to a user playlist queues a background identify. importing
+    web_server wires that to the real discovery worker, so any test that
+    touches the user-playlist routes afterwards would start real discovery
+    threads. unhooked here; the auto_identify tests hook their own runner."""
+    from core.playlists import auto_identify
+    monkeypatch.setattr(auto_identify, "_runner", None)

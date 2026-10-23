@@ -54,6 +54,7 @@ import {
 import { DEEZER_PLAYLIST_PROGRESS_EVENT, deezerProgressLabel } from '../-sync.events';
 import { AccountDetailsModal } from './account-details-modal';
 import { AccountPlaylistCard } from './account-playlist-card';
+import { PlaylistSearch, noMatchText, playlistNameMatches } from './playlist-search';
 
 /**
  * `deezer:playlist_progress`, re-broadcast by core.js as an `ss:` CustomEvent —
@@ -119,6 +120,7 @@ export function SpotifyTab({ selectedIds, onToggleSelect, registerRows }: Accoun
   const [placeholder, setPlaceholder] = useState('🔄 Loading playlists...');
   const [refreshing, setRefreshing] = useState(false);
   const [open, setOpen] = useState<OpenDetail | null>(null);
+  const [query, setQuery] = useState('');
 
   const load = useCallback(async () => {
     setPlaceholder('🔄 Loading playlists...');
@@ -169,6 +171,7 @@ export function SpotifyTab({ selectedIds, onToggleSelect, registerRows }: Accoun
     <div>
       <div className="playlist-header">
         <h3>Your Spotify Playlists</h3>
+        {rows && rows.length > 0 && <PlaylistSearch value={query} onChange={setQuery} />}
         <button
           type="button"
           className="refresh-button"
@@ -182,8 +185,11 @@ export function SpotifyTab({ selectedIds, onToggleSelect, registerRows }: Accoun
       <div className="playlist-scroll-container" id="spotify-playlist-container">
         {rows === null || rows.length === 0 ? (
           <div className="playlist-placeholder">{placeholder}</div>
+        ) : !rows.some((row) => playlistNameMatches([row.name], query)) ? (
+          <div className="playlist-placeholder">{noMatchText(query)}</div>
         ) : (
           rows.map((row) => {
+            if (!playlistNameMatches([row.name], query)) return null;
             const cardId = String(row.id);
             return (
               <AccountPlaylistCard
@@ -214,7 +220,7 @@ export function SpotifyTab({ selectedIds, onToggleSelect, registerRows }: Accoun
           // 1901 prints the count raw — a zero stays a zero.
           trackCount={open.detail.track_count ?? open.row.track_count ?? 0}
           onClose={() => setOpen(null)}
-          closeBeforeDownload={false}
+          closeBeforeDownload
           onDownloadMissing={() => void window.openDownloadMissingModal?.(String(open.row.id))}
           onSync={() => void window.startPlaylistSync?.(String(open.row.id))}
         />
@@ -230,6 +236,7 @@ export function DeezerArlTab() {
   const [placeholder, setPlaceholder] = useState('🔄 Loading playlists...');
   const [refreshing, setRefreshing] = useState(false);
   const [open, setOpen] = useState<OpenDetail | null>(null);
+  const [query, setQuery] = useState('');
 
   const load = useCallback(async () => {
     setPlaceholder('🔄 Loading playlists...');
@@ -248,7 +255,7 @@ export function DeezerArlTab() {
       for (const row of list) {
         const arlId = deezerArlId(row.id);
         try {
-          const status = await fetchAccountSyncStatus(arlId);
+          const status = await fetchAccountSyncStatus(arlId, { probe: true });
           if (status.status === 'syncing') {
             window.updateCardToSyncing?.(arlId, status.progress?.progress ?? 0, status.progress);
             window.startSyncPolling?.(arlId);
@@ -316,6 +323,7 @@ export function DeezerArlTab() {
     <div>
       <div className="playlist-header">
         <h3>Your Deezer Playlists</h3>
+        {rows && rows.length > 0 && <PlaylistSearch value={query} onChange={setQuery} />}
         <button
           type="button"
           className="refresh-button"
@@ -329,8 +337,11 @@ export function DeezerArlTab() {
       <div className="playlist-scroll-container" id="deezer-arl-playlist-container">
         {rows === null || rows.length === 0 ? (
           <div className="playlist-placeholder">{placeholder}</div>
+        ) : !rows.some((row) => playlistNameMatches([row.name], query)) ? (
+          <div className="playlist-placeholder">{noMatchText(query)}</div>
         ) : (
           rows.map((row) => {
+            if (!playlistNameMatches([row.name], query)) return null;
             const cardId = deezerArlId(row.id);
             return (
               <AccountPlaylistCard

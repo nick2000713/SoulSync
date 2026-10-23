@@ -1,6 +1,8 @@
 import { useMemo } from 'react';
 
-import type { StudioFilters, StudioTrack } from '../-sample-studio.types';
+import { Skeleton } from '@/components/primitives';
+
+import type { StudioFilters, StudioTrack, TrackId } from '../-sample-studio.types';
 
 import { QUALITY_TIER_LABEL, qualityTier, tempoBucket } from '../-sample-studio.helpers';
 import { DEFAULT_FILTERS } from '../-sample-studio.types';
@@ -14,7 +16,7 @@ interface LibraryPanelProps {
   onQueryChange: (q: string) => void;
   filters: StudioFilters;
   onFiltersChange: (f: StudioFilters) => void;
-  selectedId: number | null;
+  selectedId: TrackId | null;
   onSelect: (track: StudioTrack) => void;
 }
 
@@ -156,9 +158,9 @@ export function LibraryPanel({
       <div className={styles.scroll}>
         {isLoading ? (
           <>
-            <div className={styles.shimmer} />
-            <div className={styles.shimmer} />
-            <div className={styles.shimmer} />
+            <Skeleton className={styles.shimmer} />
+            <Skeleton className={styles.shimmer} />
+            <Skeleton className={styles.shimmer} />
           </>
         ) : searchError && !isLoading ? (
           <div className={styles.emptyHint}>

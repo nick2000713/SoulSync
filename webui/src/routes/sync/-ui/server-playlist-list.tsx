@@ -13,7 +13,7 @@
 
 import type { CSSProperties, ReactElement } from 'react';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useLayoutEffect, useRef, useState } from 'react';
 
 import type {
   MirroredMatch,
@@ -32,6 +32,7 @@ import {
   serverTabTitle,
   splitServerPlaylists,
 } from '../-sync.server';
+import { PlaylistSearch, noMatchText, playlistNameMatches } from './playlist-search';
 
 /** The three server icons, verbatim from 86-90. */
 const SERVER_ICONS: Readonly<Record<string, ReactElement>> = {
@@ -81,7 +82,7 @@ function SkeletonGrid() {
           </div>
           <div
             className="server-pl-card-footer"
-            style={{ borderTop: '1px solid rgba(255,255,255,0.05)', paddingTop: 12 }}
+            style={{ borderTop: '1px solid var(--white-a05)', paddingTop: 12 }}
           >
             <div className="skeleton-box" style={{ width: 60, height: 10, borderRadius: 3 }} />
           </div>
@@ -296,6 +297,36 @@ export function OtherOwnersBlock({
   );
 }
 
+type ServerListView = {
+  synced: ServerPlaylist[];
+  unsynced: ServerPlaylist[];
+  serverAdmin: ServerPlaylistGroup[];
+  others: ServerPlaylistGroup[];
+};
+
+/** narrow every section by name; owner groups the search empties drop out. */
+export function filterServerList<T extends ServerListView>(view: T, query: string): T {
+  if (!query.trim()) return view;
+  const keep = (pls: ServerPlaylist[]) => pls.filter((pl) => playlistNameMatches([pl.name], query));
+  const keepGroups = (groups: ServerPlaylistGroup[]) =>
+    groups
+      .map((g) => ({ ...g, playlists: keep(g.playlists) }))
+      .filter((g) => g.playlists.length > 0);
+  return {
+    ...view,
+    synced: keep(view.synced),
+    unsynced: keep(view.unsynced),
+    serverAdmin: keepGroups(view.serverAdmin),
+    others: keepGroups(view.others),
+  };
+}
+
+function serverListEmpty(view: ServerListView): boolean {
+  return (
+    view.synced.length + view.unsynced.length + view.serverAdmin.length + view.others.length === 0
+  );
+}
+
 export interface ServerPlaylistListProps {
   /**
    * Resolved by the name lookup: exactly one mirrored match, none (server-only)
@@ -318,6 +349,7 @@ export function ServerPlaylistList({ onOpenCompare }: ServerPlaylistListProps) {
   /** Held in a ref so `openCompare` stays stable across loads. */
   const serverTypeRef = useRef<string | undefined>(undefined);
   const [refreshing, setRefreshing] = useState(false);
+  const [query, setQuery] = useState('');
   /** The several-matches case (183): pick one before the compare view opens. */
   /**
    * Every path that resolves "this server playlist IS that mirror" ends at
@@ -386,7 +418,7 @@ export function ServerPlaylistList({ onOpenCompare }: ServerPlaylistListProps) {
     }
   }, []);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     void load();
   }, [load]);
 
@@ -416,10 +448,13 @@ export function ServerPlaylistList({ onOpenCompare }: ServerPlaylistListProps) {
     [openCompare],
   );
 
+  const shown = state && filterServerList(state, query);
+
   return (
     <div>
       <div className="playlist-header">
         <h3 id="server-tab-title">{serverTabTitle(state?.serverType)}</h3>
+        {state && !serverListEmpty(state) && <PlaylistSearch value={query} onChange={setQuery} />}
         <button
           type="button"
           className="refresh-button"
@@ -435,38 +470,41 @@ export function ServerPlaylistList({ onOpenCompare }: ServerPlaylistListProps) {
           <SkeletonGrid />
         ) : placeholder ? (
           <div className="playlist-placeholder">{placeholder}</div>
-        ) : state ? (
+        ) : shown ? (
           <>
-            {state.scope === 'shared' && <LinkServerUserPrompt serverType={state.serverType} />}
-            {state.synced.length > 0 && (
+            {query.trim() && serverListEmpty(shown) && (
+              <div className="playlist-placeholder">{noMatchText(query)}</div>
+            )}
+            {shown.scope === 'shared' && <LinkServerUserPrompt serverType={shown.serverType} />}
+            {shown.synced.length > 0 && (
               <Section
                 className="server-pl-section"
                 icon="🔗"
-                title={state.scope === 'shared' ? 'Synced for You' : 'Synced Playlists'}
-                playlists={state.synced}
+                title={shown.scope === 'shared' ? 'Synced for You' : 'Synced Playlists'}
+                playlists={shown.synced}
                 startIndex={0}
                 isSynced
-                serverType={state.serverType}
+                serverType={shown.serverType}
                 onOpen={(pl) => void openPlaylist(pl)}
               />
             )}
-            {state.unsynced.length > 0 && (
+            {shown.unsynced.length > 0 && (
               <Section
                 className="server-pl-section server-pl-section-unsynced"
                 icon="🎵"
                 title="Other Server Playlists"
-                playlists={state.unsynced}
-                startIndex={state.synced.length}
+                playlists={shown.unsynced}
+                startIndex={shown.synced.length}
                 isSynced={false}
-                serverType={state.serverType}
+                serverType={shown.serverType}
                 onOpen={(pl) => void openPlaylist(pl)}
               />
             )}
-            {state.serverAdmin.length > 0 && (
+            {shown.serverAdmin.length > 0 && (
               <OtherOwnersBlock
-                groups={state.serverAdmin}
-                startIndex={state.synced.length + state.unsynced.length}
-                serverType={state.serverType}
+                groups={shown.serverAdmin}
+                startIndex={shown.synced.length + shown.unsynced.length}
+                serverType={shown.serverType}
                 title="Server admin"
                 note="Playlists owned by other server admins. Editing or deleting one changes it for them."
                 // never matched to a mirror by name: the admin's own mirror of
@@ -474,15 +512,15 @@ export function ServerPlaylistList({ onOpenCompare }: ServerPlaylistListProps) {
                 onOpen={(pl) => openCompare(pl, null)}
               />
             )}
-            {state.others.length > 0 && (
+            {shown.others.length > 0 && (
               <OtherOwnersBlock
-                groups={state.others}
+                groups={shown.others}
                 startIndex={
-                  state.synced.length +
-                  state.unsynced.length +
-                  state.serverAdmin.reduce((n, g) => n + g.playlists.length, 0)
+                  shown.synced.length +
+                  shown.unsynced.length +
+                  shown.serverAdmin.reduce((n, g) => n + g.playlists.length, 0)
                 }
-                serverType={state.serverType}
+                serverType={shown.serverType}
                 title="Everyone else"
                 note="Other people's playlists on this server. Editing or deleting one changes it for them."
                 // never matched to a mirror by name: the admin's own mirror of
@@ -571,8 +609,9 @@ export function ServerDisambigModal({
   onPick: (candidate: MirroredMatch) => void;
 }) {
   // 221-222 parks the handler on window._disambigEsc and removes it in
-  // closeServerDisambig; an effect is the same teardown without the global.
-  useEffect(() => {
+  // closeServerDisambig. Register before paint so an immediately pressed
+  // Escape isn't lost while the visible overlay waits for passive effects.
+  useLayoutEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.key === 'Escape') onClose();
     };

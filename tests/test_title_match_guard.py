@@ -19,6 +19,8 @@ from __future__ import annotations
 import types
 from difflib import SequenceMatcher
 
+import pytest
+
 from core.text.title_match import choose_best_title_candidate, titles_plausibly_same
 
 
@@ -103,6 +105,17 @@ def test_all_stopword_side_defers():
 
 from database.music_database import MusicDatabase  # noqa: E402
 
+
+@pytest.fixture(autouse=True)
+def _real_matching_engine(monkeypatch):
+    # Importing the matching module before MusicDatabase can leave its optional
+    # import-time engine unset through the settings/DB cycle. These regressions
+    # exercise the enhanced scorer and must explicitly provide that dependency.
+    import database.music_database as database
+    from core.matching_engine import MusicMatchingEngine
+    monkeypatch.setattr(database, '_matching_engine', MusicMatchingEngine())
+
+
 _THRESHOLD = 0.7  # services/sync_service.py confidence_threshold
 
 
@@ -116,7 +129,8 @@ class _FakeTrack:
 def _scorer():
     stub = type("S", (), {})()
     for m in (
-        "_calculate_track_confidence", "_string_similarity",
+        "_calculate_track_confidence", "_score_title_similarity",
+        "_score_artist_similarity", "_string_similarity",
         "_normalize_for_comparison", "_clean_track_title_for_comparison",
     ):
         setattr(stub, m, types.MethodType(getattr(MusicDatabase, m), stub))

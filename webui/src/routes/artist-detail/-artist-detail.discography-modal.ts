@@ -2,6 +2,7 @@ import type { Discography } from './-artist-detail.types';
 
 import { classifyReleaseContent } from './-artist-detail.filters';
 import { type ReleaseSectionType } from './-artist-detail.open-release';
+import { addToWatchlistRequest } from './-artist-detail.watchlist-button';
 
 /**
  * Download Discography (library.js: openDiscographyModal 580, filters 798,
@@ -332,6 +333,8 @@ export interface FutureReleases {
   include_acoustic: boolean;
   include_compilations: boolean;
   include_instrumentals: boolean;
+  /** Include tracks by artists other than the watched one (tributes, soundtracks). Default off. */
+  include_other_artists: boolean;
   /** null = follow the global auto-download setting */
   auto_download_pref: 'on' | 'off' | null;
 }
@@ -352,6 +355,7 @@ export function defaultFutureReleases(filters: DiscogFilters): FutureReleases {
     include_acoustic: false,
     include_compilations: filters.compilations,
     include_instrumentals: false,
+    include_other_artists: false,
     auto_download_pref: null,
   };
 }
@@ -365,6 +369,7 @@ export async function watchArtistWithSettings(
   artistId: unknown,
   artistName: string,
   settings: FutureReleases,
+  source?: string,
 ): Promise<{ watching: boolean; message: string }> {
   const checkResponse = await fetch('/api/watchlist/check', {
     method: 'POST',
@@ -379,15 +384,8 @@ export async function watchArtistWithSettings(
   let message = '';
 
   if (!watching) {
-    const addResponse = await fetch('/api/watchlist/add', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ artist_id: artistId, artist_name: artistName }),
-    });
-    const addData = await addResponse.json();
-    if (!addData.success) throw new Error(addData.error || 'Failed to add to watchlist');
+    message = await addToWatchlistRequest(artistId, artistName, source);
     watching = true;
-    message = String(addData.message ?? '');
     if (typeof window.updateWatchlistCount === 'function') window.updateWatchlistCount();
   }
 
@@ -405,6 +403,7 @@ export async function watchArtistWithSettings(
         include_acoustic: settings.include_acoustic,
         include_compilations: settings.include_compilations,
         include_instrumentals: settings.include_instrumentals,
+        include_other_artists: settings.include_other_artists,
         auto_download_pref: settings.auto_download_pref,
       }),
     },

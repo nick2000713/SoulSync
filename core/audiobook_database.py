@@ -128,6 +128,10 @@ _COLUMN_MIGRATIONS = (
     ("audiobook_downloads", "release_guid", "TEXT DEFAULT ''"),
     ("audiobook_watchlist", "auto_wishlist", "INTEGER NOT NULL DEFAULT 1"),
     ("audiobook_watchlist", "narrator_mode", f"TEXT DEFAULT '{NARRATOR_EXACT}'"),
+    # A followed SERIES is found by its Audible series ASIN where we have one: the
+    # name alone cannot tell two series that share a title apart. Empty for
+    # authors and narrators, and for a series followed without an ASIN.
+    ("audiobook_watchlist", "series_asin", "TEXT DEFAULT ''"),
 )
 
 
@@ -434,6 +438,10 @@ class AudiobookDatabase:
                 STATUS_WANTED, narrator_mode, _now(),
             ))
             conn.commit()
+            from core.audiobook_events import announce, first_author, series_title
+
+            announce("audiobook_wishlist_item_added", title=title, author=first_author(book),
+                     series=series_title(book), asin=asin)
             return True
         except sqlite3.IntegrityError:
             return False
@@ -811,8 +819,9 @@ class AudiobookDatabase:
         cover_url: str = "",
         since_date: str = "",
         role: str = "author",
+        series_asin: str = "",
     ) -> bool:
-        """Follow an author so their new releases get wishlisted.
+        """Follow an author (or narrator, or series) so new releases get wishlisted.
 
         ``since_date`` is the cutoff: only books published after it are picked
         up. It defaults to today, because following an author means "tell me
@@ -828,11 +837,14 @@ class AudiobookDatabase:
         try:
             conn.execute("""
                 INSERT INTO audiobook_watchlist
-                    (name, profile_id, role, cover_url, since_date, added_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (name, profile_id, role, cover_url, since_date, series_asin, added_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (name, int(profile_id), str(role or "author"),
-                  str(cover_url or ""), since_date, _now()))
+                  str(cover_url or ""), since_date, str(series_asin or ""), _now()))
             conn.commit()
+            from core.audiobook_events import announce
+
+            announce("audiobook_author_followed", name=name, role=role or "author")
             return True
         except sqlite3.IntegrityError:
             return False
@@ -850,6 +862,11 @@ class AudiobookDatabase:
                 (str(name or "").strip(), str(role or "author"), int(profile_id)),
             )
             conn.commit()
+            if cursor.rowcount > 0:
+                from core.audiobook_events import announce
+
+                announce("audiobook_author_unfollowed", name=str(name or "").strip(),
+                         role=role or "author")
             return cursor.rowcount > 0
         except sqlite3.Error as exc:
             logger.warning("Could not unfollow %s: %s", name, exc)

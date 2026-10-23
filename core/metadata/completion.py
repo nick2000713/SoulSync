@@ -232,32 +232,38 @@ def _library_album_by_source_id(db, card_source, card_id, candidate_albums, id_m
 def _stored_release_kind(db: Any, album_id: Any) -> str:
     """The library album row's known release kind, '' when unknown.
 
-    ``record_type`` is the populated column (enrichment workers backfill it:
-    album / single / ep / compilation); ``album_type`` is legacy/unwritten in
-    current code but checked anyway in case an older DB carries it. Each
-    column is queried separately because ``album_type`` may not exist at all
-    on fresh DBs — one missing column must not hide the other.
+    Ours: a ``lib2_albums`` id. ``album_type`` there is NOT NULL with the
+    schema default 'album', so a bare 'album' is no evidence -- an import that
+    predates the #1562 stamp left every single at it. Only another kind, or a
+    download's recorded filing (``filed_release``), counts as known; the rest
+    stays lenient exactly like upstream's unknown kind.
     """
-    for col in ("record_type", "album_type"):
+    try:
+        conn = db._get_connection()
         try:
-            conn = db._get_connection()
+            row = conn.execute(
+                "SELECT album_type, filed_release FROM lib2_albums WHERE id = ?",
+                (str(album_id),),
+            ).fetchone()
+        finally:
             try:
-                row = conn.execute(
-                    f"SELECT {col} FROM albums WHERE id = ?", (str(album_id),)
-                ).fetchone()
-            finally:
-                try:
-                    conn.close()
-                except Exception:  # noqa: S110 - cleanup only
-                    pass
-        except Exception:
-            continue
-        # Strip before the truthiness check: a whitespace-only value is
-        # unknown and must fall through to the next column, not return "".
-        val = str(row[0]).strip() if row and row[0] else ""
-        if val:
-            return val.lower()
-    return ""
+                conn.close()
+            except Exception:  # noqa: S110 - cleanup only
+                pass
+    except Exception:
+        return ""
+    if not row:
+        return ""
+    kind = str(row[0] or "").strip().lower()
+    if kind and kind != "album":
+        return kind
+    try:
+        import json
+        filed = json.loads(row[1] or "{}")
+    except (TypeError, ValueError):
+        filed = {}
+    filed_kind = str((filed or {}).get("type") or "").strip().lower() if isinstance(filed, dict) else ""
+    return filed_kind
 
 
 def _get_canonical_memoized(db, local_album_id: Any, canonical_cache: Optional[dict] = None) -> Optional[dict]:
@@ -402,6 +408,19 @@ def _resolve_canonical_album_completion(db, db_album: Any,
     }
 
 
+def _routed_owned_tracks(db: Any, album_name: str, artist_name: str) -> int:
+    """Tracks on disk for an audiobook-routed artist's album, 0 when unknown."""
+    lookup = getattr(db, 'routed_album_owned_tracks', None)
+    if not callable(lookup):
+        return 0
+    try:
+        count = lookup(album_name, artist_name)
+    except Exception:
+        logger.debug("routed album ownership check failed", exc_info=True)
+        return 0
+    return count if isinstance(count, int) else 0
+
+
 def check_album_completion(
     db,
     album_data: Dict[str, Any],
@@ -490,6 +509,22 @@ def check_album_completion(
                         owned_tracks, expected_tracks, is_complete, formats = db.check_album_completeness(
                             _proven.id, total_tracks if total_tracks > 0 else None)
                 else:
+                    # An artist routed to the audiobook library has no album row
+                    # but a download ledger; credit what is still on disk.
+                    routed_owned = _routed_owned_tracks(db, album_name, artist_name)
+                    if routed_owned:
+                        expected = total_tracks or routed_owned
+                        return {
+                            "id": album_id,
+                            "name": album_name,
+                            "status": "completed" if routed_owned >= expected else "partial",
+                            "owned_tracks": routed_owned,
+                            "expected_tracks": expected,
+                            "completion_percentage": round(min(routed_owned / expected, 1) * 100, 1),
+                            "confidence": 1.0,
+                            "found_in_db": False,
+                            "formats": [],
+                        }
                     # Album is not in the library at all — mark missing immediately without
                     # making expensive external HTTP calls to count tracks on an unowned album.
                     return {
@@ -984,6 +1019,7 @@ def check_single_completion(
                             confidence_threshold=0.7,
                             server_source=active_server,
                             candidate_tracks=release_tracks,
+                            include_downloads=True,
                         )
                         single_owned = db_track is not None
                     else:

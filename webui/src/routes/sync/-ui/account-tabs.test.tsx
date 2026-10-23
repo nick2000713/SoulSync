@@ -521,7 +521,12 @@ describe('SpotifyTab', () => {
     );
   });
 
-  it('opening a card fetches its tracks and shows the details modal', async () => {
+  it('opens details, closes through React on download, and can reopen them', async () => {
+    const openDownloadMissingModal = vi.fn(() => {
+      const modal = document.querySelector<HTMLElement>('#playlist-details-modal');
+      if (modal) modal.style.display = 'none';
+    });
+    vi.stubGlobal('openDownloadMissingModal', openDownloadMissingModal);
     responder = (url) =>
       url === '/api/spotify/playlists' ? [SPOTIFY_ROW] : { name: 'Road Trip', tracks: [] };
     render(<SpotifyTab registerRows={() => {}} />);
@@ -529,6 +534,13 @@ describe('SpotifyTab', () => {
     fireEvent.click(document.querySelector('#action-btn-p1') as Element);
     await waitFor(() => expect(document.querySelector('#playlist-details-modal')).not.toBeNull());
     expect(calls.some((c) => c.url === '/api/spotify/playlist/p1')).toBe(true);
+
+    fireEvent.click(screen.getByText('📥 Download Missing Tracks'));
+    expect(openDownloadMissingModal).toHaveBeenCalledWith('p1');
+    expect(document.querySelector('#playlist-details-modal')).toBeNull();
+
+    fireEvent.click(document.querySelector('#action-btn-p1') as Element);
+    await waitFor(() => expect(document.querySelector('#playlist-details-modal')).toBeVisible());
   });
 });
 
@@ -554,7 +566,8 @@ describe('DeezerArlTab', () => {
         : { status: 'syncing', progress: { progress: 42 } };
     render(<DeezerArlTab />);
     await waitFor(() => expect(updateCardToSyncing).toHaveBeenCalled());
-    expect(calls.some((c) => c.url === '/api/sync/status/deezer_arl_7')).toBe(true);
+    // probe=1: an idle playlist answers 200, not a 404 per row (#1763)
+    expect(calls.some((c) => c.url === '/api/sync/status/deezer_arl_7?probe=1')).toBe(true);
     expect(updateCardToSyncing).toHaveBeenCalledWith('deezer_arl_7', 42, { progress: 42 });
     expect(startSyncPolling).toHaveBeenCalledWith('deezer_arl_7');
   });
@@ -596,5 +609,34 @@ describe('DeezerArlTab', () => {
     );
     // The PATH takes the raw id; the ids around it are prefixed.
     expect(calls.some((c) => c.url === '/api/deezer/arl-playlist/7?async=1')).toBe(true);
+  });
+
+  it('narrates the resolve-albums progress and ignores a frame for another playlist', async () => {
+    responder = (url) =>
+      url === '/api/deezer/arl-playlists' ? [ARL_ROW] : { name: 'Deep Cuts', tracks: [] };
+    render(<DeezerArlTab />);
+    await waitFor(() => expect(screen.getByText('Deep Cuts')).toBeInTheDocument());
+    fireEvent.click(document.querySelector('#action-btn-deezer_arl_7') as Element);
+    // Fired synchronously — the listener is attached before the details fetch
+    // is awaited, so both dispatches land while the modal is still loading.
+    fireEvent(
+      window,
+      new CustomEvent(DEEZER_PLAYLIST_PROGRESS_EVENT, {
+        detail: { playlist_id: '99', done: 1, total: 2, phase: 'release dates' },
+      }),
+    );
+    fireEvent(
+      window,
+      new CustomEvent(DEEZER_PLAYLIST_PROGRESS_EVENT, {
+        detail: { playlist_id: '7', done: 3, total: 10, phase: 'track numbers' },
+      }),
+    );
+    expect(window.showLoadingOverlay).not.toHaveBeenCalledWith(expect.stringContaining('99'));
+    expect(window.showLoadingOverlay).toHaveBeenCalledWith(
+      expect.stringContaining('track numbers 3/10'),
+    );
+    await waitFor(() =>
+      expect(document.querySelector('#deezer-arl-playlist-details-modal')).not.toBeNull(),
+    );
   });
 });

@@ -409,7 +409,17 @@ async function bootstrapServerAppearanceSettings() {
     }
 }
 
-bootstrapServerAppearanceSettings();
+// runs from setCurrentProfile, admins only. /api/settings is admin-only, so a
+// member's boot fetch was a guaranteed 403, and those 4xx bursts get members
+// banned by crowdsec / fail2ban (#1763). members lose nothing: the page
+// template already injects the same appearance values.
+let _serverAppearanceBootstrapped = false;
+function bootstrapServerAppearanceForAdmin(profile) {
+    if (_serverAppearanceBootstrapped || !profile) return;
+    if (!(profile.is_admin || profile.id === 1)) return;
+    _serverAppearanceBootstrapped = true;
+    bootstrapServerAppearanceSettings();
+}
 
 // ── Password-manager autofill suppression ──────────────────────────────
 // Bitwarden / 1Password / LastPass etc. attach an inline autofill overlay to
@@ -510,6 +520,8 @@ function setCurrentProfile(profile) {
     // mirrored (the window._socketConnected pattern). The dashboard's
     // hello strip greets by it.
     window._currentProfileName = (profile && profile.name) || '';
+    window.SoulSyncProfileGate?.setProfile(profile);
+    bootstrapServerAppearanceForAdmin(profile);
     updateProfileIndicator();
     notifyProfileContextChanged();
 }
@@ -559,6 +571,9 @@ const PF_BOOT_PATH = (window.SoulSyncURL?.strip(window.location.pathname) ?? win
 const LEGACY_PROFILE_PAGE_ALIASES = {
     downloads: 'search',
     artists: 'search',
+    // Library v2 became the Library; anything still naming the old route id
+    // resolves to the same permission rather than to an unknown page.
+    'library-v2': 'library',
 };
 
 function normalizeProfilePageId(pageId) {
@@ -1696,7 +1711,16 @@ function showPinDialog(profile, mode = 'pin') {
             autocomplete: 'current-password', maxlength: '200', 'aria-label': `${profile.name}'s password`,
             'aria-describedby': 'profile-pin-error',
         });
-        card.append(input, error);
+        input.name = 'password';
+        // password managers pair a password with the username in its form. there's
+        // no visible username here, so carry the profile name hidden beside it
+        const login = pfEl('input', {
+            type: 'text', name: 'username', autocomplete: 'username', value: profile.name,
+            readonly: true, hidden: true, tabindex: '-1', 'aria-hidden': 'true',
+        });
+        const form = pfEl('form', { action: '/api/profiles/select', method: 'post', autocomplete: 'on', style: 'width:100%' }, [login, input]);
+        form.addEventListener('submit', (e) => { e.preventDefault(); submit(); });
+        card.append(form, error);
         const go = pfEl('button', { type: 'button', class: 'pf-btn pf-btn--primary', text: 'Continue', style: 'margin-top:8px;width:100%' });
         go.addEventListener('click', () => submit());
         keys.push(go);
@@ -1924,10 +1948,24 @@ function showProfileForgotPin(profile) {
 // the last select answer, so a failed pick can say why
 let _pfLastSelect = null;
 
+// Reconnect the socket so its new handshake carries the CURRENT session
+// cookie: Flask-SocketIO freezes the session at connect time, so after
+// anything that changes this browser's session server-side (profile
+// switch, own-password change, "sign out everywhere" — the server keeps
+// THIS browser signed in under a new epoch) the existing socket would
+// keep acting on, and being revocation-checked against, the stale
+// session (#1837). The connect handler re-joins rooms and re-subscribes.
+function pfReconnectSocket() {
+    if (!socket) return;
+    // the revocation sweep can drop the old socket before this runs, and a
+    // server-side drop never auto-reconnects, so connect either way
+    if (socket.connected) socket.disconnect();
+    socket.connect();
+}
+
 async function selectProfile(profileId) {
     _pfLastSelect = null;
     try {
-        const oldProfileId = currentProfile ? currentProfile.id : null;
         const res = await fetch('/api/profiles/select', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -1937,10 +1975,9 @@ async function selectProfile(profileId) {
         _pfLastSelect = data;
         if (data.success) {
             setCurrentProfile(data.profile);
-            // Join profile-scoped WebSocket room for watchlist/wishlist count updates
-            if (socket && socket.connected) {
-                socket.emit('profile:join', { profile_id: profileId, old_profile_id: oldProfileId });
-            }
+            // New handshake for the switched profile's session (#1837);
+            // the connect handler re-joins the profile room.
+            pfReconnectSocket();
             // Invalidate ListenBrainz cache on profile switch (each profile has their own playlists)
             _invalidateListenBrainzCache();
         }
@@ -2076,6 +2113,9 @@ function updateProfileIndicator() {
         const page = btn.getAttribute('data-video-page');
         if (page === 'video-help' || page === 'video-issues') { btn.style.display = ''; return; }
         if (VIDEO_ADMIN_ONLY.includes(page)) { btn.style.display = currentProfile.is_admin ? '' : 'none'; return; }
+        // requests: admins answer them, profiles without download rights make
+        // them. same rule as the music side's requests, not a page toggle
+        if (page === 'video-requests') { btn.style.display = (currentProfile.is_admin || !canDownload()) ? '' : 'none'; return; }
         if (currentProfile.id === 1) { btn.style.display = ''; return; }
         const ap = currentProfile.allowed_pages;
         btn.style.display = (!ap || ap.includes(page)) ? '' : 'none';
@@ -2116,6 +2156,24 @@ function profileAllowedSides() {
     if (!currentProfile || currentProfile.is_admin || currentProfile.id === 1) return 'both';
     const s = currentProfile.allowed_sides;
     return (s === 'video' || s === 'both') ? s : 'music';
+}
+
+// A shared React page that shows the VIDEO side's view of itself under
+// ?media=... is gated by that video page's permission (and the video side
+// being on), not the music page's. /wishlist?media=tv is the video wishlist.
+const SHARED_VIDEO_VIEWS = {
+    wishlist: { media: ['movies', 'tv', 'youtube'], videoPage: 'video-wishlist' },
+};
+
+function isPageAccessAllowed(pageId, search) {
+    const view = SHARED_VIDEO_VIEWS[pageId];
+    let media = null;
+    if (view) {
+        try { media = new URLSearchParams(search || '').get('media'); } catch (e) { media = null; }
+    }
+    if (!view || view.media.indexOf(media) === -1) return isPageAllowed(pageId);
+    if (profileAllowedSides() === 'music') return false;
+    return isPageAllowed(view.videoPage);
 }
 
 // =====================
@@ -2343,6 +2401,7 @@ async function loadProfileManageList() {
     _pfManageState = {
         profiles, loginMode,
         librarySupported: data.own_library_supported !== false,
+        libraryAvailable: data.own_library_available !== false,
         libraryHint: data.own_library_root_hint || '',
     };
 
@@ -2806,6 +2865,9 @@ async function signOutProfileEverywhere(p) {
         const res = await fetch(`/api/profiles/${p.id}/sign-out-everywhere`, { method: 'POST' });
         const data = await pfReadJson(res);
         if (!res.ok || !data.success) throw new Error(data.error || "Couldn't sign out");
+        // self: the server kept THIS browser signed in under the new epoch —
+        // re-handshake so the socket isn't dropped as revoked (#1837)
+        if (isSelf) pfReconnectSocket();
         showToast(isSelf ? 'Other devices are signed out' : `${p.name} is signed out everywhere`, 'success');
         return true;
     } catch (e) {
@@ -2972,6 +3034,9 @@ function openProfilePasswordModal(p) {
         });
         const data = await pfReadJson(res);
         if (!res.ok || !data.success) throw new Error(data.error || "Couldn't save the password");
+        // own password changed: this browser stays signed in under a new
+        // epoch — re-handshake so the socket isn't dropped as revoked (#1837)
+        if (currentProfile && currentProfile.id === p.id) pfReconnectSocket();
     };
     if (p.has_password) {
         const remove = pfEl('button', { type: 'button', class: 'pf-btn pf-btn--quiet', text: 'Remove password', style: 'margin-right:auto' });
@@ -3145,6 +3210,7 @@ async function openProfileEditor({ mode = 'create', profile = null } = {}) {
     const p = profile || {};
     const loginMode = _pfManageState ? _pfManageState.loginMode : profileLoginMode;
     const librarySupported = _pfManageState ? _pfManageState.librarySupported : true;
+    const libraryAvailable = _pfManageState ? _pfManageState.libraryAvailable !== false : true;
     const libraryHint = _pfManageState
         ? _pfManageState.libraryHint.replace('<name>', (p.name || 'profile').toLowerCase().replace(/[^a-z0-9]+/g, '-'))
         : '';
@@ -3486,12 +3552,17 @@ async function openProfileEditor({ mode = 'create', profile = null } = {}) {
                 pfEl('p', { class: 'pf-help', text: 'Docker: mount this folder in docker-compose.yml. Then add it as a second music library on Plex or Jellyfin and pick that library under their account.' }),
             ]);
             const inactive = !librarySupported;
+            // parked beats unsupported in the message: the server can be the
+            // right one and the feature still be off, and a control that
+            // cannot succeed has to say so rather than fail on save
+            const parked = !libraryAvailable;
             const ownSwitch = pfSwitch({
                 title: 'Own library',
-                desc: inactive ? 'Needs Plex or Jellyfin. With Navidrome or standalone their downloads go to the shared folder.'
+                desc: parked ? 'Not available in this build yet.'
+                    : inactive ? 'Needs Plex or Jellyfin. With Navidrome or standalone their downloads go to the shared folder.'
                     : 'Their downloads go to their own folder and their own server library.',
                 checked: st.library_mode === 'own',
-                disabled: inactive && st.library_mode !== 'own',
+                disabled: parked || (inactive && st.library_mode !== 'own'),
                 onChange: (on) => { st.library_mode = on ? 'own' : 'shared'; folderBox.style.display = on ? '' : 'none'; },
             });
             folderBox.style.display = st.library_mode === 'own' ? '' : 'none';
@@ -3806,6 +3877,7 @@ async function openProfileEditor({ mode = 'create', profile = null } = {}) {
         if (isSelf && st.password) {
             try {
                 const data = await send(`/api/profiles/${targetId}/set-password`, 'POST', { password: st.password });
+                pfReconnectSocket();   // own password: new epoch, re-handshake (#1837)
                 saved.push('login password');
                 currentProfile.has_password = !!data.has_password;
             } catch (e) {
@@ -4055,16 +4127,36 @@ document.addEventListener('DOMContentLoaded', async function () {
         }
     }
 
-    if (showWizard && typeof openSetupWizard === 'function') {
+    if (showWizard && await _setupFlowReady()) {
         window._onSetupWizardComplete = function () {
             _continueAppInit();
         };
-        openSetupWizard();
+        // the wizard runs before any profile is picked, let its calls through
+        window.SoulSyncProfileGate?.setProfile(null);
+        window.SoulSyncProfileGate?.open();
+        window.openSetupWizard();
         return; // Defer init until wizard closes
     }
 
     _continueAppInit();
 });
+
+// the setup flow is a react module (webui/src/features/onboarding). module
+// scripts normally run before this handler, but in dev the bundle comes from
+// vite and can land later, so wait a moment for it to announce itself.
+function _setupFlowReady() {
+    if (typeof window.openSetupWizard === 'function') return Promise.resolve(true);
+    return new Promise((resolve) => {
+        const done = (ok) => {
+            window.removeEventListener('soulsync:onboarding-ready', onReady);
+            clearTimeout(timer);
+            resolve(ok);
+        };
+        const onReady = () => done(typeof window.openSetupWizard === 'function');
+        const timer = setTimeout(() => done(typeof window.openSetupWizard === 'function'), 8000);
+        window.addEventListener('soulsync:onboarding-ready', onReady);
+    });
+}
 
 async function _continueAppInit() {
     // Check profiles first — may show picker instead of app
@@ -4078,6 +4170,8 @@ async function _continueAppInit() {
 }
 
 function initApp() {
+    // a profile is picked and unlocked: calls held at boot go out now
+    window.SoulSyncProfileGate?.open();
     // Unlocked / authenticated — reveal the app (the lock screens hide it via
     // body.app-locked so a bypassed overlay shows nothing). Do this FIRST so
     // component init below measures real layout, not a display:none container.
@@ -4155,7 +4249,12 @@ function initializeNavigation() {
 
 const _DEEPLINK_VALID_PAGES = new Set([
     'dashboard', 'sync', 'search', 'discover', 'automations',
-    'library', 'import', 'settings', 'help', 'issues', 'stats', 'watchlist',
+    // iss29-B07: '/library-v2' is a live alias that redirects to '/library'
+    // (query string preserved). It was missing here, so this fallback resolved
+    // a bookmark to it as 'dashboard'. React usually wins the race and the
+    // right page appears anyway — which is exactly what makes the gap easy to
+    // miss and unreliable to depend on.
+    'library', 'library-v2', 'import', 'settings', 'help', 'issues', 'stats', 'watchlist',
     'wishlist', 'active-downloads', 'artist-detail', 'playlist-explorer',
     'hydrabase', 'tools', 'chat', 'podcasts', 'audiobooks', 'requests',
     'sample-studio'
@@ -4173,6 +4272,9 @@ function _getPageFromPath() {
     if (!_DEEPLINK_VALID_PAGES.has(basePage)) return 'dashboard';
     // Context-dependent pages fall back to a sensible parent
     if (basePage === 'playlist-explorer') return 'library';
+    // The alias and its target are the same page as far as the shell chrome
+    // is concerned (iss29-B07).
+    if (basePage === 'library-v2') return 'library';
     return basePage;
 }
 
@@ -4596,10 +4698,81 @@ function initializeWatchlist() {
     console.log('Watchlist system initialized');
 }
 
+// The sidebar's page ids are coarser than the URL space: several distinct routes
+// share one page id (/audiobooks, /audiobooks/<asin>, /audiobooks/library, ...).
+// Comparing page ids in navigateToPage's early-return used to swallow "go home"
+// clicks from any sub-route, because the click looked like a no-op even though
+// the URL was different and the click handler had already preventDefaulted the
+// anchor. The guard now compares the resolved target path against the current
+// path (see _navGuardPath), so a nav item is a reliable way back to its
+// section's home page. The pointerdown/click double-fire is absorbed by the
+// _lastNavTarget echo token below, restoring the old synchronous no-op.
+function _navTargetPath(pageId, options = {}) {
+    if (pageId === 'dashboard') return '/';
+    if (pageId === 'artist-detail' && options.artistId) {
+        return buildArtistDetailPath(options.artistId, options.artistSource, options.artistName, options.focusAlbumId);
+    }
+    if (pageId === 'label-detail' && options.labelId) {
+        return buildLabelDetailPath(options.labelId, options.labelName);
+    }
+    return '/' + pageId;
+}
+
+// What the TanStack bridge actually navigates to for a pageId — the guard
+// must compare against this, not the fallback branch's pushState path. They
+// differ in one place: the bridge takes the dashboard to '/dashboard' (the
+// route manifest path) while the legacy fallback pushes '/'.
+function _navGuardPath(pageId, options = {}) {
+    if (pageId === 'dashboard') return '/dashboard';
+    return _navTargetPath(pageId, options);
+}
+
+function _normalizeNavPath(path) {
+    const stripped = window.SoulSyncURL?.strip(String(path || '')) ?? String(path || '');
+    const bare = stripped.split('?')[0].split('#')[0];
+    if (bare.length > 1 && bare.endsWith('/')) return bare.slice(0, -1);
+    return bare || '/';
+}
+
+// The sidebar fires navigateToPage twice per mouse click: pointerdown (for an
+// instant response) and click ~100-200ms later. The guard above compares
+// against window.location.pathname, which only changes once TanStack commits
+// the navigation — async — so without its own synchronous signal the
+// click-phase call would fire a second router.navigate to the same target
+// (double loaders, double history entries). This records the last target
+// synchronously; the echo honors it exactly once and stands down. History
+// traversals (Back/forward) bypass navigateToPage, so popstate clears it.
+let _lastNavTarget = null;
+let _lastNavAt = 0;
+// Just wider than the pointerdown->click gap (~150ms). A stale token can
+// swallow at most one legitimate click before it expires or is consumed,
+// so keep the window tight.
+const _NAV_ECHO_WINDOW_MS = 1000;
+
+function _noteNavTarget(target) {
+    _lastNavTarget = target;
+    _lastNavAt = Date.now();
+}
+
+function _isNavEcho(target) {
+    if (_lastNavTarget !== target) return false;
+    if (Date.now() - _lastNavAt > _NAV_ECHO_WINDOW_MS) {
+        _lastNavTarget = null;
+        return false;
+    }
+    _lastNavTarget = null;
+    return true;
+}
+
+window.addEventListener('popstate', () => { _lastNavTarget = null; });
+
 function navigateToPage(pageId, options = {}) {
     navigationEpoch += 1;
 
-    if (!options.forceReload && pageId === currentPage) return;
+    const navTarget = _normalizeNavPath(_navGuardPath(pageId, options));
+    if (!options.forceReload
+        && (navTarget === _normalizeNavPath(window.location.pathname) || _isNavEcho(navTarget))) return;
+    _noteNavTarget(navTarget);
 
     // Permission guard — redirect to home page if not allowed
     if (!isPageAllowed(pageId)) {
@@ -4657,10 +4830,7 @@ function navigateToPage(pageId, options = {}) {
     }
 
     if (!options.skipPushState) {
-        const urlPath = pageId === 'dashboard' ? '/'
-            : (pageId === 'artist-detail' && options.artistId) ? buildArtistDetailPath(options.artistId, options.artistSource, options.artistName, options.focusAlbumId)
-            : (pageId === 'label-detail' && options.labelId) ? buildLabelDetailPath(options.labelId, options.labelName)
-            : '/' + pageId;
+        const urlPath = _navTargetPath(pageId, options);
         if ((window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname) !== urlPath) {
             if (options.replace === true) {
                 history.replaceState({ page: pageId }, '', urlPath);
@@ -4988,7 +5158,8 @@ async function loadInitialData() {
         // Navigate to user's home page (or dashboard for admin)
         const homePage = getProfileHomePage();
         const urlPage = _getPageFromPath();
-        let targetPage = (urlPage && urlPage !== 'dashboard' && isPageAllowed(urlPage))
+        // media-aware: /wishlist?media=tv is the video wishlist, gated by that page
+        let targetPage = (urlPage && urlPage !== 'dashboard' && isPageAccessAllowed(urlPage, window.location.search))
             ? urlPage
             : homePage;
 
@@ -5009,7 +5180,7 @@ async function loadInitialData() {
         // answers the question startup was already asking, so adopt it.
         if ((window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname) !== initialPath) {
             const redirectedPage = _getPageFromPath();
-            if (redirectedPage && isPageAllowed(redirectedPage)) {
+            if (redirectedPage && isPageAccessAllowed(redirectedPage, window.location.search)) {
                 targetPage = redirectedPage;
             }
         }

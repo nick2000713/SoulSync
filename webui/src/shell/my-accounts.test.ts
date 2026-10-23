@@ -9,7 +9,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { server } from '@/test/msw';
 
-import { closeMyAccountsModal, openMyAccountsModal, openPersonalSettings } from './my-accounts';
+import {
+  _maPlexConnect,
+  closeMyAccountsModal,
+  openMyAccountsModal,
+  openPersonalSettings,
+} from './my-accounts';
 
 type Conns = Record<string, { connected: boolean; account: string | null }>;
 
@@ -92,6 +97,29 @@ afterEach(() => {
 });
 
 describe('My Account', () => {
+  it('closes the mobile nav drawer it was opened from (Oct 13 fold, M-04)', async () => {
+    // The My Account button lives inside the sidebar drawer; drawer-first
+    // is the natural phone flow, and the drawer (z-10001) would otherwise
+    // stay open over the modal (z-10000) with its close button hidden.
+    document.body.innerHTML = `
+      <button id="hamburger-btn" class="active" aria-expanded="true"></button>
+      <div id="mobile-overlay" class="active"></div>
+      <aside class="sidebar mobile-open"></aside>`;
+    document.body.classList.add('mobile-nav-open');
+    mockAccount({});
+    await opened();
+    expect(document.querySelector('.sidebar')?.classList.contains('mobile-open')).toBe(false);
+    expect(document.body.classList.contains('mobile-nav-open')).toBe(false);
+    expect(document.getElementById('mobile-overlay')?.classList.contains('active')).toBe(false);
+    const burger = document.getElementById('hamburger-btn');
+    expect(burger?.classList.contains('active')).toBe(false);
+    expect(burger?.getAttribute('aria-expanded')).toBe('false');
+    // …and the modal itself is open.
+    expect(document.getElementById('my-accounts-overlay')?.classList.contains('hidden')).toBe(
+      false,
+    );
+  });
+
   it('is one modal with your media server and your music services', async () => {
     mockAccount({ library: { navidrome_username: 'kim' } });
     await opened();
@@ -262,10 +290,234 @@ describe('My Account', () => {
     expect(pin.hidden).toBe(false);
   });
 
+  it('plex offers connect with plex to everyone, home users or not', async () => {
+    // a shared friend: no plex home users on the server, still gets a way in
+    mockAccount({ server: 'plex' });
+    server.use(
+      http.get('/api/plex/music-libraries', () => HttpResponse.json({ libraries: ['Music'] })),
+      http.get('/api/profiles/me/plex-home-users', () => HttpResponse.json({ users: [] })),
+    );
+    await opened();
+    click('[data-ma="toggle"][data-id="server"]');
+    const primary = body().querySelectorAll('.ma-btn-primary[data-ma^="plex"]');
+    expect([...primary].map((b) => (b as HTMLElement).dataset.ma)).toEqual(['plex-connect']);
+    expect(document.getElementById('ma-plex-user')).toBeNull();
+  });
+
+  it('connect with plex waits for plex, then links and says who', async () => {
+    mockAccount({ server: 'plex' });
+    let checks = 0;
+    server.use(
+      http.get('/api/plex/music-libraries', () => HttpResponse.json({ libraries: [] })),
+      http.get('/api/profiles/me/plex-home-users', () => HttpResponse.json({ users: [] })),
+      http.post('/api/profiles/me/plex-connect/start', () =>
+        HttpResponse.json({ success: true, url: 'https://app.plex.tv/auth#?x' }),
+      ),
+      http.post('/api/profiles/me/plex-connect/check', () => {
+        checks += 1;
+        return HttpResponse.json(
+          checks < 2
+            ? { success: true, pending: true }
+            : { success: true, pending: false, title: 'maxnrose' },
+        );
+      }),
+    );
+    const popup = { location: { href: '' }, closed: false, close: vi.fn() };
+    const ok = await _maPlexConnect(
+      null,
+      () => popup as unknown as Window,
+      async () => {},
+    );
+    expect(ok).toBe(true);
+    expect(popup.location.href).toBe('https://app.plex.tv/auth#?x');
+    expect(popup.close).toHaveBeenCalled();
+    expect(toasts).toContain('Connected to Plex as maxnrose');
+  });
+
+  it('connect with plex shows the server refusal', async () => {
+    server.use(
+      http.post('/api/profiles/me/plex-connect/start', () =>
+        HttpResponse.json({ success: true, url: 'https://app.plex.tv/auth#?x' }),
+      ),
+      http.post('/api/profiles/me/plex-connect/check', () =>
+        HttpResponse.json(
+          { success: false, error: 'That Plex account is connected to another SoulSync profile' },
+          { status: 403 },
+        ),
+      ),
+    );
+    const popup = { location: { href: '' }, closed: false, close: vi.fn() };
+    expect(
+      await _maPlexConnect(
+        null,
+        () => popup as unknown as Window,
+        async () => {},
+      ),
+    ).toBe(false);
+    expect(toasts).toContain('That Plex account is connected to another SoulSync profile');
+  });
+
+  it('connect with plex stops when plex is closed without approving', async () => {
+    server.use(
+      http.post('/api/profiles/me/plex-connect/start', () =>
+        HttpResponse.json({ success: true, url: 'https://app.plex.tv/auth#?x' }),
+      ),
+      http.post('/api/profiles/me/plex-connect/check', () =>
+        HttpResponse.json({ success: true, pending: true }),
+      ),
+    );
+    const popup = { location: { href: '' }, closed: true, close: vi.fn() };
+    expect(
+      await _maPlexConnect(
+        null,
+        () => popup as unknown as Window,
+        async () => {},
+      ),
+    ).toBe(false);
+    expect(toasts).toContain('Connecting with Plex was cancelled');
+  });
+
   it('the admin is pointed at Settings', async () => {
     mockAccount({ isAdmin: true });
     openMyAccountsModal();
     await vi.waitFor(() => expect(body().textContent).toContain("They're set up in Settings"));
     expect(body().querySelector('.ma-section')).toBeNull();
+  });
+});
+
+describe('My Account: sign in with oidc', () => {
+  function mockOidc(status: Record<string, unknown>) {
+    server.use(
+      http.get('/api/profiles/me/oidc', () => HttpResponse.json({ success: true, ...status })),
+    );
+  }
+  const signIn = () =>
+    (body().querySelector('#ma-signin-h')?.closest('.ma-section') ?? null) as HTMLElement | null;
+
+  it('has no sign-in card when the admin has not turned it on', async () => {
+    mockAccount();
+    mockOidc({ enabled: false, label: 'Sign in with OIDC', connected: false, last: null });
+    await opened();
+    expect(signIn()).toBeNull();
+  });
+
+  it("offers connect, named with the admin's label", async () => {
+    mockAccount();
+    mockOidc({ enabled: true, label: 'Sign in with Pocket ID', connected: false, last: null });
+    await opened();
+    await vi.waitFor(() => expect(signIn()).not.toBeNull());
+    expect(signIn()!.textContent).toContain('Sign in with Pocket ID');
+    expect(signIn()!.querySelector('[data-ma="oidc-connect"]')).not.toBeNull();
+    expect(signIn()!.querySelector('[data-ma="oidc-disconnect"]')).toBeNull();
+  });
+
+  it('disconnect when connected, and it says so', async () => {
+    mockAccount();
+    mockOidc({ enabled: true, label: 'Sign in with Pocket ID', connected: true, last: null });
+    let deleted = 0;
+    server.use(
+      http.delete('/api/profiles/me/oidc', () => {
+        deleted++;
+        return HttpResponse.json({ success: true });
+      }),
+    );
+    await opened();
+    await vi.waitFor(() =>
+      expect(signIn()?.querySelector('[data-ma="oidc-disconnect"]')).not.toBeNull(),
+    );
+    click('[data-ma="oidc-disconnect"]');
+    await vi.waitFor(() => expect(deleted).toBe(1));
+    await vi.waitFor(() => expect(toasts).toContain('Disconnected'));
+  });
+
+  it('a refused disconnect shows the server reason', async () => {
+    mockAccount();
+    mockOidc({ enabled: true, label: 'Sign in with Pocket ID', connected: true, last: null });
+    server.use(
+      http.delete('/api/profiles/me/oidc', () =>
+        HttpResponse.json(
+          { success: false, error: 'This is the only way this profile can sign in.' },
+          { status: 400 },
+        ),
+      ),
+    );
+    await opened();
+    await vi.waitFor(() =>
+      expect(signIn()?.querySelector('[data-ma="oidc-disconnect"]')).not.toBeNull(),
+    );
+    click('[data-ma="oidc-disconnect"]');
+    await vi.waitFor(() => expect(toasts.join(' ')).toContain('only way'));
+  });
+
+  it('says how a connect that just came back went', async () => {
+    mockAccount();
+    mockOidc({
+      enabled: true,
+      label: 'Sign in with Pocket ID',
+      connected: false,
+      last: { connected: false, error: 'That account is connected to another SoulSync profile' },
+    });
+    await opened();
+    await vi.waitFor(() => expect(toasts.join(' ')).toContain('another SoulSync profile'));
+  });
+
+  it('the admin, pointed at Settings, still gets the sign-in card', async () => {
+    mockAccount({ isAdmin: true });
+    mockOidc({
+      enabled: true,
+      label: 'Sign in with Pocket ID',
+      connected: true,
+      last: { connected: true },
+    });
+    openMyAccountsModal();
+    await vi.waitFor(() => expect(body().textContent).toContain("They're set up in Settings"));
+    await vi.waitFor(() => expect(signIn()).not.toBeNull());
+    expect(toasts.join(' ')).toContain('Connected');
+  });
+
+  it("shows the admin's logo, or a plain key without one", async () => {
+    mockAccount();
+    mockOidc({
+      enabled: true,
+      label: 'Sign In With Pocket ID',
+      icon: 'https://cdn.example.test/pocket-id.png',
+      connected: true,
+      last: null,
+    });
+    await opened();
+    await vi.waitFor(() => expect(signIn()).not.toBeNull());
+    expect(signIn()!.querySelector('.ma-logo img')!.getAttribute('src')).toBe(
+      'https://cdn.example.test/pocket-id.png',
+    );
+
+    closeMyAccountsModal();
+    mockOidc({
+      enabled: true,
+      label: 'Sign In With Pocket ID',
+      icon: '',
+      connected: true,
+      last: null,
+    });
+    await opened();
+    await vi.waitFor(() => expect(signIn()).not.toBeNull());
+    expect(signIn()!.querySelector('.ma-logo img')).toBeNull();
+    expect(signIn()!.querySelector('.ma-logo-key svg')).not.toBeNull();
+  });
+
+  it('the header catches up when the profile is known after it opened', async () => {
+    window.getCurrentProfileContext = () => null;
+    mockAccount();
+    mockOidc({ enabled: true, label: 'Sign In With Pocket ID', connected: true, last: null });
+    await opened();
+    expect(modal().querySelector('.ma-title')!.textContent).toBe('My Account');
+    window.getCurrentProfileContext = () => ({
+      profileId: 7,
+      isAdmin: false,
+      name: 'Kim',
+      avatarColor: '#6d5ce8',
+      avatarUrl: '',
+    });
+    window.dispatchEvent(new CustomEvent('ss:webui-profile-context-changed'));
+    expect(modal().querySelector('.ma-title')!.textContent).toBe('Kim');
   });
 });

@@ -368,9 +368,9 @@ class MusicMatchingEngine:
 
         return standard_ratio
     
-    def duration_similarity(self, duration1: int, duration2: int) -> float:
+    def duration_similarity(self, duration1: Optional[int], duration2: Optional[int]) -> float:
         """Calculates similarity score based on track duration (in ms)."""
-        if duration1 == 0 or duration2 == 0:
+        if not duration1 or not duration2:
             return 0.5 # Neutral score if a duration is missing
         
         # Allow a 5-second tolerance (5000 ms)
@@ -381,8 +381,8 @@ class MusicMatchingEngine:
         return max(0, 1.0 - diff_ratio * 5)
 
     def score_track_match(self, source_title: str, source_artists: List[str],
-                          source_duration_ms: int, candidate_title: str,
-                          candidate_artists: List[str], candidate_duration_ms: int) -> Tuple[float, str]:
+                          source_duration_ms: Optional[int], candidate_title: str,
+                          candidate_artists: List[str], candidate_duration_ms: Optional[int]) -> Tuple[float, str]:
         """Generic track matching — same logic as calculate_match_confidence but type-agnostic.
 
         Works for any two tracks regardless of source (Spotify, iTunes, YouTube, Tidal, etc.).
@@ -391,6 +391,11 @@ class MusicMatchingEngine:
 
         Returns (confidence, match_type) tuple.
         """
+        # Catalogue rows and provider responses may omit the runtime. Use the
+        # existing unknown-duration sentinel before comparisons or arithmetic.
+        source_duration_ms = source_duration_ms or 0
+        candidate_duration_ms = candidate_duration_ms or 0
+
         # --- Artist Scoring ---
         source_artists_cleaned = [self.clean_artist(a) for a in source_artists if a]
 
@@ -927,6 +932,20 @@ class MusicMatchingEngine:
         return queries[0] if queries else ""
         
     
+    @staticmethod
+    def _candidate_text(slskd_track) -> str:
+        """The text the matcher reads off a result.
+
+        Soulseek: the path. YouTube: just the title after the video id, since
+        'videoId||title' is not a path and the id only drags the score down.
+        A catalog hit is 'videoId||Sugar', so the id was most of the string
+        and exact matches fell under the threshold (#1817).
+        """
+        filename = slskd_track.filename or ''
+        if getattr(slskd_track, 'username', None) == 'youtube' and '||' in filename:
+            return filename.split('||', 1)[1]
+        return filename
+
     def calculate_slskd_match_confidence(self, spotify_track: SpotifyTrack, slskd_track: TrackResult) -> float:
         """
         Calculates a confidence score for a Soulseek track against a Spotify track.
@@ -937,8 +956,12 @@ class MusicMatchingEngine:
         spotify_title_norm = self.normalize_string(spotify_track.name)
         spotify_artists_norm = [self.normalize_string(a) for a in spotify_track.artists]
 
+        # --- Source Type ---
+        is_youtube = slskd_track.username == 'youtube'
+
         # The slskd filename is our primary source of truth, so normalize it
-        slskd_filename_norm = self.normalize_string(slskd_track.filename)
+        candidate_text = self._candidate_text(slskd_track)
+        slskd_filename_norm = self.normalize_string(candidate_text)
 
         # 1. Title Score: Use full-string similarity instead of substring matching
         # This prevents false positives like "Love" matching "Loveless"
@@ -965,7 +988,11 @@ class MusicMatchingEngine:
 
         # Split original filename into segments for per-segment matching.
         # Handles path separators (/, \) and YouTube's || delimiter.
-        _artist_segments = re.split(r'[/\\|]+', slskd_track.filename)
+        _artist_segments = re.split(r'[/\\|]+', candidate_text)
+        # YouTube hands us the artist already. A catalog hit's title never
+        # carries it, so without this the artist was nowhere to be found.
+        if is_youtube and getattr(slskd_track, 'artist', None):
+            _artist_segments.append(slskd_track.artist)
         _artist_segments_norm = [self.normalize_string(s) for s in _artist_segments if s.strip()]
 
         for artist in spotify_artists_norm:
@@ -1008,9 +1035,6 @@ class MusicMatchingEngine:
                 quality_bonus = 0.03  # Reduced from 0.07
             elif slskd_track.quality.lower() == 'mp3' and (slskd_track.bitrate or 0) >= 320:
                 quality_bonus = 0.02  # Reduced from 0.05
-
-        # --- Source Type ---
-        is_youtube = slskd_track.username == 'youtube'
 
         # 4b. Album Bonus/Penalty: Prefer results from the correct album folder.
         # Uses full-string similarity to prevent "Paradise" matching "Club Paradise".
@@ -1186,6 +1210,16 @@ class MusicMatchingEngine:
                 'patterns': [r'\bradio\s*edit\b', r'\bradio\s*version\b', r'\bclean\s*edit\b'],
                 'penalty': 0.08  # -8% penalty for radio edits (minor difference)
             },
+            # tempo edits ahead of remix: "Slowed Edit" holds the remix word
+            # 'edit', but its audio is the slowed cut, not a remix
+            'slowed': {
+                'patterns': [r'\bslowed\b', r'\bdaycore\b'],
+                'penalty': 0.20
+            },
+            'sped_up': {
+                'patterns': [r'\bsped\s*up\b', r'\bspeed\s*up\b', r'\bnightcore\b'],
+                'penalty': 0.20
+            },
             'remix': {
                 'patterns': [r'\bremix\b', r'\brmx\b', r'\brework\b', r'\bedit\b(?!ion)'],
                 'penalty': 0.15  # -15% penalty for remixes
@@ -1252,7 +1286,58 @@ class MusicMatchingEngine:
         base_confidence = self.calculate_slskd_match_confidence(spotify_track, slskd_track)
 
         # Detect version type in Soulseek result
-        version_type, penalty = self.detect_version_type(slskd_track.filename)
+        candidate_text = self._candidate_text(slskd_track)
+        is_youtube = getattr(slskd_track, 'username', None) == 'youtube'
+        version_type, penalty = self.detect_version_type(candidate_text)
+
+        # --- Base-title veto (#1626) ---
+        # A shared version qualifier inflates whole-path similarity enough to
+        # pass the title gate: wanted "Crystalline (Orchestral Version)" vs a
+        # DIFFERENT song's "Damnation Flame (Orchestral Version)" in the right
+        # artist folder scored 0.69 and cleared the accept threshold — the
+        # "(Orchestral Version)" overlap pushed the title score past the 0.30
+        # gate while the artist folder contributed 0.40. Compare the BARE song
+        # titles instead: if both reduce to non-empty base titles that are
+        # nowhere near each other, this is the wrong song no matter what the
+        # folders say. Fail open — all three must hold or nothing happens:
+        #   (a) the artist component matched cleanly (word-boundary hit: the
+        #       similarity fallback is capped at 0.70, so >= 0.99 is exact);
+        #   (b) both base titles are non-empty;
+        #   (c) base-title similarity under a FLOOR, not exact inequality, so
+        #       a typo'd filename never gets vetoed.
+        # Same song, different version ("X" vs "X (Remastered)") reduces to
+        # equal base titles and never vetoes — that call stays with the strict
+        # version matching below. Skipped when the base scorer already
+        # rejected (0.0), so its early-return paths are untouched.
+        if base_confidence > 0.0:
+            _artist_evidence = getattr(slskd_track, 'artist_score', None) or 0.0
+            if _artist_evidence >= 0.99:
+                # Pass the wanted artist on both sides (MAJOR-1, #1626): for
+                # flat "Artist - Title" filenames — an explicitly supported
+                # shape — the last segment is the whole "Artist - Title"
+                # string, and without the artist the name dilutes the
+                # candidate base title ("up" vs "pink floyd up"), vetoing
+                # correct short-titled tracks by long-named artists.
+                # strip_artist_prefix only strips on exact folded equality
+                # and never returns empty, so this is fail-safe.
+                _wanted_artist = (getattr(spotify_track, 'artists', None)
+                                  or [''])[0]
+                _wanted_base = self.base_title_of(spotify_track.name,
+                                                  _wanted_artist)
+                _cand_base = self.base_title_of(candidate_text,
+                                                _wanted_artist,
+                                                from_filename=not is_youtube)
+                if _wanted_base and _cand_base:
+                    _base_sim = SequenceMatcher(
+                        None, _wanted_base, _cand_base).ratio()
+                    if _base_sim < 0.30:
+                        logger.debug(
+                            f"Base-title veto: '{spotify_track.name}' vs "
+                            f"'{slskd_track.filename[:60]}' (base "
+                            f"'{_wanted_base}' vs '{_cand_base}', "
+                            f"sim={_base_sim:.2f})"
+                        )
+                        return 0.0, 'rejected_base_title_mismatch'
 
         # Check if Spotify track title contains version indicators
         spotify_title_lower = spotify_track.name.lower()
@@ -1263,6 +1348,14 @@ class MusicMatchingEngine:
         # which is the exact case the setting exists for.
         _preferred = self._preferred_version()
         _wanted_on_purpose = bool(_preferred) and version_type == _preferred
+
+        # A slowed / sped-up cut is its own audio in BOTH directions. The checks
+        # below only reject a versioned candidate, so the plain studio file
+        # scored 0.73 for "Devil Eyes - Slowed" and got imported as it.
+        _wanted_version = self.detect_version_type(spotify_track.name)[0]
+        if ((version_type in self.TEMPO_EDITS or _wanted_version in self.TEMPO_EDITS)
+                and version_type != _wanted_version):
+            return 0.0, 'rejected_version_mismatch'
 
         # STRICT VERSION MATCHING: Reject mismatched versions
         if version_type == 'live' and not _wanted_on_purpose:
@@ -1365,6 +1458,8 @@ class MusicMatchingEngine:
     # silently matching nothing.
     PREFERABLE_VERSIONS = ('extended', 'radio', 'remix', 'live', 'acoustic',
                            'instrumental', 'demo', 'clean', 'explicit')
+    # tempo edits: never a stand-in for the original, nor the original for them
+    TEMPO_EDITS = ('slowed', 'sped_up')
 
     _BRACKET_GROUP = re.compile(r'[\(\[][^\)\]]*[\)\]]')
 
@@ -1457,8 +1552,9 @@ class MusicMatchingEngine:
             if getattr(r, 'version_type', 'original') != preferred:
                 continue
             try:
-                if self.base_title_of(getattr(r, 'filename', ''), artist,
-                                      from_filename=True) == wanted:
+                is_youtube = getattr(r, 'username', None) == 'youtube'
+                if self.base_title_of(self._candidate_text(r), artist,
+                                      from_filename=not is_youtube) == wanted:
                     matches.add(id(r))
             except Exception:
                 continue

@@ -471,6 +471,19 @@ describe('normTitleForMatch', () => {
 
 describe('getAlbumCanonicalSource', () => {
   it('prefers Spotify, then Deezer, then iTunes', () => {
+    // A pinned release must override the normal Spotify-first fallback.
+    expect(
+      getAlbumCanonicalSource({
+        title: "Kill 'Em All (Remastered)",
+        track_count: 10,
+        canonical_source: 'deezer',
+        canonical_album_id: '14581190',
+        canonical_locked: 1,
+        spotify_album_id: '3m69LQokz6DaKB3yw4BH6n',
+        deezer_id: '14581190',
+      }),
+    ).toEqual({ source: 'deezer', id: '14581190' });
+
     expect(getAlbumCanonicalSource({ deezer_id: 'd', spotify_album_id: 's' })).toEqual({
       source: 'spotify',
       id: 's',
@@ -760,5 +773,30 @@ describe('bitrateClass', () => {
     expect(bitrateClass(192)).toBe('medium');
     expect(bitrateClass(160)).toBe('low');
     expect(bitrateClass(0)).toBe('low');
+  });
+});
+
+describe('playlistTrackPayload', () => {
+  it("uses a compilation row's own artist over the page's", async () => {
+    const { playlistTrackPayload } = await import('./-artist-detail.enhanced-album');
+    expect(
+      playlistTrackPayload(
+        { title: 'Song', artist_name: 'Guest', duration: 180000 },
+        { title: 'Comp', thumb_url: '/api/image/1' },
+        { name: 'Various Artists' },
+      ),
+    ).toEqual({
+      track_name: 'Song',
+      artist_name: 'Guest',
+      album_name: 'Comp',
+      duration_ms: 180000,
+      image_url: '/api/image/1',
+    });
+  });
+
+  it("falls back to the page's artist, and is null without a title", async () => {
+    const { playlistTrackPayload } = await import('./-artist-detail.enhanced-album');
+    expect(playlistTrackPayload({ title: 'Song' }, {}, { name: 'Band' })?.artist_name).toBe('Band');
+    expect(playlistTrackPayload({}, {}, { name: 'Band' })).toBeNull();
   });
 });

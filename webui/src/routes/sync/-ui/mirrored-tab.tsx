@@ -59,6 +59,8 @@ import {
   fetchSourceDiscoveryStatus,
   prepareMirroredDiscovery,
   patchMirroredCustomName,
+  postCopyToRequestList,
+  patchRequestListSettings,
 } from '../-sync.api';
 import { patchMirroredSourceRef } from '../-sync.api';
 import { patchMirroredPreferences } from '../-sync.api';
@@ -91,10 +93,21 @@ import { SOURCE_REF_FAILED, sourceRefUpdatedToast } from '../-sync.pipeline';
 import { SYNC_SOURCES } from '../-sync.sources';
 import { asString } from '../-sync.url-tabs';
 import { useExportJobs } from '../-sync.use-export';
+import { playPlaylist } from '../../../features/playlists/play-playlist';
+import {
+  copyMirrorToUserPlaylist,
+  createUserPlaylist,
+  duplicateUserPlaylist,
+  isUserPlaylist,
+  pinLikedFirst,
+  removeFromUserPlaylist,
+  reorderUserPlaylist,
+} from '../../../features/playlists/user-playlists';
 import { AutoSyncWeeklyEditor } from './autosync-weekly';
 import { ExportModal, ExportStatusSpan } from './export-modal';
 import { MirroredDetailModal } from './mirrored-detail-modal';
 import { PlaylistCard, playlistCardPrimaryLabel } from './playlist-card';
+import { PlaylistSearch } from './playlist-search';
 import { ScheduleMenu } from './schedule-menu';
 import { SourceIcon } from './source-icon';
 import { SourceRefModal } from './source-ref-modal';
@@ -124,7 +137,7 @@ export interface MirroredTabProps {
    * hook already treats its collaborators ("the collaborators live in refs so
    * the returned controller is STABLE").
    */
-  registerReload: (reload: () => void) => void;
+  registerReload: (reload: () => void, key?: string) => void;
   /**
    * Hand the page this tab's detail-modal opener.
    *
@@ -136,6 +149,24 @@ export interface MirroredTabProps {
    * call it, so it is the sync page's duplicate that goes, not the function.)
    */
   registerOpenDetail?: (open: (playlistId: number) => void) => void;
+  /**
+   * which playlists this instance shows. 'all' is the Mirrored library, every
+   * playlist that came from somewhere. 'user' is My Playlists, the ones made
+   * here (source 'soulsync'). 'requests' is Request Lists. same component so all
+   * get every card action, schedule and the pipeline; each playlist lives in exactly one tab.
+   */
+  scope?: 'all' | 'user' | 'requests';
+}
+
+/** the scope's slice of the list. */
+function rowsForScope<T extends { source?: string | null; is_request_list?: boolean }>(
+  rows: readonly T[],
+  scope: 'all' | 'user' | 'requests',
+): T[] {
+  if (scope === 'requests') {
+    return rows.filter((r) => Boolean(r.is_request_list));
+  }
+  return rows.filter((r) => !r.is_request_list && isUserPlaylist(r) === (scope === 'user'));
 }
 
 /**
@@ -157,6 +188,10 @@ function MirroredCardMenu({
   onClear,
   onDelete,
   onToggleOrganize,
+  onSetSyncMode,
+  onCopyToMine,
+  onCopyToRequests,
+  onToggleAutoRemove,
 }: {
   row: MirroredPlaylistRow;
   top: number;
@@ -170,6 +205,14 @@ function MirroredCardMenu({
   onClear: () => void;
   onDelete: () => void;
   onToggleOrganize: (enabled: boolean) => void;
+  /** '' = back to the global mode */
+  onSetSyncMode: (mode: string) => void;
+  /** a mirror only: an editable copy in My Playlists */
+  onCopyToMine?: () => void;
+  /** copy as a new Request List */
+  onCopyToRequests?: () => void;
+  /** toggle Spotify auto-remove */
+  onToggleAutoRemove?: () => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const pos = usePopoverPosition({ top, left }, ref);
@@ -244,9 +287,53 @@ function MirroredCardMenu({
           <span dangerouslySetInnerHTML={profileMarkup} />
         </div>
       ) : null}
+      {/* #1704: append-only for a mirror you add to on the server, while
+          the global mode keeps doing the rest */}
+      <div
+        className="pl-menu-field"
+        onClick={(e) => {
+          e.stopPropagation();
+        }}
+      >
+        <span className="pl-menu-heading">Sync mode</span>
+        <select
+          aria-label="Sync mode"
+          value={row.sync_mode ?? ''}
+          onChange={(e) => {
+            onSetSyncMode(e.target.value);
+            onClose();
+          }}
+        >
+          <option value="">Use global setting</option>
+          <option value="reconcile">Reconcile (match the source)</option>
+          <option value="append">Append only (never remove tracks)</option>
+          <option value="replace">Replace (delete and recreate)</option>
+        </select>
+      </div>
       <div className="pl-menu-sep" />
       {item('Rename', onRename)}
-      {item('Edit source link', onEditSource)}
+      {!isUserPlaylist(row) && onCopyToMine && item('Copy to My Playlists', onCopyToMine)}
+      {row.is_request_list ? (
+        <>
+          {(row.source === 'spotify' || row.source === 'spotify_public') && onToggleAutoRemove && (
+            <button
+              type="button"
+              className={`pl-menu-item${row.auto_remove_fulfilled ? ' pl-menu-item--on' : ''}`}
+              title="Automatically remove tracks from the Spotify playlist once fulfilled"
+              onClick={() => {
+                onToggleAutoRemove();
+                onClose();
+              }}
+            >
+              Auto-remove fulfilled (Spotify)
+              {row.auto_remove_fulfilled ? <span className="pl-menu-tick">✓</span> : null}
+            </button>
+          )}
+        </>
+      ) : (
+        <>{onCopyToRequests && item('Copy to Request Lists', onCopyToRequests)}</>
+      )}
+      {!isUserPlaylist(row) && item('Edit source link', onEditSource)}
       {item('Export', onExport)}
       {/* Only offered when there IS a discovery to clear (575-582). */}
       {(row.discovered_count || 0) > 0 && item('Clear identification', onClear)}
@@ -261,10 +348,18 @@ export function MirroredTab({
   pipeline,
   registerReload,
   registerOpenDetail,
+  scope = 'all',
 }: MirroredTabProps) {
   const config = SYNC_SOURCES.mirrored;
+  const userScope = scope === 'user';
+  const requestsScope = scope === 'requests';
+  const loadingText = requestsScope
+    ? 'Loading request lists...'
+    : userScope
+      ? 'Loading your playlists...'
+      : 'Loading mirrored playlists...';
   const [rows, setRows] = useState<MirroredPlaylistRow[] | null>(null);
-  const [placeholder, setPlaceholder] = useState('Loading mirrored playlists...');
+  const [placeholder, setPlaceholder] = useState(loadingText);
   /** The library view: filter by STATE, and optionally narrow by source. */
   const [filter, setFilter] = useState<LibraryFilter>('all');
   const [query, setQuery] = useState('');
@@ -357,16 +452,19 @@ export function MirroredTab({
    * Same trap the registerReload ref below documents, and the one useAutoSync's
    * `now` fell into. Only an explicit reload() should re-fetch this list.
    */
-  const loadCtx = useRef({ config, vertical });
-  loadCtx.current = { config, vertical };
+  const loadCtx = useRef({ config, vertical, scope, loadingText });
+  loadCtx.current = { config, vertical, scope, loadingText };
 
   /** loadMirroredPlaylists (500-524). */
   const load = useCallback(async () => {
-    const { config, vertical } = loadCtx.current;
-    setPlaceholder('Loading mirrored playlists...');
+    const { config, vertical, scope, loadingText } = loadCtx.current;
+    setPlaceholder(loadingText);
     setRows(null);
     try {
-      const list = (await fetchMirroredPlaylists()) as unknown as MirroredPlaylistRow[];
+      const list = rowsForScope(
+        (await fetchMirroredPlaylists()) as unknown as MirroredPlaylistRow[],
+        scope,
+      );
       setRows(list);
       if (list.length === 0) return;
       // The saved discovery states, after the list is up (520), resuming any
@@ -386,7 +484,8 @@ export function MirroredTab({
       );
     } catch (err) {
       const message = err instanceof Error ? err.message : 'unknown error';
-      setPlaceholder(`Error loading mirrored playlists: ${message}`);
+      const scopeLabel = scope === 'requests' ? 'request' : scope === 'user' ? 'your' : 'mirrored';
+      setPlaceholder(`Error loading ${scopeLabel} playlists: ${message}`);
     }
   }, []);
 
@@ -422,8 +521,10 @@ export function MirroredTab({
   const registerRef = useRef(registerReload);
   registerRef.current = registerReload;
   useEffect(() => {
-    registerRef.current(reload);
-  }, [reload]);
+    const key =
+      scope === 'requests' ? 'request-lists' : scope === 'user' ? 'my-playlists' : 'mirrored';
+    registerRef.current(reload, key);
+  }, [reload, scope]);
 
   /**
    * The render-time poller resume (stats-automations.js 653-655): a row the
@@ -489,7 +590,10 @@ export function MirroredTab({
       const name = row.name ?? '';
       const ok = await window.showConfirmDialog?.({
         title: 'Delete Playlist',
-        message: `Delete mirrored playlist "${name}"?`,
+        // a mirror can be mirrored again; a user playlist is gone for good
+        message: isUserPlaylist(row)
+          ? `Delete "${name}"? This can't be undone.`
+          : `Delete mirrored playlist "${name}"?`,
         confirmText: 'Delete',
         destructive: true,
       });
@@ -500,7 +604,10 @@ export function MirroredTab({
           window.showToast?.(data.error || 'Failed to delete', 'error');
           return;
         }
-        window.showToast?.(`Deleted mirror: ${name}`, 'success');
+        window.showToast?.(
+          isUserPlaylist(row) ? `Deleted ${name}` : `Deleted mirror: ${name}`,
+          'success',
+        );
         await load();
       } catch (err) {
         window.showToast?.(
@@ -592,6 +699,57 @@ export function MirroredTab({
     }
   }, []);
 
+  /** My Playlists / Request Lists' new-playlist row: null when closed, else the typed name. */
+  const [newName, setNewName] = useState<string | null>(null);
+  const createPlaylist = useCallback(async () => {
+    const name = (newName ?? '').trim();
+    if (!name) {
+      setNewName(null);
+      return;
+    }
+    try {
+      const { id } = await createUserPlaylist(name, [], requestsScope);
+      setNewName(null);
+      window.showToast?.(
+        requestsScope ? `Made request list "${name}"` : `Made "${name}"`,
+        'success',
+      );
+      await load();
+      await openDetail(id);
+    } catch (err) {
+      window.showToast?.(err instanceof Error ? err.message : 'Failed to make playlist', 'error');
+    }
+  }, [newName, load, openDetail, requestsScope]);
+
+  /**
+   * a user playlist's track edits. the detail is refetched quietly (no
+   * overlay) so the modal stays put while you work through the list, and the
+   * cards reload for the new count. on a failure the refetch still runs, so
+   * what you see is what's saved.
+   */
+  const editTracks = useCallback(
+    async (playlistId: number, edit: () => Promise<unknown>) => {
+      try {
+        await edit();
+      } catch (err) {
+        window.showToast?.(
+          err instanceof Error ? err.message : 'Failed to update playlist',
+          'error',
+        );
+      }
+      try {
+        const data = await fetchMirroredPlaylist(playlistId);
+        if (!data.error) {
+          setDetail((prev) => (prev?.playlistId === playlistId ? { playlistId, data } : prev));
+        }
+      } catch {
+        // the next open shows it
+      }
+      void load();
+    },
+    [load],
+  );
+
   /**
    * Organize-by-playlist, moved off the Auto-Sync board.
    *
@@ -617,12 +775,33 @@ export function MirroredTab({
     },
     [load],
   );
+  const setSyncMode = useCallback(
+    async (row: MirroredPlaylistRow, mode: string) => {
+      try {
+        const res = await patchMirroredPreferences(row.id, { sync_mode: mode || null });
+        const data = (await res.json()) as { error?: string };
+        if (!res.ok || data.error) throw new Error(data.error || 'Failed to update preference');
+        window.showToast?.(
+          mode
+            ? `"${row.display_name || row.name || 'Playlist'}" now syncs in ${mode} mode`
+            : `"${row.display_name || row.name || 'Playlist'}" follows the global sync mode`,
+          'success',
+        );
+        await load();
+      } catch (err) {
+        window.showToast?.(`Error: ${err instanceof Error ? err.message : String(err)}`, 'error');
+      }
+    },
+    [load],
+  );
   /** Same ref-not-dependency reasoning as registerReload above. */
   const registerOpenDetailRef = useRef(registerOpenDetail);
   registerOpenDetailRef.current = registerOpenDetail;
   useEffect(() => {
+    // the page has one opener; Mirrored owns it, My Playlists opens its own
+    if (scope !== 'all') return;
     registerOpenDetailRef.current?.((playlistId) => void openDetail(playlistId));
-  }, [openDetail]);
+  }, [openDetail, scope]);
 
   const commitSourceRef = useCallback(
     async (row: MirroredPlaylistRow, sourceRef: string, fromDetail: boolean) => {
@@ -731,6 +910,72 @@ export function MirroredTab({
    * playlist behind it opened an empty discovery modal nobody could use
    * (#1405). the detail's Discover button reopens the discovery instead.
    */
+  /** make a mirror yours, from its card menu or its detail: the copy opens,
+   *  ready to edit, and the mirror keeps syncing from its source */
+  const copyToMine = useCallback(async (mirrorId: number) => {
+    try {
+      const copy = await copyMirrorToUserPlaylist(mirrorId);
+      const data = await fetchMirroredPlaylist(copy.id);
+      if (!data.error) setDetail({ playlistId: copy.id, data });
+      window.showToast?.(`“${copy.name}” is in My Playlists now`, 'success');
+    } catch (err) {
+      window.showToast?.(
+        err instanceof Error ? err.message : 'Could not copy the playlist',
+        'error',
+      );
+    }
+  }, []);
+
+  const copyToRequests = useCallback(
+    async (mirrorId: number) => {
+      try {
+        const res = await postCopyToRequestList(mirrorId);
+        if (res.new_playlist_id) {
+          const data = await fetchMirroredPlaylist(res.new_playlist_id);
+          if (!data.error) setDetail({ playlistId: res.new_playlist_id, data });
+        }
+        reload();
+        window.showToast?.('Copied to Request Lists', 'success');
+      } catch (err) {
+        window.showToast?.(
+          err instanceof Error ? err.message : 'Could not copy to Request Lists',
+          'error',
+        );
+      }
+    },
+    [reload],
+  );
+
+  const toggleAutoRemove = useCallback(
+    async (row: MirroredPlaylistRow) => {
+      try {
+        const next = !row.auto_remove_fulfilled;
+        // turning it on deletes songs from the real spotify playlist, so ask first
+        if (next) {
+          const ok = await window.showConfirmDialog?.({
+            title: 'Remove fulfilled tracks from Spotify?',
+            message: `Once a track from "${row.name}" is in your library, SoulSync deletes it from the playlist on Spotify itself. A wrong match deletes the wrong song.`,
+            confirmText: 'Turn on',
+            destructive: true,
+          });
+          if (!ok) return;
+        }
+        await patchRequestListSettings(row.id, next);
+        reload();
+        window.showToast?.(
+          next ? 'Auto-removal of fulfilled tracks enabled' : 'Auto-removal disabled',
+          'success',
+        );
+      } catch (err) {
+        window.showToast?.(
+          err instanceof Error ? err.message : 'Could not update request list settings',
+          'error',
+        );
+      }
+    },
+    [reload],
+  );
+
   const onCardClick = useCallback(
     (row: MirroredPlaylistRow) => {
       void openDetail(row.id);
@@ -791,7 +1036,7 @@ export function MirroredTab({
     <div>
       <div className="playlist-header">
         <div className="library-heading">
-          <h3>Your playlists</h3>
+          <h3>{requestsScope ? 'Request lists' : userScope ? 'My playlists' : 'Your playlists'}</h3>
           {/* Says something TRUE, and omits what it has nothing to say about —
               a fresh install gets a sentence, not a row of zeroes. */}
           {/* While searching, the count has to describe what you are LOOKING
@@ -805,32 +1050,15 @@ export function MirroredTab({
         {/* The gap between the heading and Update list was the widest empty
             space on the page, and finding one playlist among thirty-eight had
             no answer but scrolling. */}
-        {allRows.length > 0 && (
-          <div className="library-search">
-            <input
-              type="search"
-              className="library-search-input"
-              placeholder="Search playlists"
-              aria-label="Search playlists"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              onKeyDown={(e) => {
-                // Escape clears rather than blurs: a search box you cannot empty
-                // without selecting the text is a box you have to fight.
-                if (e.key === 'Escape') setQuery('');
-              }}
-            />
-            {query && (
-              <button
-                type="button"
-                className="library-search-clear"
-                aria-label="Clear search"
-                onClick={() => setQuery('')}
-              >
-                &times;
-              </button>
-            )}
-          </div>
+        {allRows.length > 0 && <PlaylistSearch value={query} onChange={setQuery} />}
+        {(userScope || requestsScope) && (
+          <button
+            type="button"
+            className="refresh-button user-playlist-new-btn"
+            onClick={() => setNewName((prev) => (prev === null ? '' : null))}
+          >
+            {requestsScope ? '+ New request list' : '+ New playlist'}
+          </button>
         )}
         {/* select mode lives next to Update list because that is where you
             look for "do something to the list". it is a toggle: Select opens
@@ -847,13 +1075,44 @@ export function MirroredTab({
         )}
         <button
           type="button"
-          className="refresh-button mirrored"
-          id="mirrored-refresh-btn"
+          // on My Playlists and Request Lists, New playlist is the one accent button
+          className={
+            userScope || requestsScope ? 'library-select-toggle' : 'refresh-button mirrored'
+          }
+          id={userScope || requestsScope ? undefined : 'mirrored-refresh-btn'}
           onClick={() => void load()}
         >
           Update list
         </button>
       </div>
+      {(userScope || requestsScope) && newName !== null && (
+        <form
+          className="user-playlist-create"
+          onSubmit={(e) => {
+            e.preventDefault();
+            void createPlaylist();
+          }}
+        >
+          <input
+            className="user-playlist-create-input"
+            autoFocus
+            maxLength={200}
+            placeholder={requestsScope ? 'Name your request list' : 'Name your playlist'}
+            aria-label={requestsScope ? 'New request list name' : 'New playlist name'}
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') setNewName(null);
+            }}
+          />
+          <button type="submit" className="user-playlist-create-btn" disabled={!newName.trim()}>
+            Create
+          </button>
+          <button type="button" className="library-source-clear" onClick={() => setNewName(null)}>
+            Cancel
+          </button>
+        </form>
+      )}
       {selecting && (
         /* one bar for the whole selection. "all visible" is the search and
            filter's result, so narrowing to a name and selecting all is the
@@ -955,7 +1214,11 @@ export function MirroredTab({
             {rows === null
               ? placeholder
               : rows.length === 0
-                ? 'Playlists you add from any service will appear here.'
+                ? requestsScope
+                  ? 'Request Lists download tracks for your media server without creating a playlist on it. Start one with + New request list, or copy a playlist here from Mirrored or My Playlists.'
+                  : userScope
+                    ? 'Playlists you make live here. Start one with + New playlist, then add songs with the + on any track.'
+                    : 'Playlists you add from any service will appear here.'
                 : query.trim()
                   ? // Naming the query beats "Nothing in this filter", which
                     // leaves you wondering whether it was the search or the tab.
@@ -964,7 +1227,7 @@ export function MirroredTab({
           </div>
         ) : (
           <div className="pl-grid">
-            {librarySortedRows(visibleRows, sort).map((row) => {
+            {pinLikedFirst(librarySortedRows(visibleRows, sort)).map((row) => {
               const displayName = row.display_name || row.name || '';
               // The live phase line, unchanged — its percentages and its
               // Discovered N/M are information the resting meta line cannot
@@ -991,7 +1254,7 @@ export function MirroredTab({
               const exportStatus = exportJobs.statuses[row.id];
               const state = libraryCardState(row);
               // #1289: an all-playlists pipeline schedules this card only if
-              // the backend actually processes its source (file/beatport are skipped).
+              // the backend actually processes its source (file is skipped).
               const pipelineCovers =
                 cardSchedules.hasAllPipeline && autoSyncPipelineCoversPlaylist(row);
               return renaming === row.id ? (
@@ -1029,7 +1292,7 @@ export function MirroredTab({
                   // "Mirrored 30m ago", the vanilla's own wording — it names what
                   // the timestamp actually is (the last mirror refresh), where a
                   // bare "30m ago" leaves you guessing.
-                  when={`Mirrored ${timeAgo(row.updated_at || row.mirrored_at, Date.now())}`}
+                  when={`${userScope ? 'Edited' : 'Mirrored'} ${timeAgo(row.updated_at || row.mirrored_at, Date.now())}`}
                   schedule={cardScheduleLabel(
                     cardSchedules.schedules[String(row.id)],
                     Date.now(),
@@ -1047,13 +1310,23 @@ export function MirroredTab({
                     ) : null
                   }
                   onOpen={() => onCardClick(row)}
+                  onPlay={async () => {
+                    try {
+                      const data = await fetchMirroredPlaylist(row.id);
+                      if (data.error) throw new Error(data.error);
+                      await playPlaylist(data.tracks ?? [], displayName);
+                    } catch {
+                      window.showToast?.(`Could not load ${displayName}`, 'error');
+                    }
+                  }}
                   selecting={selecting}
                   selected={selected.has(row.id)}
                   onToggleSelect={() => toggleSelected(row.id)}
+                  onNeedsMatch={() => window.openWingItPoolModal?.(String(row.id))}
                   primary={
-                    // The pipeline endpoint rejects file/beatport outright, and
-                    // lastfm cannot be scheduled either — same guard the board
-                    // uses, so the card never offers a run that 400s.
+                    // The pipeline endpoint rejects file outright, and lastfm
+                    // or a frozen beatport mirror cannot be scheduled either —
+                    // same guard the board uses.
                     !autoSyncCanSchedulePlaylist(row)
                       ? null
                       : {
@@ -1170,6 +1443,10 @@ export function MirroredTab({
           onClear={() => void onClear(menu.row)}
           onDelete={() => void onDelete(menu.row)}
           onToggleOrganize={(enabled) => void setOrganize(menu.row, enabled)}
+          onSetSyncMode={(mode) => void setSyncMode(menu.row, mode)}
+          onCopyToMine={() => void copyToMine(menu.row.id)}
+          onCopyToRequests={() => void copyToRequests(menu.row.id)}
+          onToggleAutoRemove={() => void toggleAutoRemove(menu.row)}
         />
       )}
       {exporting && (
@@ -1195,6 +1472,11 @@ export function MirroredTab({
           data={detail.data}
           now={now}
           onClose={() => setDetail(null)}
+          onFindMatches={() => {
+            const id = detail.playlistId;
+            setDetail(null);
+            window.openWingItPoolModal?.(String(id));
+          }}
           onDelete={() => {
             const row = rows?.find((r) => r.id === detail.playlistId);
             if (row) void onDelete(row);
@@ -1229,6 +1511,44 @@ export function MirroredTab({
             mirroredDiscoveryReopenable(vertical.states[mirroredHash(detail.playlistId)])
               ? 'View identification'
               : 'Identify'
+          }
+          onRemoveTrack={
+            isUserPlaylist(detail.data)
+              ? (position) =>
+                  void editTracks(detail.playlistId, () =>
+                    removeFromUserPlaylist(detail.playlistId, position),
+                  )
+              : undefined
+          }
+          onReorder={
+            isUserPlaylist(detail.data)
+              ? (order) =>
+                  void editTracks(detail.playlistId, () =>
+                    reorderUserPlaylist(detail.playlistId, order),
+                  )
+              : undefined
+          }
+          onRefresh={() => editTracks(detail.playlistId, async () => {})}
+          onMakeMine={isUserPlaylist(detail.data) ? undefined : () => copyToMine(detail.playlistId)}
+          onDuplicate={
+            isUserPlaylist(detail.data)
+              ? async () => {
+                  try {
+                    const copy = await duplicateUserPlaylist(detail.playlistId);
+                    const data = await fetchMirroredPlaylist(copy.id);
+                    if (!data.error) {
+                      setDetail({ playlistId: copy.id, data });
+                    }
+                    window.showToast?.(`Duplicated as “${copy.name}”`, 'success');
+                  } catch (err) {
+                    window.showToast?.(
+                      err instanceof Error ? err.message : 'Could not duplicate the playlist',
+                      'error',
+                    );
+                  }
+                  void load();
+                }
+              : undefined
           }
         />
       )}

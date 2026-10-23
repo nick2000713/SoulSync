@@ -258,7 +258,9 @@ describe('OperationsStudio (Simple Mode)', () => {
     expect(screen.getByText('⏹ Stop Operation')).not.toBeNull();
   });
 
-  it('navigates with severity filtering when Quarantine or Suggestions is clicked', async () => {
+  it('opens the biggest type in each bucket when Quarantine or Suggestions is clicked', async () => {
+    // the buckets are destructive / fixable, not severity. a severity filter
+    // showed something other than what the card counted (orphans are 'info')
     const onShowFindings = vi.fn();
     render(
       <OperationsStudio
@@ -275,11 +277,14 @@ describe('OperationsStudio (Simple Mode)', () => {
       expect(screen.getByText('Review Suggestions ➔')).not.toBeNull();
     });
 
+    await waitFor(() => {
+      expect(screen.getByText('Review Suggestions ➔').closest('button')?.disabled).toBe(false);
+    });
     fireEvent.click(screen.getByText('Review Suggestions ➔'));
-    expect(onShowFindings).toHaveBeenCalledWith('', { severity: 'info' });
+    expect(onShowFindings).toHaveBeenCalledWith('', { findingType: 'canonical_version' });
 
     fireEvent.click(screen.getByText('🛡️ Inspect Quarantine ➔'));
-    expect(onShowFindings).toHaveBeenCalledWith('', { severity: 'error' });
+    expect(onShowFindings).toHaveBeenCalledWith('', { findingType: 'corrupt_audio' });
   });
 
   it('renders all 1-Click Playbooks', () => {
@@ -335,12 +340,12 @@ describe('OperationsStudio (Simple Mode)', () => {
         'album_tag_consistency',
         'missing_lyrics',
         'missing_cover_art',
-        'duplicate_detector',
+        'empty_folder_cleaner',
       ],
     ],
     [
       'Audio Fidelity Sweep',
-      ['audio_corruption_detector', 'fake_lossless_detector', 'quality_upgrade_scanner'],
+      ['audio_corruption_detector', 'fake_lossless_detector', 'short_preview_track'],
     ],
     [
       'Metadata Polish',
@@ -353,9 +358,7 @@ describe('OperationsStudio (Simple Mode)', () => {
     const catalogueIds = [
       'audio_corruption_detector',
       'fake_lossless_detector',
-      'quality_upgrade_scanner',
       'short_preview_track',
-      'duplicate_detector',
       'album_tag_consistency',
       'comma_artist_splitter',
       'genre_cleanup',

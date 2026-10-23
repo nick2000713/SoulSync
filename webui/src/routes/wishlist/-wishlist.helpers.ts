@@ -1,3 +1,5 @@
+import { parseStamp } from '@/routes/active-downloads/-dl.format';
+
 import {
   WL_FAILING_ATTEMPTS,
   type ParsedWishlistTrack,
@@ -38,10 +40,16 @@ export function parseWishlistTrack(
     (typeof rawAlbum === 'string'
       ? rawAlbum
       : (rawAlbum as { name?: string } | null | undefined)?.name) || 'Unknown';
-  const albumImage =
-    (typeof rawAlbum === 'object' && rawAlbum !== null
-      ? (rawAlbum as { images?: { url?: string }[] }).images?.[0]?.url
-      : '') || '';
+  const albumImages =
+    typeof rawAlbum === 'object' && rawAlbum !== null
+      ? ((rawAlbum as { images?: { url?: string }[] }).images ?? [])
+      : [];
+  const albumImage = albumImages[0]?.url || '';
+  // The next DIFFERENT url in the list. For a Library-v2 row that is the
+  // provider CDN cover sitting behind the local artwork endpoint, which is
+  // exactly what should be painted while the local copy is still being built.
+  const albumImageFallback =
+    albumImages.find((entry) => entry?.url && entry.url !== albumImage)?.url || '';
 
   let artist = 'Unknown Artist';
   const artists = sd.artists;
@@ -58,19 +66,54 @@ export function parseWishlistTrack(
     }
   }
 
+  const source = parseSourceInfo(row.source_info);
   const retry = Number(row.retry_count) || 0;
   return {
     track: sd.name || 'Unknown',
     artist,
     album: albumName,
     image: albumImage,
+    imageFallback: albumImageFallback,
     type,
     id: String(row.spotify_track_id || row.id || ''),
     retry,
     failing: retry >= WL_FAILING_ATTEMPTS,
     lastTried: row.last_attempted || '',
     failReason: row.failure_reason || '',
+    upgrade: source.upgrade_check === true,
+    currentQuality: typeof source.original_quality === 'string' ? source.original_quality : '',
+    ...(Number(source.lib2_track_id) > 0 ? { lib2TrackId: Number(source.lib2_track_id) } : {}),
   };
+}
+
+/**
+ * Unpack `source_info`, which — like `spotify_data` — is a dict from the
+ * service and a JSON string from some callers.
+ */
+function parseSourceInfo(raw: unknown): Record<string, unknown> {
+  let value = raw;
+  if (typeof value === 'string') {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return {};
+    }
+  }
+  return value && typeof value === 'object' ? (value as Record<string, unknown>) : {};
+}
+
+/**
+ * What an upgrade row's badge says.
+ *
+ * The wishlist mixes two completely different intents — "I don't have this"
+ * and "I have this but want it better" — and showed them identically. Someone
+ * whose quality profile pulled 343 owned tracks in read it as the wishlist
+ * duplicating their library.
+ */
+export function upgradeTitle(track: ParsedWishlistTrack): string {
+  return track.currentQuality
+    ? `Quality upgrade — you already have this as ${track.currentQuality}`
+    : 'Quality upgrade — you already have this file';
 }
 
 /**
@@ -93,6 +136,27 @@ export function buildArtistImageMap(
   for (const artist of watchlistArtists) {
     if (artist.artist_name && artist.image_url) {
       map.set(artist.artist_name.toLowerCase(), artist.image_url);
+    }
+  }
+  return map;
+}
+
+/**
+ * Artist name -> CDN photo, for the artists whose primary URL is the local
+ * artwork endpoint.
+ *
+ * Kept as a SECOND map rather than folded into the first: the primary map is
+ * what everything already reads, and a curated watchlist photo must keep
+ * overriding it. This one is consulted only when the primary URL fails to
+ * load, which for a Library-v2 artist means the local build is still cold.
+ */
+export function buildArtistImageFallbackMap(
+  trackResponses: { artist_images_fallback?: Record<string, string> }[],
+): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const res of trackResponses) {
+    for (const [name, url] of Object.entries(res.artist_images_fallback ?? {})) {
+      if (name && url) map.set(name.toLowerCase(), url);
     }
   }
   return map;
@@ -127,7 +191,7 @@ export function groupWishlistArtists(
     const entry = ensure(track.artist);
     let album = entry.albums.get(track.album);
     if (!album) {
-      album = { image: track.image, tracks: [] };
+      album = { image: track.image, imageFallback: track.imageFallback ?? '', tracks: [] };
       entry.albums.set(track.album, album);
     }
     album.tracks.push(track);
@@ -140,6 +204,7 @@ export function groupWishlistArtists(
     const albums = [...entry.albums.entries()].map(([albumName, acc]) => ({
       name: albumName,
       image: acc.image,
+      imageFallback: acc.imageFallback,
       tracks: acc.tracks,
     }));
     const total =
@@ -157,6 +222,7 @@ export function groupWishlistArtists(
 
 interface WishlistAlbumAcc {
   image: string;
+  imageFallback: string;
   tracks: ParsedWishlistTrack[];
 }
 
@@ -187,6 +253,26 @@ export function orbImage(group: WishlistArtistGroup, artistImages: Map<string, s
     if (album.image) return album.image;
   }
   return group.singles.find((single) => single.image)?.image || '';
+}
+
+/**
+ * What to paint if `orbImage`'s pick fails to load.
+ *
+ * Mirrors `orbImage`'s own precedence so the fallback belongs to the same
+ * subject: an artist photo falls back to that artist's CDN photo, an orb
+ * standing in with a cover falls back to that cover's CDN url.
+ */
+export function orbImageFallback(
+  group: WishlistArtistGroup,
+  artistImages: Map<string, string>,
+  artistFallbacks: Map<string, string>,
+): string {
+  const key = group.name.toLowerCase();
+  if (artistImages.get(key)) return artistFallbacks.get(key) || '';
+  for (const album of group.albums) {
+    if (album.image) return album.imageFallback;
+  }
+  return group.singles.find((single) => single.image)?.imageFallback || '';
 }
 
 /**
@@ -245,4 +331,186 @@ export function filterWishlistGroups(
     if (group.name.toLowerCase().includes(needle)) return true;
     return group.albums.some((album) => album.name.toLowerCase().includes(needle));
   });
+}
+
+/**
+ * what's keeping a track off the shelf. only failing tracks get a trouble
+ * kind, everything else is still hunting. failure_reason also carries the
+ * reason a track was ADDED (watchlist scan, quality upgrade), so anything
+ * that isn't a known post-download rejection or a no-match lands in
+ * 'failed' rather than being read as the cause.
+ */
+export type WishlistTrouble = 'rejected' | 'notfound' | 'failed' | 'hunting';
+
+/** worst first. the order zones render in and the order an artist is filed by. */
+export const TROUBLE_ORDER: WishlistTrouble[] = ['rejected', 'notfound', 'failed', 'hunting'];
+
+const REJECTED =
+  /^(file integrity check failed|acoustid verification failed|post-processing failed)|quarantin/i;
+
+export function troubleKind(track: ParsedWishlistTrack): WishlistTrouble {
+  if (!track.failing) return 'hunting';
+  const reason = track.failReason.trim();
+  if (REJECTED.test(reason)) return 'rejected';
+  if (/^no matching track found/i.test(reason)) return 'notfound';
+  return 'failed';
+}
+
+export function groupTracks(group: WishlistArtistGroup): ParsedWishlistTrack[] {
+  return [...group.albums.flatMap((album) => album.tracks), ...group.singles];
+}
+
+/** the artist is filed under its worst track. */
+export function groupTrouble(group: WishlistArtistGroup): WishlistTrouble {
+  let worst = TROUBLE_ORDER.length - 1;
+  for (const track of groupTracks(group)) {
+    worst = Math.min(worst, TROUBLE_ORDER.indexOf(troubleKind(track)));
+  }
+  return TROUBLE_ORDER[worst];
+}
+
+export interface WishlistZone {
+  kind: WishlistTrouble;
+  title: string;
+  /** "3 artists · the file came in bad" */
+  sub: string;
+  groups: WishlistArtistGroup[];
+  /** every failing track id in the zone, for its retry button. */
+  stuckIds: string[];
+}
+
+const ZONE_COPY: Record<WishlistTrouble, { title: string; sub: string }> = {
+  rejected: { title: 'Downloaded, then rejected', sub: 'the file came in bad' },
+  notfound: { title: 'No match found', sub: 'nothing on your sources yet' },
+  failed: { title: 'Download keeps failing', sub: 'still retrying on the backoff' },
+  hunting: { title: 'Still hunting', sub: 'in line for the next pass' },
+};
+
+/**
+ * split artists into zones by what's wrong. keeps the incoming order inside
+ * each zone, so the page's sort still decides who comes first. empty zones
+ * are dropped.
+ */
+export function wishlistZones(groups: WishlistArtistGroup[]): WishlistZone[] {
+  const buckets = new Map<WishlistTrouble, WishlistArtistGroup[]>();
+  for (const group of groups) {
+    const kind = groupTrouble(group);
+    const list = buckets.get(kind) ?? [];
+    list.push(group);
+    buckets.set(kind, list);
+  }
+  return TROUBLE_ORDER.filter((kind) => buckets.has(kind)).map((kind) => {
+    const zoneGroups = buckets.get(kind)!;
+    const count = zoneGroups.length;
+    return {
+      kind,
+      title: ZONE_COPY[kind].title,
+      sub: `${count} artist${count === 1 ? '' : 's'} · ${ZONE_COPY[kind].sub}`,
+      groups: zoneGroups,
+      stuckIds: zoneGroups.flatMap((g) =>
+        groupTracks(g)
+          .filter((t) => t.failing)
+          .map((t) => t.id),
+      ),
+    };
+  });
+}
+
+/** sqlite stamps are bare utc. "today", "yesterday", else "Oct 17". */
+export function shortStamp(value: string, now: number = Date.now()): string {
+  const ms = parseStamp(value);
+  if (ms === null) return '';
+  const day = (t: number) => new Date(t).toDateString();
+  if (day(ms) === day(now)) return 'today';
+  if (day(ms) === day(now - 86_400_000)) return 'yesterday';
+  const sameYear = new Date(ms).getFullYear() === new Date(now).getFullYear();
+  return new Date(ms).toLocaleDateString([], {
+    month: 'short',
+    day: 'numeric',
+    ...(sameYear ? {} : { year: 'numeric' }),
+  });
+}
+
+function clock(seconds: number): string {
+  return `${Math.floor(seconds / 60)}:${String(Math.round(seconds % 60)).padStart(2, '0')}`;
+}
+
+function clip(text: string, max = 160): string {
+  return text.length > max ? `${text.slice(0, max - 1).trimEnd()}…` : text;
+}
+
+/** what went wrong, in words a person would use. */
+export function describeTrouble(track: ParsedWishlistTrack): {
+  kind: WishlistTrouble;
+  headline: string;
+  detail: string;
+} {
+  const kind = troubleKind(track);
+  const reason = track.failReason.trim();
+  const after = reason.replace(/^[^:]*:\s*/, '');
+
+  if (kind === 'hunting') {
+    const last = shortStamp(track.lastTried);
+    return {
+      kind,
+      headline: 'Waiting',
+      detail:
+        track.retry > 0 ? `Tried ${track.retry}×${last ? `, last ${last}` : ''}` : 'Not tried yet',
+    };
+  }
+  if (kind === 'notfound') {
+    return { kind, headline: 'No match found', detail: 'None of your sources had a match yet.' };
+  }
+  if (kind === 'failed') {
+    return {
+      kind,
+      headline: 'Download keeps failing',
+      detail: reason ? clip(`Last note: ${reason}`) : 'No reason was recorded.',
+    };
+  }
+
+  if (/^file integrity/i.test(reason)) {
+    const partial = /only ~?(\d+)s actually decodes of a (\d+)s/i.exec(reason);
+    return {
+      kind,
+      headline: 'Downloaded, then thrown out',
+      detail: partial
+        ? `Only ~${partial[1]}s of ${clock(Number(partial[2]))} actually played. A preview clip or a broken download, so the integrity check threw it out.`
+        : clip(`The file failed the integrity check: ${after}`),
+    };
+  }
+  if (/^acoustid/i.test(reason)) {
+    const heard = /mismatch:\s*'(.+?)' by '(.+?)'/i.exec(reason);
+    return {
+      kind,
+      headline: 'The wrong song came back',
+      detail: heard
+        ? clip(`The audio fingerprint says it was "${heard[1]}" by ${heard[2]}, not this track.`)
+        : "The audio fingerprint didn't match this track.",
+    };
+  }
+  if (/^post-processing/i.test(reason)) {
+    return {
+      kind,
+      headline: 'Downloaded, then failed to save',
+      detail: /winerror 3|cannot find the path/i.test(reason)
+        ? 'The file came in, but its folder could not be created on disk.'
+        : clip(`The file came in, but saving it failed: ${after}`),
+    };
+  }
+  return { kind, headline: 'Downloaded, then quarantined', detail: clip(reason) };
+}
+
+/** the quiet line under an orb. */
+export function orbMeta(group: WishlistArtistGroup): string {
+  const stuck = groupTracks(group).filter((t) => t.failing);
+  if (stuck.length === 0) return trackCountLabel(group.total);
+  const latest = stuck.reduce(
+    (best, t) => ((parseStamp(t.lastTried) ?? 0) > (parseStamp(best.lastTried) ?? 0) ? t : best),
+    stuck[0],
+  );
+  const when = shortStamp(latest.lastTried);
+  const head =
+    group.total === 1 ? `${stuck[0].retry} tries` : `${stuck.length} of ${group.total} stuck`;
+  return when ? `${head} · ${when}` : head;
 }

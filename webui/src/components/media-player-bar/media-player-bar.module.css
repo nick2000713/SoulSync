@@ -13,15 +13,15 @@
   bottom: auto;
   left: calc(var(--sidebar-w, 240px) + 24px);
   right: 24px;
-  z-index: 10000;
+  z-index: var(--z-modal);
   background: rgba(16, 16, 24, 0.94);
   backdrop-filter: blur(28px);
   -webkit-backdrop-filter: blur(28px);
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  border: 1px solid var(--white-a14);
   border-top: 1px solid rgba(255, 255, 255, 0.24);
-  border-radius: 18px;
+  border-radius: var(--radius-sheet);
   box-shadow:
-    0 20px 48px rgba(0, 0, 0, 0.75),
+    0 20px 48px var(--black-a75),
     0 0 28px rgba(var(--accent-rgb), 0.18);
   padding: 12px 24px;
   display: flex;
@@ -54,10 +54,10 @@
 .playerThumb {
   width: 44px;
   height: 44px;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   object-fit: cover;
   flex-shrink: 0;
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--white-a08);
 }
 
 .playerTrackMeta {
@@ -79,7 +79,7 @@
 
 .playerTrackAuthor {
   font-size: 11px;
-  color: rgba(255, 255, 255, 0.55);
+  color: var(--white-a55);
   margin: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -104,12 +104,12 @@
 .controlBtn {
   background: none;
   border: none;
-  color: rgba(255, 255, 255, 0.75);
+  color: var(--white-a75);
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
-  transition: all 0.15s ease;
+  transition: all var(--dur-fast) ease;
 }
 
 .controlBtn:hover {
@@ -120,7 +120,7 @@
 .playerPlayPauseBtn {
   width: 36px;
   height: 36px;
-  border-radius: 50%;
+  border-radius: var(--radius-circle);
   background: rgb(var(--accent-rgb));
   border: none;
   color: #ffffff;
@@ -128,7 +128,7 @@
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition: all var(--dur-base) ease;
   box-shadow: 0 4px 12px rgba(var(--accent-rgb), 0.35);
 }
 
@@ -147,7 +147,7 @@
 
 .timeLabel {
   font-size: 11px;
-  color: rgba(255, 255, 255, 0.5);
+  color: var(--white-a50);
   font-variant-numeric: tabular-nums;
   width: 40px;
 }
@@ -161,7 +161,7 @@
   height: 4px;
   -webkit-appearance: none;
   appearance: none;
-  background: rgba(255, 255, 255, 0.15);
+  background: var(--white-a15);
   border-radius: 2px;
   outline: none;
   cursor: pointer;
@@ -171,10 +171,10 @@
   -webkit-appearance: none;
   width: 12px;
   height: 12px;
-  border-radius: 50%;
+  border-radius: var(--radius-circle);
   background: rgb(var(--accent-rgb));
   cursor: pointer;
-  transition: transform 0.15s ease;
+  transition: transform var(--dur-fast) ease;
 }
 
 .scrubSlider:hover::-webkit-slider-thumb {
@@ -191,19 +191,19 @@
 }
 
 .speedToggleBtn {
-  background: rgba(255, 255, 255, 0.08);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 6px;
-  color: rgba(255, 255, 255, 0.85);
+  background: var(--white-a08);
+  border: 1px solid var(--white-a12);
+  border-radius: var(--radius-sm);
+  color: var(--white-a85);
   padding: 3px 8px;
   font-size: 11px;
   font-weight: 600;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: all var(--dur-fast) ease;
 }
 
 .speedToggleBtn:hover {
-  background: rgba(255, 255, 255, 0.15);
+  background: var(--white-a15);
   color: #ffffff;
 }
 
@@ -214,7 +214,7 @@
 }
 
 .volumeIcon {
-  color: rgba(255, 255, 255, 0.5);
+  color: var(--white-a50);
   font-size: 13px;
   user-select: none;
 }
@@ -224,7 +224,7 @@
   height: 4px;
   -webkit-appearance: none;
   appearance: none;
-  background: rgba(255, 255, 255, 0.15);
+  background: var(--white-a15);
   border-radius: 2px;
   outline: none;
   cursor: pointer;
@@ -234,7 +234,7 @@
   -webkit-appearance: none;
   width: 10px;
   height: 10px;
-  border-radius: 50%;
+  border-radius: var(--radius-circle);
   background: #ffffff;
   cursor: pointer;
 }
@@ -242,12 +242,12 @@
 .closePlayerBtn {
   background: none;
   border: none;
-  color: rgba(255, 255, 255, 0.4);
+  color: var(--white-a40);
   cursor: pointer;
   font-size: 18px;
   display: flex;
   align-items: center;
-  transition: color 0.15s ease;
+  transition: color var(--dur-fast) ease;
 }
 
 .closePlayerBtn:hover {

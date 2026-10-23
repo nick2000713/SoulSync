@@ -5,7 +5,7 @@ from plexapi.playlist import Playlist as PlexPlaylist
 from plexapi.exceptions import PlexApiException, NotFound
 from typing import List, Optional, Dict, Any
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import re
 from utils.logging_config import get_logger
 from core.settings import config_manager
@@ -17,7 +17,8 @@ import time
 # XPlaylistInfo. Lifted to one canonical type so consumers (matching
 # engine, sync service, etc.) get a single import.
 from core.media_server.types import TrackInfo, PlaylistInfo
-from core.media_server.contract import MediaServerClient
+from core.media_server.base import MediaServerBase
+from core.media_server.contract import Capability
 
 logger = get_logger("plex_client")
 
@@ -48,7 +49,14 @@ def _plex_track_path(track) -> str:
     return ''
 
 
-class PlexClient(MediaServerClient):
+class PlexClient(MediaServerBase):
+    CAPABILITIES = frozenset({
+        Capability.SEARCH, Capability.RECENTLY_ADDED, Capability.SCAN_TRIGGER,
+        Capability.LIBRARY_STATS, Capability.PLAYLISTS, Capability.PLAYLIST_IMAGE,
+        Capability.PLAY_HISTORY, Capability.CURATION_SIGNALS, Capability.METADATA_WRITE,
+        Capability.TRACK_METADATA_WRITE, Capability.PER_USER_VIEWS,
+    })
+
     def __init__(self):
         self.server: Optional[PlexServer] = None
         self.music_library: Optional[MusicSection] = None
@@ -147,6 +155,27 @@ class PlexClient(MediaServerClient):
         with self._user_servers_lock:
             self._user_servers[token] = server
         return server
+
+    def image_url(self, thumb):
+        """Plex thumb references are /library/... paths (or a localhost URL
+        holding one); they load with the server base URL and the token."""
+        if not thumb:
+            return None
+        from urllib.parse import urlparse
+        plex_config = config_manager.get_plex_config()
+        base_url = (plex_config.get('base_url') or '').rstrip('/')
+        token = plex_config.get('token') or ''
+        if not base_url or not token:
+            return None
+        path = thumb if thumb.startswith('/library/') else urlparse(thumb).path
+        if not path.startswith('/library/'):
+            return None
+        return f"{base_url}{path}?X-Plex-Token={token}"
+
+    def user_view(self, identity):
+        """``as_home_user`` under the shared hook name (see MediaServerBase)."""
+        token = (identity or {}).get('token')
+        return self.as_home_user(token, (identity or {}).get('title', '')) if token else None
 
     def as_home_user(self, token: str, title: str = '') -> Optional['PlexUserView']:
         """this client, connected as a Home user (see PlexUserView). None when
@@ -1010,13 +1039,24 @@ class PlexClient(MediaServerClient):
             logger.error(f"Error updating playlist '{playlist_name}': {e}")
             return False
     
-    def set_playlist_image(self, playlist_name: str, image_url: str) -> bool:
-        """Set the poster image for a playlist from a URL."""
-        if not self.ensure_connection() or not image_url:
+    def set_playlist_image(self, playlist_name: str, image_url: str,
+                           local_path: Optional[str] = None) -> bool:
+        """Set the poster image for a playlist from a URL, or from a local
+        file when one is given and exists.
+
+        Plex fetches a URL itself, so a SoulSync-local address (127.0.0.1)
+        breaks when Plex runs in another container or host. A local file
+        sidesteps the network entirely via uploadPoster(filepath=...).
+        """
+        if not self.ensure_connection() or (not image_url and not local_path):
             return False
         try:
+            import os
             playlist = self.server.playlist(playlist_name)
-            playlist.uploadPoster(url=image_url)
+            if local_path and os.path.isfile(local_path):
+                playlist.uploadPoster(filepath=local_path)
+            else:
+                playlist.uploadPoster(url=image_url)
             logger.info(f"Set playlist poster for '{playlist_name}'")
             return True
         except Exception as e:
@@ -1265,9 +1305,17 @@ class PlexClient(MediaServerClient):
                         'track_title': item.title or '',
                         'artist': item.grandparentTitle or '',
                         'album': item.parentTitle or '',
-                        'played_at': item.viewedAt.isoformat() if hasattr(item, 'viewedAt') and item.viewedAt else None,
+                        # plexapi gives the server's local time with no zone;
+                        # the history keeps utc (the clock last.fm and
+                        # listenbrainz copies come back in)
+                        'played_at': (item.viewedAt.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+                                      if getattr(item, 'viewedAt', None) else None),
                         'duration_ms': (item.duration or 0),
                         'track_id': str(item.ratingKey),
+                        # who played it: 1 is the server owner, anyone else
+                        # their plex.tv user id. files the play in their pile
+                        'account_id': (str(item.accountID) if getattr(item, 'accountID', None) is not None
+                                       else None),
                     })
                 except Exception:
                     continue

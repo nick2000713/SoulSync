@@ -89,13 +89,8 @@ export interface UseAutoSyncOptions {
    * Runs a REAL mirrored playlist through the pipeline engine — 'Run now' on
    * anything that is not a synthetic personalized row (2336).
    *
-   * Required, and injected rather than reached for on `window`, because
-   * `runMirroredPlaylistPipeline` is defined in auto-sync.js ITSELF (2481) —
-   * the file the flip deletes. A `window.runMirroredPlaylistPipeline?.()` call
-   * would keep working right up until the flip and then silently stop, which
-   * is the exact failure mode vanilla-seams.test.ts exists to prevent. The
-   * page passes `useMirroredPipeline().run`, which is the same function
-   * already ported in P5g.
+   * Injected by the page or root host from useMirroredPipeline, keeping
+   * scheduling independent of the classic dialog compatibility globals.
    */
   runPipeline: (playlistId: number, playlistName: string) => void;
 }
@@ -245,7 +240,12 @@ export function useAutoSync({ open, now = () => Date.now(), runPipeline }: UseAu
     trigger: { trigger_type: string; trigger_config: unknown },
     existingId: number | string | undefined,
   ) => {
-    const payload = autoSyncSchedulePayload(playlist, playlistId, trigger);
+    // read before the reload: dropOpposing may have just deleted the row
+    // that held it, a weekly->hourly swap still keeps its config (#1704)
+    const carry =
+      stateRef.current.playlistSchedules[String(playlistId)]?.action_config ??
+      stateRef.current.weeklySchedules[String(playlistId)]?.action_config;
+    const payload = autoSyncSchedulePayload(playlist, playlistId, trigger, carry);
     const res = existingId
       ? await updateAutomation(existingId, payload)
       : await createAutomation(payload);

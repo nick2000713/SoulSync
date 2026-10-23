@@ -66,6 +66,84 @@ def _detect_provider(items, client):
     return 'spotify'
 
 
+def _release_value(value, *names, default=None):
+    for name in names:
+        if isinstance(value, dict):
+            candidate = value.get(name)
+        else:
+            candidate = getattr(value, name, None)
+        if candidate not in (None, ''):
+            return candidate
+    return default
+
+
+def _release_image(value):
+    direct = _release_value(value, 'image_url', 'cover_url', 'album_cover_url')
+    if direct:
+        return str(direct)
+    images = _release_value(value, 'images', default=[]) or []
+    if images:
+        first = images[0]
+        if isinstance(first, dict):
+            return first.get('url') or first.get('#text') or None
+        return str(first)
+    return None
+
+
+def artist_release_preview(service, artist_id, artist_name='', limit=6):
+    """Small, provider-exact release context for an artist match candidate.
+
+    This deliberately uses the same metadata registry/artist-album helper as
+    Library/Watchlist discography. It never falls across providers: the albums
+    shown under a Spotify candidate are Spotify's albums for that exact id.
+    Unsupported/rate-limited providers return ``supported=False`` or an empty
+    list without turning a successful artist search into an error.
+    """
+    service = str(service or '').strip().lower()
+    try:
+        limit = max(1, min(int(limit), 8))
+    except (TypeError, ValueError):
+        limit = 6
+    if service not in {
+        'spotify', 'itunes', 'deezer', 'discogs', 'amazon',
+        'musicbrainz', 'jiosaavn',
+    }:
+        return {'supported': False, 'albums': []}
+
+    from core.metadata.album_tracks import get_artist_albums_for_source
+    albums = get_artist_albums_for_source(
+        service,
+        str(artist_id or '').strip(),
+        artist_name=str(artist_name or '').strip(),
+        limit=limit,
+        max_pages=1,
+    )
+    if albums is None:
+        return {'supported': False, 'albums': []}
+
+    normalized = []
+    seen = set()
+    for album in albums:
+        album_id = str(_release_value(album, 'id', 'album_id', default='') or '')
+        title = str(_release_value(album, 'name', 'title', 'album_name', default='') or '').strip()
+        release_date = str(_release_value(album, 'release_date', 'date', default='') or '')
+        dedupe_key = album_id or f"{title.casefold()}::{release_date[:4]}"
+        if not title or dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        normalized.append({
+            'id': album_id,
+            'title': title,
+            'image': _release_image(album),
+            'release_date': release_date or None,
+            'album_type': str(_release_value(album, 'album_type', 'type', default='') or '') or None,
+            'total_tracks': _release_value(album, 'total_tracks', 'track_count'),
+        })
+        if len(normalized) >= limit:
+            break
+    return {'supported': True, 'albums': normalized}
+
+
 def _mb_direct_lookup(entity_type, mbid):
     """Confirm a pasted MusicBrainz MBID by fetching that exact entity.
     Returns a one-item result list (same shape as the search path) so the
@@ -210,6 +288,50 @@ def _deezer_direct_lookup(entity_type, deezer_id, query=''):
     return []
 
 
+
+def _deezer_exact_title_first(query, plain, req_lib, limit=8):
+    """Deezer's plain track search for a typed query, plus ``track:"title" artist``.
+
+    The plain results can leave the real song out entirely (for "Auli'i Cravalho
+    How Far I'll Go" they are the Reprise and karaoke copies). When the query
+    names an artist, the exact-title results go first. The artist is read from
+    the plain results' artist names. Scoped results are used only if one is
+    credited to that artist. Returns ``plain`` unchanged otherwise.
+    """
+    from core.deezer_throttle import wait_for_slot
+    from core.deezer_track_query import (
+        artist_scoped_query,
+        credits_artist,
+        merge_by_id,
+        split_query_by_artist,
+    )
+
+    def get(kind, q, n):
+        wait_for_slot()
+        return req_lib.get(f'https://api.deezer.com/search/{kind}', params={'q': q, 'limit': n}, timeout=10).json().get('data', [])
+
+    def scoped_for(names):
+        scoped_query = artist_scoped_query(query, names)
+        split = split_query_by_artist(query, names) if scoped_query else None
+        if not split:
+            return None
+        scoped = get('track', scoped_query, limit)
+        # Deezer only RANKS by the artist words (its artist filter is broken), so
+        # covers by other artists can still lead: the artist's own tracks go first,
+        # then the plain results, and other artists' scoped hits only after those.
+        by_artist = [i for i in scoped if credits_artist([(i.get('artist') or {}).get('name')], split[0])]
+        if by_artist:
+            rest = [i for i in scoped if i not in by_artist]
+            return merge_by_id(by_artist, plain, rest, limit=limit)
+        return None
+
+    names = [(i.get('artist') or {}).get('name') for i in plain if isinstance(i.get('artist'), dict)]
+    found = scoped_for([n for n in names if n])
+    if found:
+        return found
+    return plain
+
+
 def _search_service(service, entity_type, query):
     """Search a service and return normalized results."""
     import requests as req_lib
@@ -244,7 +366,14 @@ def _search_service(service, entity_type, query):
             # Detect actual provider from result IDs — Spotify IDs are alphanumeric,
             # iTunes/Deezer IDs are purely numeric. Prevents storing wrong IDs.
             provider = _detect_provider(items, client)
-            return [{'id': a.id, 'name': a.name, 'image': a.image_url, 'extra': ', '.join(a.genres[:3]) if a.genres else '', 'provider': provider} for a in items]
+            # §52.5: every Artist dataclass (Spotify, SpotipyFree, and the
+            # iTunes/Deezer fallback this branch can silently resolve to)
+            # already carries followers/popularity — 0 where a provider
+            # doesn't supply it (see core/metadata's "Spotify-only; 0
+            # elsewhere" convention) — so surfacing them is free, no extra
+            # API call regardless of which source actually served this hit.
+            return [{'id': a.id, 'name': a.name, 'image': a.image_url, 'extra': ', '.join(a.genres[:3]) if a.genres else '', 'provider': provider,
+                     'followers': a.followers, 'popularity': a.popularity} for a in items]
         elif entity_type == 'album':
             items = client.search_albums(query, limit=8)
             provider = _detect_provider(items, client)
@@ -272,9 +401,9 @@ def _search_service(service, entity_type, query):
         # MusicBrainz needs no credentials and no worker — only a client. When
         # the worker is there, use its service so both share one rate limiter;
         # otherwise fall back to the process-wide shared instance. Requiring
-        # the worker meant a failed worker init took manual MusicBrainz search
-        # and enrichment down with it, reported as "worker not initialized" to
-        # a user who never asked for a worker.
+        # the worker meant a MusicBrainz enrich raised, and the callers that
+        # swallow a per-provider failure turned that into "Enrich all" quietly
+        # leaving the chip pending.
         mb_client = None
         if mb_worker is not None and getattr(mb_worker, 'mb_service', None):
             mb_client = mb_worker.mb_service.mb_client
@@ -324,11 +453,19 @@ def _search_service(service, entity_type, query):
             data = resp.json().get('data', [])
         except Exception:
             data = []
+        if entity_type == 'track' and data:
+            # the plain search can leave the real song out of its 8 results; for
+            # a query that names an artist, put the exact-title results first
+            try:
+                data = _deezer_exact_title_first(query, data, req_lib)
+            except Exception as e:
+                logger.debug("deezer exact-title search skipped for %r: %s", query, e)
         results = []
         for item in data:
             if entity_type == 'artist':
                 results.append({'id': str(item.get('id', '')), 'name': item.get('name', ''),
-                                'image': item.get('picture_medium'), 'extra': f"{item.get('nb_fan', 0)} fans"})
+                                'image': item.get('picture_medium'), 'extra': f"{item.get('nb_fan', 0)} fans",
+                                'followers': item.get('nb_fan', 0)})
             elif entity_type == 'album':
                 artist_name = item.get('artist', {}).get('name', '') if isinstance(item.get('artist'), dict) else ''
                 results.append({'id': str(item.get('id', '')), 'name': item.get('title', ''),

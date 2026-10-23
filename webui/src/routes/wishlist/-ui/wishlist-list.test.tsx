@@ -30,6 +30,9 @@ function track(over: Partial<ParsedWishlistTrack>): ParsedWishlistTrack {
     failing: false,
     lastTried: '',
     failReason: '',
+    upgrade: false,
+    currentQuality: '',
+    imageFallback: '',
     ...over,
   };
 }
@@ -48,6 +51,7 @@ const GROUPS: WishlistArtistGroup[] = [
       {
         name: 'Lost Album',
         image: '',
+        imageFallback: '',
         tracks: [
           track({ id: 'f1', track: 'Ghost', retry: 7, failing: true, failReason: 'no sources' }),
         ],
@@ -57,6 +61,25 @@ const GROUPS: WishlistArtistGroup[] = [
 ];
 
 describe('WishlistList', () => {
+  it('marks only the artists whose downloads are filed as audiobooks', () => {
+    routed.names = new Set(['Calm Artist']);
+    try {
+      render(
+        <WishlistList
+          groups={GROUPS}
+          artistImages={new Map()}
+          onRemoveAlbum={vi.fn()}
+          onRemoveTrack={vi.fn()}
+        />,
+      );
+    } finally {
+      routed.names = new Set();
+    }
+    const badges = document.querySelectorAll('[data-audiobook-route-badge]');
+    expect(badges).toHaveLength(1);
+    expect(badges[0]?.previousElementSibling?.textContent).toBe('Calm Artist');
+  });
+
   it('sorts failing artists first by default and badges them', () => {
     render(
       <WishlistList
@@ -133,3 +156,10 @@ describe('WishlistList', () => {
     expect(onRemoveTrack).toHaveBeenCalledWith('f1');
   });
 });
+
+// The routed-artist lookup has its own tests (features/audiobook-routes); these
+// files exercise the list itself without a QueryClient.
+const routed = vi.hoisted(() => ({ names: new Set<string>() }));
+vi.mock('@/features/audiobook-routes/audiobook-routes.queries', () => ({
+  useRoutedArtists: () => routed.names,
+}));

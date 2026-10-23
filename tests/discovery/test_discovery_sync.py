@@ -22,10 +22,13 @@ class _FakeSyncResult:
     total_tracks: int = 6
     wishlist_added_count: int = 0
     match_details: list = None
+    errors: list = None
 
     def __post_init__(self):
         if self.match_details is None:
             self.match_details = []
+        if self.errors is None:
+            self.errors = []
 
 
 class _FakeMediaClient:
@@ -74,7 +77,10 @@ class _FakeSyncService:
     def clear_progress_callback(self, playlist_name):
         self.cleared_callbacks.append(playlist_name)
 
-    async def sync_playlist(self, playlist, download_missing=False, profile_id=1, sync_mode='replace'):
+    async def sync_playlist(self, playlist, download_missing=False, profile_id=1, sync_mode='replace',
+                            user_initiated=False, **kwargs):
+        self.user_initiated = user_initiated
+        self.extra_kwargs = kwargs
         if self._raise_on_sync:
             raise self._raise_on_sync
         return self._sync_result
@@ -94,6 +100,7 @@ class _FakeConfig:
 class _FakePlex:
     def __init__(self, existing=()):
         self.image_calls = []
+        self.local_paths = []
         # Names the test declares already present on the server (#993 existence
         # probe). Anything not listed reads as a brand-new playlist.
         self._existing = {n.lower() for n in existing}
@@ -101,8 +108,9 @@ class _FakePlex:
     def get_playlist_by_name(self, name):
         return object() if name.lower() in self._existing else None
 
-    def set_playlist_image(self, name, url):
+    def set_playlist_image(self, name, url, local_path=None):
         self.image_calls.append((name, url))
+        self.local_paths.append(local_path)
         return True
 
 
@@ -167,6 +175,7 @@ def _build_deps(
     process_wishlist_automatically=None,
     run_playlist_organize_download=None,
     is_wishlist_actually_processing=None,
+    invalidate_sync_fingerprint=None,
 ):
     return ds.SyncDeps(
         config_manager=config or _FakeConfig(),
@@ -186,6 +195,7 @@ def _build_deps(
         process_wishlist_automatically=process_wishlist_automatically,
         run_playlist_organize_download=run_playlist_organize_download,
         is_wishlist_actually_processing=is_wishlist_actually_processing,
+        invalidate_sync_fingerprint=invalidate_sync_fingerprint,
     )
 
 
@@ -245,6 +255,13 @@ def test_records_sync_history_for_new_sync(patched_db):
     assert history_calls[0]['source_page'] == 'sync'
 
 
+@pytest.mark.parametrize('automation, explicit, expected', [(None, None, True), ('job', None, False), ('job', True, True), (None, False, False)])
+def test_sync_worker_forwards_manual_or_automatic_wishlist_intent(patched_db, automation, explicit, expected):
+    deps = _build_deps()
+    ds.run_sync_task('p1', 'Playlist', [_track()], automation_id=automation, user_initiated=explicit, deps=deps)
+    assert deps.sync_service.user_initiated is expected
+
+
 def test_resync_skips_history_record(patched_db):
     """Re-sync playlist_id (resync_<id>_<ts>) skips record_sync_history_start."""
     history_calls = []
@@ -297,6 +314,36 @@ def test_setup_error_with_automation_id_updates_progress(patched_db, monkeypatch
 # Sync service errors
 # ---------------------------------------------------------------------------
 
+
+@pytest.mark.parametrize('automation_id', [None, 'automation-1'])
+def test_playlist_write_failure_is_not_reported_as_synced(patched_db, automation_id):
+    """A returned SyncResult error must not persist a successful sync fingerprint."""
+    status_calls = []
+    automation_calls = []
+    deps = _build_deps(
+        sync_service=_FakeSyncService(
+            media_client=_FakeMediaClient(),
+            sync_result=_FakeSyncResult(
+                synced_tracks=0, errors=['Navidrome playlist write failed'],
+            ),
+        ),
+        update_and_save_sync_status=lambda *a, **kw: status_calls.append((a, kw)),
+        update_automation_progress=lambda *a, **kw: automation_calls.append(kw),
+    )
+
+    ds.run_sync_task('failed-playlist', 'Playlist', [_track()],
+                     automation_id=automation_id, deps=deps)
+
+    state = deps.sync_states['failed-playlist']
+    assert state['status'] == 'error'
+    assert 'Navidrome playlist write failed' in state['error']
+    assert state['result']['errors'] == ['Navidrome playlist write failed']
+    assert status_calls == []
+    assert deps.automation_engine.events == []
+    if automation_id:
+        assert any(call.get('status') == 'error' for call in automation_calls)
+        assert not any(call.get('status') == 'finished' for call in automation_calls)
+
 def test_no_sync_service_marks_error(patched_db):
     """sync_service None → caught by outer except, sync_states marked error."""
     states = {}
@@ -336,6 +383,46 @@ def test_successful_sync_marks_state_finished(patched_db):
 
     assert states['pOK']['status'] == 'finished'
     assert states['pOK']['progress']['matched_tracks'] == 10
+
+
+def test_failed_playlist_write_is_an_error_that_keeps_its_counts(patched_db):
+    """The matching ran but the server write was refused (Navidrome mid-scan):
+    the run is an error, history keeps the real match count instead of 0, and
+    no new sync status is saved while the last good run's fingerprint is
+    dropped, so the next run cannot smart-skip the write as unchanged."""
+    states = {}
+    saved_status = []
+    invalidated = []
+    result = _FakeSyncResult(matched_tracks=2652, total_tracks=3230, synced_tracks=0,
+                             failed_tracks=578, errors=['Navidrome playlist write failed'])
+    svc = _FakeSyncService(media_client=_FakeMediaClient(), sync_result=result)
+    deps = _build_deps(sync_service=svc, sync_states=states,
+                       update_and_save_sync_status=lambda *a, **kw: saved_status.append(kw),
+                       invalidate_sync_fingerprint=invalidated.append)
+
+    ds.run_sync_task('pW', 'PW', [_track()], deps=deps)
+
+    assert states['pW']['status'] == 'error'
+    assert 'write failed' in states['pW']['error']
+    assert patched_db.completion_calls[0][1:] == (2652, 0, 578)
+    assert saved_status == []
+    assert invalidated == ['pW']
+
+
+def test_failed_resync_drops_the_playlists_own_fingerprint(patched_db, monkeypatch):
+    """A re-sync from history runs as resync_<entry>_<ts>, but the scheduled
+    run reads the fingerprint under the playlist's own id: that one goes."""
+    monkeypatch.setattr(patched_db, 'get_sync_history_entry',
+                        lambda entry_id: {'playlist_id': 'auto_mirror_1', 'batch_id': 'b'},
+                        raising=False)
+    invalidated = []
+    result = _FakeSyncResult(errors=['Navidrome playlist write failed'])
+    svc = _FakeSyncService(media_client=_FakeMediaClient(), sync_result=result)
+    deps = _build_deps(sync_service=svc, invalidate_sync_fingerprint=invalidated.append)
+
+    ds.run_sync_task('resync_42_1234', 'Liked Songs', [_track()], deps=deps)
+
+    assert invalidated == ['auto_mirror_1']
 
 
 def test_unmatched_tracks_summary_added_to_state(patched_db):
@@ -611,6 +698,16 @@ def test_update_and_save_sync_status_called(patched_db):
     assert kwargs.get('tracks_hash')  # md5 hash present
 
 
+def test_sync_status_remembers_the_mode(patched_db):
+    """#1704: the next scheduled run compares against the mode this one ran in."""
+    save_calls = []
+    svc = _FakeSyncService(media_client=_FakeMediaClient())
+    deps = _build_deps(sync_service=svc,
+                       update_and_save_sync_status=lambda *a, **kw: save_calls.append(kw))
+    ds.run_sync_task('pSS', 'PSS', [_track(track_id='abc')], deps=deps, sync_mode='append')
+    assert save_calls[0].get('sync_mode') == 'append'
+
+
 # ---------------------------------------------------------------------------
 # Post-sync automation follow-up
 # ---------------------------------------------------------------------------
@@ -662,11 +759,46 @@ def test_post_sync_starts_organize_download_when_skip_wishlist_add(patched_db):
         automation_id='auto-2',
         deps=deps,
         skip_wishlist_add=True,
+        organize_by_playlist=True,
     )
 
     assert len(org_calls) == 1
     assert org_calls[0]['mirrored_playlist_id'] == 7
     assert org_calls[0]['automation_id'] == 'auto-2'
+
+
+def test_post_sync_wishlist_skip_without_organize_queues_nothing(patched_db):
+    """#1689: skip_wishlist_add also comes from pipeline runs whose
+    wishlist skip was resolved on (checkbox / global toggle). The
+    followup must not treat that as organize-by-playlist — an organize
+    batch would download exactly the tracks the user opted out of —
+    and must not trigger wishlist processing either."""
+    org_calls = []
+    wishlist_calls = []
+    result = _FakeSyncResult(
+        matched_tracks=50,
+        failed_tracks=10,
+        total_tracks=60,
+    )
+    svc = _FakeSyncService(media_client=_FakeMediaClient(), sync_result=result)
+    deps = _build_deps(
+        sync_service=svc,
+        run_playlist_organize_download=lambda **kw: org_calls.append(kw) or {'status': 'started'},
+        process_wishlist_automatically=lambda **kw: wishlist_calls.append(kw),
+        is_wishlist_actually_processing=lambda: False,
+    )
+
+    ds.run_sync_task(
+        'auto_mirror_9',
+        'Pipeline Skip',
+        [_track()],
+        automation_id='auto-3',
+        deps=deps,
+        skip_wishlist_add=True,
+    )
+
+    assert org_calls == []
+    assert wishlist_calls == []
 
 
 def test_wing_it_mode_no_longer_blanket_skips_wishlist(patched_db):
@@ -695,6 +827,22 @@ def test_organize_by_playlist_still_blanket_skips_wishlist(patched_db):
     ds.run_sync_task('org_pl', 'Organized', [_track()], deps=deps, skip_wishlist_add=True)
 
     assert svc._skip_unmatched_wishlist is True
+
+
+def test_user_initiated_reaches_the_sync_service(patched_db):
+    """#1603: a Sync & download click carries user_initiated down to the sync,
+    which is what lets its wishlist adds through the ignore-list."""
+    svc = _FakeSyncService(media_client=_FakeMediaClient())
+    ds.run_sync_task('click_pl', 'Clicked', [_track()], deps=_build_deps(sync_service=svc),
+                     user_initiated=True)
+    assert svc.user_initiated is True
+
+    # Ours: a sync without an automation is a click too (Sync buttons on the
+    # source pages); only a run an automation started keeps the ignore-list.
+    svc = _FakeSyncService(media_client=_FakeMediaClient())
+    ds.run_sync_task('sched_pl', 'Scheduled', [_track()], automation_id='auto-1',
+                     deps=_build_deps(sync_service=svc))
+    assert svc.user_initiated is False
 
 
 # ---------------------------------------------------------------------------
@@ -757,6 +905,15 @@ class TestRecordLibraryMembership:
         # Both stamped, so "checked and absent" is distinguishable from
         # "never looked at" — the page must not report the second as the first.
         assert writes[11]['library_checked_at'] == writes[22]['library_checked_at']
+
+    def test_owned_file_counts_without_server_recognition(self, monkeypatch):
+        from core.discovery.sync import _record_library_membership
+        writes = self._db(monkeypatch)
+        _record_library_membership([{'db_track_id': 11}], [
+            {'index': 0, 'status': 'not_found', 'owned_in_library': True},
+        ])
+        assert writes[11]['in_library'] is True
+        assert writes[11]['library_track_id'] is None
 
     def test_ignores_tracks_that_are_not_mirrored_rows(self, monkeypatch):
         # Only the mirrored sync handler attaches db_track_id; every other
@@ -905,3 +1062,137 @@ def test_jellyfin_cover_goes_to_the_profiles_own_user(patched_db, monkeypatch):
                      playlist_image_url='https://img/j.png', deps=deps,
                      sync_mode='replace')  # reconcile (now the default) never pushes covers
     assert jf2.image_calls == [('PJF', 'https://img/j.png')] and jf2.views == []
+
+
+# ---------------------------------------------------------------------------
+# User-playlist covers ride the sync
+# ---------------------------------------------------------------------------
+
+def _user_playlist_db(monkeypatch, source='soulsync'):
+    class _DB:
+        def get_mirrored_playlist(self, playlist_id, profile_id=None):
+            return {'id': playlist_id, 'source': source}
+
+    monkeypatch.setattr('database.music_database.get_database', lambda: _DB())
+
+
+def test_sync_is_user_playlist_helper(monkeypatch):
+    _user_playlist_db(monkeypatch, source='soulsync')
+    assert ds._sync_is_user_playlist(9, 1) is True
+
+
+def test_sync_is_user_playlist_helper_false_for_sources(monkeypatch):
+    _user_playlist_db(monkeypatch, source='spotify')
+    assert ds._sync_is_user_playlist(9, 1) is False
+
+
+def test_sync_is_user_playlist_helper_survives_bad_ids(monkeypatch):
+    _user_playlist_db(monkeypatch)
+    assert ds._sync_is_user_playlist('pImg', 1) is False  # not an int mirror id
+    assert ds._sync_is_user_playlist(None, 1) is False
+
+
+def test_user_playlist_cover_pushes_despite_existing_server_playlist(monkeypatch, patched_db):
+    """A user playlist's cover is the owner's choice, not a source poster: it
+    pushes even when the server playlist already exists (#993's guard is for
+    source covers)."""
+    _user_playlist_db(monkeypatch)
+    nd = _FakeNavidrome(existing=('Mine',))
+    cfg = _FakeConfig(server='navidrome')
+    result = _FakeSyncResult(synced_tracks=4)
+    svc = _FakeSyncService(media_client=_FakeMediaClient(), sync_result=result)
+    deps = _build_deps(sync_service=svc, navidrome=nd, config=cfg)
+
+    ds.run_sync_task('7', 'Mine', [_track()],
+                     playlist_image_url='https://img/mine.jpg', deps=deps, sync_mode='replace')
+
+    assert nd.image_calls == [('Mine', 'https://img/mine.jpg')]
+
+
+def test_user_playlist_cover_pushes_in_reconcile_mode(monkeypatch, patched_db):
+    """Reconcile/append preserve SOURCE covers (#792/#811) but a user
+    playlist's own cover still syncs — it's the user's edit, not the source's."""
+    _user_playlist_db(monkeypatch)
+    nd = _FakeNavidrome()
+    cfg = _FakeConfig(server='navidrome')
+    result = _FakeSyncResult(synced_tracks=4)
+    svc = _FakeSyncService(media_client=_FakeMediaClient(), sync_result=result)
+    deps = _build_deps(sync_service=svc, navidrome=nd, config=cfg)
+
+    ds.run_sync_task('7', 'Mine', [_track()],
+                     playlist_image_url='https://img/mine.jpg', deps=deps, sync_mode='reconcile')
+
+    assert nd.image_calls == [('Mine', 'https://img/mine.jpg')]
+
+
+def test_user_playlist_uploaded_cover_resolves_to_absolute_url(monkeypatch, patched_db):
+    """An uploaded cover is a path on this server (\"/api/user-playlists/<id>/\n    cover\"): the sync resolves it against the web bind port so the media-\n    server clients can fetch it."""
+    _user_playlist_db(monkeypatch)
+    monkeypatch.setenv('SOULSYNC_WEB_BIND_PORT', '8008')
+    nd = _FakeNavidrome()
+    cfg = _FakeConfig(server='navidrome')
+    result = _FakeSyncResult(synced_tracks=4)
+    svc = _FakeSyncService(media_client=_FakeMediaClient(), sync_result=result)
+    deps = _build_deps(sync_service=svc, navidrome=nd, config=cfg)
+
+    ds.run_sync_task('7', 'Mine', [_track()],
+                     playlist_image_url='/api/user-playlists/7/cover?v=123', deps=deps,
+                     sync_mode='replace')
+
+    assert nd.image_calls == [('Mine', 'http://127.0.0.1:8008/api/user-playlists/7/cover')]
+
+
+def test_sync_with_no_cover_url_does_not_crash(patched_db):
+    """A NULL image_url on the row arrives as None (dict.get default doesn't
+    fire): the sync must finish normally, not die on AttributeError."""
+    plex = _FakePlex()
+    cfg = _FakeConfig(server='plex')
+    result = _FakeSyncResult(synced_tracks=5)
+    svc = _FakeSyncService(media_client=_FakeMediaClient(), sync_result=result)
+    states = {}
+    deps = _build_deps(sync_service=svc, plex=plex, config=cfg, sync_states=states)
+
+    ds.run_sync_task('pNoImg', 'PNoImg', [_track()],
+                     playlist_image_url=None, deps=deps, sync_mode='replace')
+
+    assert states['pNoImg']['status'] == 'finished'
+    assert plex.image_calls == []
+
+
+def test_plex_gets_local_filepath_for_uploaded_cover(monkeypatch, patched_db, tmp_path):
+    """Plex downloads the poster URL itself, so a 127.0.0.1 URL breaks when
+    Plex runs in another container. A SoulSync-local cover goes by file path."""
+    _user_playlist_db(monkeypatch)
+    monkeypatch.setenv('SOULSYNC_PLAYLIST_COVER_DIR', str(tmp_path))
+    cover = tmp_path / 'user-7.webp'
+    cover.write_bytes(b'fake-webp')
+    plex = _FakePlex()
+    cfg = _FakeConfig(server='plex')
+    result = _FakeSyncResult(synced_tracks=4)
+    svc = _FakeSyncService(media_client=_FakeMediaClient(), sync_result=result)
+    deps = _build_deps(sync_service=svc, plex=plex, config=cfg)
+
+    ds.run_sync_task('7', 'Mine', [_track()],
+                     playlist_image_url='/api/user-playlists/7/cover?v=1', deps=deps,
+                     sync_mode='replace')
+
+    assert plex.image_calls == [('Mine', 'http://127.0.0.1:8008/api/user-playlists/7/cover')]
+    assert plex.local_paths == [str(cover)]
+
+
+def test_plex_falls_back_to_url_when_no_local_cover_file(monkeypatch, patched_db, tmp_path):
+    """No file on disk (remote URL cover, or file deleted): plain URL push."""
+    _user_playlist_db(monkeypatch)
+    monkeypatch.setenv('SOULSYNC_PLAYLIST_COVER_DIR', str(tmp_path))
+    plex = _FakePlex()
+    cfg = _FakeConfig(server='plex')
+    result = _FakeSyncResult(synced_tracks=4)
+    svc = _FakeSyncService(media_client=_FakeMediaClient(), sync_result=result)
+    deps = _build_deps(sync_service=svc, plex=plex, config=cfg)
+
+    ds.run_sync_task('7', 'Mine', [_track()],
+                     playlist_image_url='https://img/mine.jpg', deps=deps,
+                     sync_mode='replace')
+
+    assert plex.image_calls == [('Mine', 'https://img/mine.jpg')]
+    assert plex.local_paths == [None]

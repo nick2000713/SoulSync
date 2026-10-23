@@ -189,6 +189,22 @@ def db(tmp_path):
     return AudiobookDatabase(str(tmp_path / "audiobooks.db"))
 
 
+@pytest.fixture(autouse=True)
+def fallbacks():
+    """Capture the next-release search a failure starts, instead of running it.
+
+    Left alone, every failure in this file would start a thread that searches
+    the real indexers. The tests that care run the captured call themselves.
+    """
+    from core import audiobook_download_monitor as monitor
+
+    spawned = []
+    monitor._fallbacks.clear()
+    with patch.object(monitor, "_spawn", side_effect=lambda target, *args: spawned.append((target, args))):
+        yield spawned
+    monitor._fallbacks.clear()
+
+
 def _wishlisted(db, asin="B1"):
     db.add_to_wishlist({"asin": asin, "title": "The Final Empire",
                         "author_names": ["Brandon Sanderson"]})
@@ -210,6 +226,43 @@ def test_a_completed_download_reaches_the_library(db):
     assert db.get_downloads()[0]["status"] == "completed"
     assert db.get_wishlist()[0]["status"] == STATUS_DONE
     assert db.is_owned("B1") is True
+
+
+def test_a_completed_download_announces_the_import(db):
+    # "Import Complete" automations fired for music only; a finished book
+    # reached the library silently.
+    _wishlisted(db)
+    db.record_download("d1", "B1", "The Final Empire", "torrent", client_id="hash-1",
+                       book={"asin": "B1", "title": "The Final Empire",
+                             "author_names": ["Brandon Sanderson"]})
+    events = []
+
+    with patch("core.audiobook_download_monitor._get_status",
+               return_value=_status("completed")), \
+         patch("core.audiobook_download_monitor._resolve_path", side_effect=_identity_path), \
+         patch("core.audiobook_download_monitor._check_complete", side_effect=_whole_book), \
+         patch("core.audiobook_download_monitor._organize",
+               return_value={"ok": True, "path": "/library/Sanderson/Book"}), \
+         patch("core.app_events.publish", side_effect=lambda t, d=None: events.append((t, d))):
+        tick(db=db)
+
+    assert events == [("import_completed", {
+        "track_count": "1", "album_name": "The Final Empire", "artist": "Brandon Sanderson",
+    })]
+
+
+def test_a_failed_download_announces_no_completed_import(db):
+    _wishlisted(db)
+    db.record_download("d1", "B1", "The Final Empire", "torrent", client_id="hash-1")
+    events = []
+
+    with patch("core.audiobook_download_monitor._get_status",
+               return_value=_status("error", error="dead torrent")), \
+         patch("core.audiobook_download_monitor._resolve_path", side_effect=_identity_path), \
+         patch("core.app_events.publish", side_effect=lambda t, d=None: events.append((t, d))):
+        tick(db=db)
+
+    assert "import_completed" not in [event for event, _ in events]
 
 
 def test_a_failed_download_marks_the_wishlist_row(db):
@@ -596,8 +649,11 @@ def test_the_completeness_gate_uses_the_captured_runtime(db, tmp_path):
     # storefront is shedding.
     from core.audiobook_download_monitor import _check_complete
 
+    # The release names the edition's narrator, so the narration check is a
+    # confident match and the captured runtime is what gets compared.
     db.record_download("hash-1", "B1", "The Final Empire", "torrent",
-                       client_id="hash-1", book=_stored_book(runtime_minutes=600))
+                       client_id="hash-1", book=_stored_book(runtime_minutes=600),
+                       release_title="The Final Empire narrated by Michael Kramer")
     row = db.get_downloads()[0]
     folder = tmp_path / "dl"
     folder.mkdir()
@@ -1040,3 +1096,203 @@ def test_a_real_answer_resets_the_miss_count(db, monkeypatch):
                 tick(db=db)
 
     assert db.get_downloads()[0]["status"] == "unavailable"     # the count started over
+
+
+# ---------------------------------------------------------------------------
+# Going straight on to the next release after a failure
+# ---------------------------------------------------------------------------
+
+def _fail_once(db):
+    with patch("core.audiobook_download_monitor._get_status",
+               return_value=_status("failed", error="peer never answered")), \
+         patch("core.audiobook_download_monitor._resolve_path", side_effect=_identity_path):
+        return tick(db=db)
+
+
+def test_a_failed_download_searches_for_the_next_release_at_once(db, fallbacks):
+    # A dead Soulseek peer used to cost the book the whole retry backoff, with
+    # every other source for it sitting there untried.
+    _wishlisted(db)
+    db.record_download("d1", "B1", "The Final Empire", "soulseek", client_id="ref-1")
+
+    _fail_once(db)
+
+    assert len(fallbacks) == 1
+    target, args = fallbacks[0]
+    with patch("core.audiobook_wishlist_worker.process_one",
+               return_value={"grabbed": True}) as process_one:
+        target(*args)
+    process_one.assert_called_once()
+    assert process_one.call_args.args[0]["asin"] == "B1"
+
+
+def test_the_next_release_search_leaves_a_row_that_moved_on_alone(db, fallbacks):
+    # A wishlist pass or a manual search got there first.
+    from core.audiobook_database import STATUS_SEARCHING
+
+    _wishlisted(db)
+    db.record_download("d1", "B1", "The Final Empire", "soulseek", client_id="ref-1")
+    _fail_once(db)
+    db.mark_wishlist_status("B1", STATUS_SEARCHING)
+
+    target, args = fallbacks[0]
+    with patch("core.audiobook_wishlist_worker.process_one") as process_one:
+        target(*args)
+    process_one.assert_not_called()
+
+
+def test_a_run_of_failures_falls_back_to_the_wishlist_backoff(db, fallbacks):
+    from core import audiobook_download_monitor as monitor
+
+    with patch.object(monitor, "_fallback_limit", return_value=2):
+        assert monitor._try_next_release(db, "B1") is True
+        assert monitor._try_next_release(db, "B1") is True
+        assert monitor._try_next_release(db, "B1") is False
+        # the count starts over, so a later failure gets its own fallbacks
+        assert monitor._try_next_release(db, "B1") is True
+    assert len(fallbacks) == 3
+
+
+def test_a_fallback_that_grabs_nothing_resets_the_count(db, fallbacks):
+    from core import audiobook_download_monitor as monitor
+
+    _wishlisted(db)
+    db.mark_wishlist_status("B1", STATUS_FAILED)
+    with patch.object(monitor, "_fallback_limit", return_value=1):
+        monitor._try_next_release(db, "B1")
+        target, args = fallbacks[0]
+        with patch("core.audiobook_wishlist_worker.process_one", return_value={"grabbed": False}):
+            target(*args)
+        assert monitor._try_next_release(db, "B1") is True
+
+
+def test_a_limit_of_zero_turns_the_fallback_off(db, fallbacks):
+    from core import audiobook_download_monitor as monitor
+
+    with patch.object(monitor, "_fallback_limit", return_value=0):
+        assert monitor._try_next_release(db, "B1") is False
+    assert fallbacks == []
+
+
+def test_an_imported_book_clears_its_fallback_count(db):
+    from core import audiobook_download_monitor as monitor
+
+    _wishlisted(db)
+    db.record_download("d1", "B1", "The Final Empire", "torrent", client_id="hash-1")
+    monitor._fallbacks["B1"] = 3
+
+    with patch("core.audiobook_download_monitor._get_status",
+               return_value=_status("completed")), \
+         patch("core.audiobook_download_monitor._resolve_path", side_effect=_identity_path), \
+         patch("core.audiobook_download_monitor._check_complete", side_effect=_whole_book), \
+         patch("core.audiobook_download_monitor._organize",
+               return_value={"ok": True, "path": "/library/Sanderson/Book"}):
+        tick(db=db)
+
+    assert "B1" not in monitor._fallbacks
+
+
+
+# ---------------------------------------------------------------------------
+# a finished download with files but no audio fails at once, it never stages
+# ---------------------------------------------------------------------------
+
+def test_files_but_no_audio(tmp_path):
+    from core.audiobook_completeness import has_files_but_no_audio
+    epub = tmp_path / "Blaze.epub"
+    epub.write_bytes(b"x")
+    assert has_files_but_no_audio(epub) is True
+    ebook_dir = tmp_path / "ebook"
+    ebook_dir.mkdir()
+    (ebook_dir / "Blaze.epub").write_bytes(b"x")
+    assert has_files_but_no_audio(ebook_dir) is True
+    (ebook_dir / "01.m4b").write_bytes(b"x")
+    assert has_files_but_no_audio(ebook_dir) is False
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    # missing or empty may still be arriving
+    assert has_files_but_no_audio(empty) is False
+    assert has_files_but_no_audio(tmp_path / "nope") is False
+    assert has_files_but_no_audio("") is False
+
+
+def test_a_finished_ebook_fails_instead_of_staging():
+    patch_out = process_download(
+        _row(), get_status=lambda s, r: _status("completed"),
+        resolve_path=_identity_path, organize=_ok_organize(),
+        check_complete=lambda s, r: {"complete": False, "no_audio": True,
+                                     "reason": "No audio files in the download"},
+    )
+    assert patch_out["status"] == "failed"
+    assert "No audio" in patch_out["error"]
+
+
+def test_the_gate_spots_an_ebook(db, tmp_path):
+    from core.audiobook_download_monitor import _check_complete
+    db.record_download("hash-1", "B1", "Blaze", "torrent",
+                       client_id="hash-1", book=_stored_book(runtime_minutes=600))
+    row = db.get_downloads()[0]
+    epub = tmp_path / "Blaze.epub"
+    epub.write_bytes(b"x")
+    assert _check_complete(str(epub), row)["no_audio"] is True
+    empty = tmp_path / "arriving"
+    empty.mkdir()
+    assert not _check_complete(str(empty), row).get("no_audio")
+
+
+# ---------------------------------------------------------------------------
+# #1833 (SimpleSimonLA): a wrong book far longer than the wanted one sat staged
+# for staging_days with the wishlist row stuck on grabbed. waiting can't make a
+# download shorter, so it fails, the release is blocked, the next one is tried
+# ---------------------------------------------------------------------------
+
+def test_an_overshoot_fails_instead_of_staging():
+    patch_out = process_download(
+        _row(), get_status=lambda s, r: _status("completed"),
+        resolve_path=_identity_path, organize=_ok_organize(),
+        check_complete=lambda s, r: {"complete": False, "overshoot": True, "files": 3,
+                                     "reason": "351 minutes for a 74-minute book"},
+    )
+    assert patch_out["status"] == "failed"
+    assert "351 minutes for a 74-minute book" in patch_out["error"]
+
+
+def test_a_short_book_still_stages():
+    patch_out = process_download(
+        _row(), get_status=lambda s, r: _status("completed"),
+        resolve_path=_identity_path, organize=_ok_organize(),
+        check_complete=_short_book(),
+    )
+    assert patch_out["status"] == "staged"
+
+
+def test_a_wrong_book_overshoot_blocks_the_release_and_tries_the_next(db, fallbacks, tmp_path):
+    # the real gate, the real tick, the real db. "Dangerous Game" wanted at 74
+    # minutes, a different book of the same name at 351 came down
+    db.add_to_wishlist({"asin": "B1", "title": "Dangerous Game",
+                        "author_names": ["Wanted Author"]})
+    db.mark_wishlist_status("B1", "grabbed")
+    db.record_download("d1", "B1", "Dangerous Game", "usenet", client_id="nzo-1",
+                       book=_stored_book(title="Dangerous Game", runtime_minutes=74,
+                                         narrator_names=[]),
+                       release_title="Other Author - Dangerous Game",
+                       release_guid="guid-wrong", indexer="idx")
+    folder = tmp_path / "Other Author - Dangerous Game"
+    folder.mkdir()
+    (folder / "01.mp3").write_bytes(b"x")
+
+    with patch("core.audiobook_download_monitor._get_status",
+               return_value=_status("completed", save_path=str(folder))), \
+         patch("core.audiobook_download_monitor._resolve_path", side_effect=_identity_path), \
+         patch("core.audiobook_completeness.measure_duration_seconds", return_value=351 * 60.0), \
+         patch("core.audiobook_download_monitor._organize") as organize:
+        summary = tick(db=db)
+
+    organize.assert_not_called()
+    assert summary["staged"] == 0 and summary["failed"] == 1
+    download = db.get_downloads()[0]
+    assert download["status"] == "failed"
+    assert "Wrong release" in download["error"]
+    assert db.get_wishlist_entry("B1")["status"] == STATUS_FAILED
+    assert any("guid-wrong" in key for key in db.blocked_keys())
+    assert len(fallbacks) == 1

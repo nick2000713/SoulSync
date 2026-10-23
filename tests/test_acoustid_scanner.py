@@ -7,14 +7,15 @@ from core.repair_jobs.acoustid_scanner import AcoustIDScannerJob
 
 @pytest.fixture(autouse=True)
 def _no_live_alias_lookup(monkeypatch):
-    """Keep the alias chain off the network and off the real library database.
+    """Keep the alias chain off the network.
 
-    `_resolve_expected_artist_aliases` builds a MusicBrainzService over
-    `get_database()` — the process-wide, CONFIGURED library database — and then
-    queries MusicBrainz over HTTP. Reached from a unit test that means a live
-    request and a schema migration against whatever database this machine is
-    pointed at. Tests that are about the alias bridge override this with the
-    list they mean.
+    `_resolve_expected_artist_aliases` builds a MusicBrainzService and then
+    queries MusicBrainz over HTTP. These tests were reaching it for real: they
+    patched the name on the SCANNER module, which stopped importing it when the
+    scan was routed through the shared verifier, and the non-raising form of
+    monkeypatch turned that into a silent no-op. 35 seconds a piece, and a
+    different answer when rate-limited. Tests that are about the alias bridge
+    override this with the list they mean.
     """
     monkeypatch.setattr(
         "core.acoustid_verification._resolve_expected_artist_aliases",
@@ -49,21 +50,62 @@ class _FakeConnection:
     def cursor(self):
         return self._cursor
 
+    def execute(self, query, params=None):
+        return self._cursor.execute(query, params)
+
+    def commit(self):
+        pass
+
     def close(self):
         pass
 
 
-def _make_context(rows):
-    conn = _FakeConnection(rows)
-    config_manager = SimpleNamespace(
-        get=lambda key, default=None: default,
-        set=lambda *args, **kwargs: None,
-    )
-    db = SimpleNamespace(_get_connection=lambda: conn)
+def _make_context(subjects, tmp_path):
+    """A real Library-v2 catalogue holding ``subjects``.
+
+    ``subjects`` is a list of ``(track_id, title, artist, path, track_number,
+    album_title, duration_ms)``; a ``None`` track id means "a row the catalogue
+    could not identify", which lib2 expresses by simply not having it — there is
+    no id-less track row to skip past any more.
+    """
+    import pathlib
+    import sqlite3
+
+    from core.library2.schema import ensure_library_v2_schema
+
+    db_path = tmp_path / "scan.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    ensure_library_v2_schema(conn)
+    conn.execute("INSERT INTO lib2_artists (id, name, sort_name, image_url) "
+                 "VALUES (7, 'Artist', 'Artist', 'artist-thumb')")
+    conn.execute("INSERT INTO lib2_albums (id, primary_artist_id, title, image_url) "
+                 "VALUES (1, 7, 'Album', 'album-thumb')")
+    for track_id, title, artist, path, number, album_title, duration in subjects:
+        if track_id is None:
+            continue
+        # A native subject resolves through `resolve_lib2_path`, not the legacy
+        # path resolver, so the file has to actually be there.
+        pathlib.Path(path).write_bytes(b"audio")
+        conn.execute(
+            "INSERT INTO lib2_tracks (id, album_id, title, track_number, duration) "
+            "VALUES (?, 1, ?, ?, ?)", (track_id, title, number, duration))
+        conn.execute(
+            "INSERT INTO lib2_track_files (track_id, path, format, is_primary) "
+            "VALUES (?, ?, 'flac', 1)", (track_id, path))
+    conn.commit()
+    conn.close()
+
+    class _RealDB:
+        def _get_connection(self):
+            c = sqlite3.connect(str(db_path))
+            c.row_factory = sqlite3.Row
+            return c
+
     return SimpleNamespace(
-        db=db,
+        db=_RealDB(),
         transfer_folder="/music",
-        config_manager=config_manager,
+        config_manager=_EnabledConfig(),
         acoustid_client=object(),
         create_finding=None,
         report_progress=lambda **kwargs: None,
@@ -74,35 +116,25 @@ def _make_context(rows):
     )
 
 
-def test_load_db_tracks_skips_null_ids_and_normalizes_track_ids():
+def test_load_db_tracks_keys_every_subject_by_its_native_id(tmp_path):
     job = AcoustIDScannerJob()
     context = _make_context([
-        # 13 columns: id, title, artist (COALESCE'd), file_path, track_number,
-        # album_title, album_thumb, artist_thumb, track_artist (raw, may be ''),
-        # album_artist, duration_ms (issue #587 — duration guard), artist_row_id,
-        # verification_status (the catalogue's record of the file's standing).
-        (None, "Broken Track", "Artist", "/music/broken.flac", 1, "Album", None, None, "", "Artist", 180000, 7, None),
-        (42, "Good Track", "Artist", "/music/good.flac", 2, "Album", "album-thumb", "artist-thumb", "", "Artist", 240000, 7, "verified"),
-    ])
+        (42, "Good Track", "Artist", str(tmp_path / "good.flac"), 2, "Album", 240000),
+    ], tmp_path)
 
     tracks = job._load_db_tracks(context)
 
-    assert list(tracks.keys()) == ["42"]
-    assert tracks["42"]["title"] == "Good Track"
-    assert tracks["42"]["artist"] == "Artist"
-    assert tracks["42"]["duration_ms"] == 240000
-    assert tracks["42"]["db_verification_status"] == "verified"
+    assert list(tracks.keys()) == ["lib2:42"]
+    assert tracks["lib2:42"]["title"] == "Good Track"
+    assert tracks["lib2:42"]["artist"] == "Artist"
+    assert tracks["lib2:42"]["duration_ms"] == 240000   # #587 duration guard
 
 
-def test_scan_handles_mixed_track_id_types(monkeypatch):
+def test_scan_walks_the_native_subjects(tmp_path, monkeypatch):
     job = AcoustIDScannerJob()
     context = _make_context([
-        # 13 columns: id, title, artist (COALESCE'd), file_path, track_number,
-        # album_title, album_thumb, artist_thumb, track_artist (raw, may be ''),
-        # album_artist, duration_ms, artist_row_id, verification_status.
-        (None, "Broken Track", "Artist", "/music/broken.flac", 1, "Album", None, None, "", "Artist", 180000, 7, None),
-        (42, "Good Track", "Artist", "/music/good.flac", 2, "Album", "album-thumb", "artist-thumb", "", "Artist", 240000, 7, None),
-    ])
+        (42, "Good Track", "Artist", str(tmp_path / "good.flac"), 2, "Album", 240000),
+    ], tmp_path)
 
     monkeypatch.setattr(job, "_resolve_path", lambda file_path, _context: file_path)
 
@@ -117,7 +149,31 @@ def test_scan_handles_mixed_track_id_types(monkeypatch):
     result = job.scan(context)
 
     assert result.scanned == 1
-    assert scanned_track_ids == ["42"]
+    assert scanned_track_ids == ["lib2:42"]
+
+
+def test_scan_respects_active_manual_acoustid_override(tmp_path, monkeypatch):
+    job = AcoustIDScannerJob()
+    context = _make_context([
+        (42, "Good Track", "Artist", str(tmp_path / "good.flac"), 2, "Album", 240000),
+    ], tmp_path)
+    monkeypatch.setattr(job, "_resolve_path", lambda file_path, _context: file_path)
+    monkeypatch.setattr(
+        "core.library2.manual_skips.check_is_skipped",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        job,
+        "_scan_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("manual override must skip fingerprinting")
+        ),
+    )
+
+    result = job.scan(context)
+
+    assert result.scanned == 0
+    assert result.skipped == 1
 
 
 # ---------------------------------------------------------------------------
@@ -280,37 +336,21 @@ class JobResultStub:
 
 
 def _make_real_db_context(tmp_path):
-    """Build a context with a REAL SQLite DB so the scanner's
-    multi-table JOIN runs against actual schema. SimpleNamespace
-    fakes can't simulate the JOIN."""
+    """A real Library-v2 catalogue, because that is what the scan reads.
+
+    This used to hand-roll ``artists``/``albums``/``tracks``. The per-track
+    artist credit that made these tests interesting still exists, one level
+    down: lib2 records it in ``lib2_track_artists`` and ``active_file_subjects``
+    prefers it over the album's primary artist — the same COALESCE, moved.
+    """
     import sqlite3
+
+    from core.library2.schema import ensure_library_v2_schema
+
     db_path = tmp_path / "test.db"
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.executescript("""
-        CREATE TABLE artists (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            thumb_url TEXT
-        );
-        CREATE TABLE albums (
-            id TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            thumb_url TEXT
-        );
-        CREATE TABLE tracks (
-            id TEXT PRIMARY KEY,
-            title TEXT,
-            artist_id TEXT,
-            album_id TEXT,
-            file_path TEXT,
-            track_number INTEGER,
-            track_artist TEXT,
-            duration INTEGER,
-            verification_status TEXT
-        );
-    """)
+    ensure_library_v2_schema(conn)
     conn.commit()
     conn.close()
 
@@ -323,82 +363,71 @@ def _make_real_db_context(tmp_path):
     return _RealDB()
 
 
-def test_load_db_tracks_prefers_track_artist_for_compilation():
-    """Reporter's exact case (Skowl) — compilation album where
-    every track has a different artist credited via track_artist
-    column, while artist_id points at the album-level curator."""
-    import tempfile, pathlib
-    tmp = pathlib.Path(tempfile.mkdtemp())
-    db = _make_real_db_context(tmp)
+class _EnabledConfig:
+    """``features.library_v2`` off means the subject walk returns nothing."""
+
+    def get(self, key, default=None):
+        return True if key == "features.library_v2" else default
+
+    def set(self, *args, **kwargs):
+        pass
+
+
+def test_load_db_tracks_prefers_track_artist_for_compilation(tmp_path):
+    """Reporter's exact case (Skowl) — a compilation where every track credits a
+    different artist while the album belongs to the curator."""
+    db = _make_real_db_context(tmp_path)
 
     conn = db._get_connection()
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO artists (id, name) VALUES ('andro', 'Andromedik')")
-    cursor.execute(
-        "INSERT INTO albums (id, title) VALUES ('hightea', 'High Tea Music: Vol 1')"
-    )
-    cursor.execute(
-        "INSERT INTO tracks (id, title, artist_id, album_id, file_path, track_artist) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        ('city-lights', 'City Lights', 'andro', 'hightea',
-         '/music/citylights.mp3', 'Eclypse'),
-    )
-    cursor.execute(
-        "INSERT INTO tracks (id, title, artist_id, album_id, file_path, track_artist) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        ('invasion', 'Invasion', 'andro', 'hightea',
-         '/music/invasion.mp3', None),  # NULL track_artist falls back
-    )
+    conn.execute("INSERT INTO lib2_artists (id, name, sort_name) VALUES (1, 'Andromedik', 'Andromedik')")
+    conn.execute("INSERT INTO lib2_artists (id, name, sort_name) VALUES (2, 'Eclypse', 'Eclypse')")
+    conn.execute(
+        "INSERT INTO lib2_albums (id, primary_artist_id, title) "
+        "VALUES (1, 1, 'High Tea Music: Vol 1')")
+    conn.execute("INSERT INTO lib2_tracks (id, album_id, title) VALUES (10, 1, 'City Lights')")
+    conn.execute("INSERT INTO lib2_tracks (id, album_id, title) VALUES (11, 1, 'Invasion')")
+    conn.execute(
+        "INSERT INTO lib2_track_artists (track_id, artist_id, role, position) "
+        "VALUES (10, 2, 'primary', 0)")
+    conn.execute(
+        "INSERT INTO lib2_track_files (track_id, path, format, is_primary) "
+        "VALUES (10, '/music/citylights.mp3', 'mp3', 1)")
+    conn.execute(
+        "INSERT INTO lib2_track_files (track_id, path, format, is_primary) "
+        "VALUES (11, '/music/invasion.mp3', 'mp3', 1)")
     conn.commit()
     conn.close()
 
     job = AcoustIDScannerJob()
-    context = SimpleNamespace(
-        db=db,
-        config_manager=SimpleNamespace(get=lambda *a, **k: None),
-    )
+    context = SimpleNamespace(db=db, config_manager=_EnabledConfig())
     tracks = job._load_db_tracks(context)
 
-    # Track with track_artist populated → Eclypse (per-track), NOT
-    # Andromedik (album-artist via artist_id).
-    assert tracks['city-lights']['artist'] == 'Eclypse', (
-        f"Compilation track must use track_artist; got {tracks['city-lights']['artist']!r}"
-    )
-    # Track with NULL track_artist → falls back to album artist
-    # via COALESCE. Backward compat for legacy rows + single-artist
-    # albums where track_artist isn't populated.
-    assert tracks['invasion']['artist'] == 'Andromedik'
+    # Credited on the track → Eclypse, not the album's Andromedik.
+    assert tracks['lib2:10']['artist'] == 'Eclypse'
+    # No track credit → the album artist, same fallback as before.
+    assert tracks['lib2:11']['artist'] == 'Andromedik'
 
 
-def test_load_db_tracks_falls_back_when_track_artist_empty_string():
-    """Defensive: NULLIF treats empty string as NULL too. Some
-    legacy rows might have stored '' instead of NULL."""
-    import tempfile, pathlib
-    tmp = pathlib.Path(tempfile.mkdtemp())
-    db = _make_real_db_context(tmp)
+def test_load_db_tracks_falls_back_when_a_track_has_no_credit_row(tmp_path):
+    """The empty-string ``track_artist`` this used to guard cannot occur: a
+    credit is a row in ``lib2_track_artists``, so it is either there or not."""
+    db = _make_real_db_context(tmp_path)
 
     conn = db._get_connection()
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO artists (id, name) VALUES ('a', 'Album Artist')")
-    cursor.execute("INSERT INTO albums (id, title) VALUES ('alb', 'Album')")
-    cursor.execute(
-        "INSERT INTO tracks (id, title, artist_id, album_id, file_path, track_artist) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        ('t1', 'T1', 'a', 'alb', '/music/t1.mp3', ''),  # empty string
-    )
+    conn.execute("INSERT INTO lib2_artists (id, name, sort_name) VALUES (1, 'Album Artist', 'Album Artist')")
+    conn.execute("INSERT INTO lib2_albums (id, primary_artist_id, title) VALUES (1, 1, 'Album')")
+    conn.execute("INSERT INTO lib2_tracks (id, album_id, title) VALUES (1, 1, 'T1')")
+    conn.execute(
+        "INSERT INTO lib2_track_files (track_id, path, format, is_primary) "
+        "VALUES (1, '/music/t1.mp3', 'mp3', 1)")
     conn.commit()
     conn.close()
 
     job = AcoustIDScannerJob()
-    context = SimpleNamespace(
-        db=db,
-        config_manager=SimpleNamespace(get=lambda *a, **k: None),
-    )
+    context = SimpleNamespace(db=db, config_manager=_EnabledConfig())
     tracks = job._load_db_tracks(context)
 
-    # Empty string in track_artist → NULLIF returns NULL → COALESCE
-    # falls back to album artist
-    assert tracks['t1']['artist'] == 'Album Artist'
+    assert tracks['lib2:1']['artist'] == 'Album Artist'
 
 
 # ---------------------------------------------------------------------------
@@ -820,8 +849,6 @@ def test_scanner_does_not_flag_cross_script_when_alias_bridges(monkeypatch):
     unified verification core recognises the match, so the library scan must NOT
     create a false 'Wrong download' finding (it did before, stripping all
     non-ASCII and never consulting aliases)."""
-    # Alias resolution lives in the shared verifier the scan routes through;
-    # the real one opens a database connection and calls MusicBrainz.
     monkeypatch.setattr(
         "core.acoustid_verification._resolve_expected_artist_aliases",
         lambda name: ["澤野弘之"])
@@ -888,9 +915,6 @@ def test_force_imported_mismatch_is_reported_as_informational(monkeypatch):
 
 
 def test_human_verified_files_are_never_scanned(monkeypatch):
-    monkeypatch.setattr(
-        "core.acoustid_verification._resolve_expected_artist_aliases",
-        lambda name: [])
     monkeypatch.setattr('core.tag_writer.read_file_tags',
                         lambda fpath: {'artist': None, 'verification_status': 'human_verified'})
     job = AcoustIDScannerJob()
@@ -913,10 +937,20 @@ def test_human_verified_files_are_never_scanned(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _run_persistence_scan(monkeypatch, *, file_status, aid_artist, expected_artist, lib_rows=None):
-    """Drive one _scan_file call and return (status_updates, tag_writes) where
-    status_updates is the list of (query, params) UPDATEs the scanner ran.
-    ``lib_rows`` seeds the library_history match SELECT (#934)."""
+def _run_persistence_scan(tmp_path, monkeypatch, *, file_status, aid_artist,
+                          expected_artist):
+    """Drive one ``_scan_file`` and return (file rows, tag writes, findings).
+
+    The verdict now lands on ``lib2_track_files.verification_status``. It used to
+    be written to ``tracks`` AND healed into the file's ``library_history`` row
+    (#934); the native path writes neither, which is why these assertions moved
+    rather than being deleted — see docs §50.4.4.11 for the history-row gap that
+    is still open.
+    """
+    import sqlite3
+
+    from core.library2.schema import ensure_library_v2_schema
+
     monkeypatch.setattr(
         'core.tag_writer.read_file_tags',
         lambda fpath: {'artist': None, 'verification_status': file_status})
@@ -924,61 +958,320 @@ def _run_persistence_scan(monkeypatch, *, file_status, aid_artist, expected_arti
     monkeypatch.setattr(
         'core.tag_writer.write_verification_status',
         lambda fpath, status: tag_writes.append((fpath, status)) or True)
-    job = AcoustIDScannerJob()
+
+    db_path = tmp_path / "verify.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    ensure_library_v2_schema(conn)
+    conn.execute("INSERT INTO lib2_artists (id, name, sort_name) VALUES (1, ?, ?)",
+                 (expected_artist, expected_artist))
+    conn.execute("INSERT INTO lib2_albums (id, primary_artist_id, title) VALUES (1, 1, 'Album')")
+    conn.execute("INSERT INTO lib2_tracks (id, album_id, title) VALUES (9, 1, 'Call Your Name')")
+    conn.execute(
+        "INSERT INTO lib2_track_files (id, track_id, path, format, is_primary) "
+        "VALUES (4, 9, '/music/cyn.flac', 'flac', 1)")
+    conn.commit()
+    conn.close()
+
+    class _RealDB:
+        def _get_connection(self):
+            c = sqlite3.connect(str(db_path))
+            c.row_factory = sqlite3.Row
+            return c
+
     captured = []
-    context = _make_finding_capturing_context(
-        track_row=("9", "Call Your Name", expected_artist,
-                   "/music/cyn.flac", 1, "Album", None, None),
-        captured=captured, lib_rows=lib_rows)
+    context = SimpleNamespace(
+        db=_RealDB(),
+        transfer_folder="/music",
+        config_manager=_EnabledConfig(),
+        acoustid_client=object(),
+        create_finding=lambda **kwargs: captured.append(kwargs) or True,
+        report_change=None,
+        report_progress=lambda **kwargs: None,
+        update_progress=lambda *args, **kwargs: None,
+        check_stop=lambda: False,
+        wait_if_paused=lambda: False,
+        sleep_or_stop=lambda *args, **kwargs: False,
+    )
+
+    job = AcoustIDScannerJob()
     fake = SimpleNamespace(fingerprint_and_lookup=lambda f: {
         'best_score': 0.97,
         'recordings': [{'title': 'Call Your Name', 'artist': aid_artist}]})
-    job._scan_file('/music/cyn.flac', '9',
-                   {'title': 'Call Your Name', 'artist': expected_artist},
+    job._scan_file('/music/cyn.flac', 'lib2:9',
+                   {'title': 'Call Your Name', 'artist': expected_artist,
+                    'lib2_file_id': 4},
                    fake, context, JobResultStub(),
                    fp_threshold=0.85, title_threshold=0.85, artist_threshold=0.6)
-    conn = context.db._get_connection()
-    updates = [(q, p) for q, p in conn.cursor().executed
-               if 'verification_status' in q]
-    return updates, tag_writes, captured
+
+    conn = _RealDB()._get_connection()
+    try:
+        status = conn.execute(
+            "SELECT verification_status FROM lib2_track_files WHERE id=4").fetchone()[0]
+    finally:
+        conn.close()
+    return status, tag_writes, captured
 
 
-def test_scan_pass_backfills_verified_status(monkeypatch):
-    # Clean fingerprint PASS → the scan backfills 'verified' into the tag, the tracks
-    # row AND the file's library_history row. The history row's path drifted since
-    # download (file moved), so the scan heals it by id (#934) rather than missing it.
-    updates, tag_writes, captured = _run_persistence_scan(
-        monkeypatch, file_status=None,
-        aid_artist='Sawano Hiroyuki', expected_artist='Sawano Hiroyuki',
-        lib_rows=[(1, '/downloads/old/cyn.flac', 'Call Your Name', 'soulseek')])
+def test_scan_pass_backfills_verified_status(tmp_path, monkeypatch):
+    """A clean fingerprint PASS stamps the tag and the file row."""
+    status, tag_writes, captured = _run_persistence_scan(
+        tmp_path, monkeypatch, file_status=None,
+        aid_artist='Sawano Hiroyuki', expected_artist='Sawano Hiroyuki')
+
     assert captured == []
     assert tag_writes == [('/music/cyn.flac', 'verified')]
-    assert any('tracks' in q and p == ('verified', '9') for q, p in updates)
-    # healed by id, status set + path refreshed to the file's current location.
-    assert any('library_history' in q and p == ('verified', '/music/cyn.flac', 1)
-               for q, p in updates)
+    assert status == 'verified'
 
 
-def test_scan_skip_marks_untagged_file_unverified(monkeypatch):
-    # Title matches but the artist is ambiguous (cover/collab band?) → SKIP.
-    # An untagged file SoulSync never downloaded (no history row) gets a fresh
-    # 'unverified' row INSERTed so it surfaces in the Downloads-page review queue.
-    updates, tag_writes, captured = _run_persistence_scan(
-        monkeypatch, file_status=None,
-        aid_artist='Mantilla', expected_artist='Metallica')  # no lib_rows → no existing row
+def test_scan_skip_marks_untagged_file_unverified(tmp_path, monkeypatch):
+    """Title matches but the artist is ambiguous (cover? collab?) → SKIP, and an
+    untagged file is recorded 'unverified' so it surfaces for review."""
+    status, tag_writes, captured = _run_persistence_scan(
+        tmp_path, monkeypatch, file_status=None,
+        aid_artist='Mantilla', expected_artist='Metallica')
+
     assert captured == []
     assert tag_writes == [('/music/cyn.flac', 'unverified')]
-    assert any('tracks' in q and p == ('unverified', '9') for q, p in updates)
-    assert any('INSERT INTO library_history' in q and p[-1] == 'unverified'
-               for q, p in updates)
+    assert status == 'unverified'
 
 
-def test_scan_skip_does_not_downgrade_verified(monkeypatch):
-    # A SKIP must not downgrade an import-time 'verified' (that check ran with
-    # richer candidate metadata). Status is refreshed, tag untouched.
-    updates, tag_writes, captured = _run_persistence_scan(
-        monkeypatch, file_status='verified',
+def test_scan_skip_does_not_downgrade_verified(tmp_path, monkeypatch):
+    """A SKIP must not undo an import-time 'verified' — that check ran with
+    richer candidate metadata. The status is refreshed, the tag untouched."""
+    status, tag_writes, captured = _run_persistence_scan(
+        tmp_path, monkeypatch, file_status='verified',
         aid_artist='Mantilla', expected_artist='Metallica')
+
     assert captured == []
     assert tag_writes == []
-    assert any('tracks' in q and p == ('verified', '9') for q, p in updates)
+    assert status == 'verified'
+
+
+# ---------------------------------------------------------------------------
+# Opt-in skip_verified
+# ---------------------------------------------------------------------------
+
+KEY = 'repair.jobs.acoustid_scanner.'
+
+
+class _Library:
+    """A few tracks on disk plus the config store the scanner reads and writes,
+    so several runs can be chained and a run can be stopped partway."""
+
+    def __init__(self, tmp_path, ids=("1", "2", "3", "4"), setting=True):
+        self.tmp_path = tmp_path
+        self.files = {}
+        for tid in ids:
+            f = tmp_path / f"song{tid}.flac"
+            f.write_bytes(b"x")
+            self.files[tid] = f
+        self.cfg = {}
+        self.setting = setting
+        self.rows = {tid: (int(tid), "Good Track", "Artist", str(f), 1, "Album",
+                           None, None, "", "Artist", 240000, 7, "verified")
+                     for tid, f in self.files.items()}
+
+    def touch(self, tid):
+        """Replace a file now. The pauses keep its mtime and ctime clear of
+        the pass start before it and of the next run's start after it."""
+        import time
+        time.sleep(0.05)
+        self.files[tid].write_bytes(b"replaced")
+        time.sleep(0.05)
+
+    def run(self, monkeypatch, *, stop_after=None, error_on=None, unresolved=(), slack=0):
+        """One scan(). Returns (scanned_ids, result). The cutoff slack is 0 by
+        default: these files are written moments before the pass, inside it."""
+        import core.repair_jobs.acoustid_scanner as scanner_mod
+        monkeypatch.setattr(scanner_mod, 'VERIFIED_CUTOFF_SLACK_S', slack)
+        # Library v2 port: the scanner reads native subjects; feed the same
+        # rows straight to its loader (no lib2_file_id, so paths go through
+        # the patched _resolve_path like the legacy rows did)
+        tracks = {tid: {'title': row[1], 'artist': row[2], 'file_path': row[3],
+                        'track_number': row[4], 'album_title': row[5],
+                        'duration_ms': row[10], 'db_verification_status': row[12]}
+                  for tid, row in self.rows.items()}
+        if getattr(self, '_context', None) is None:
+            self._context = _make_context([], self.tmp_path)
+        context = self._context
+        context.check_stop = lambda: False
+
+        def _get(key, default=None):
+            if key.endswith('.settings'):
+                return {'skip_verified': self.setting}
+            return self.cfg.get(key, default)
+
+        context.config_manager = SimpleNamespace(
+            get=_get, set=lambda key, value: self.cfg.__setitem__(key, value))
+
+        scanned = []
+        job = AcoustIDScannerJob()
+        monkeypatch.setattr(job, "_load_db_tracks", lambda _ctx: dict(tracks))
+        monkeypatch.setattr(
+            job, "_resolve_path",
+            lambda file_path, _c: None if any(
+                str(self.files[u]) == file_path for u in unresolved) else file_path)
+
+        def _scan_file(fpath, track_id, expected, client, ctx, result, *a, **k):
+            scanned.append(track_id)
+            if track_id == error_on:
+                raise RuntimeError("boom")
+
+        monkeypatch.setattr(job, "_scan_file", _scan_file)
+        if stop_after is not None:
+            context.check_stop = lambda: len(scanned) >= stop_after
+        self.warnings = []
+        context.report_progress = lambda log_line=None, log_type=None, **k: (
+            self.warnings.append(log_line) if log_type == 'warning' else None)
+        return scanned, job.scan(context)
+
+
+def _full_pass(lib, monkeypatch):
+    scanned, _ = lib.run(monkeypatch)
+    assert KEY + 'checkpoint_id' in lib.cfg and lib.cfg[KEY + 'checkpoint_id'] is None
+    return scanned
+
+
+def test_skip_verified_is_off_by_default():
+    assert AcoustIDScannerJob.default_settings['skip_verified'] is False
+
+
+def test_skip_verified_off_still_scans_verified(monkeypatch, tmp_path):
+    lib = _Library(tmp_path, setting=False)
+    _full_pass(lib, monkeypatch)
+    scanned, result = lib.run(monkeypatch)
+    assert scanned == ["1", "2", "3", "4"]
+    assert result.skipped == 0
+
+
+def test_skip_verified_scans_everything_before_a_clean_pass(monkeypatch, tmp_path):
+    lib = _Library(tmp_path)
+    scanned, _ = lib.run(monkeypatch)
+    assert scanned == ["1", "2", "3", "4"]
+
+
+def test_skip_verified_skips_unchanged_files_after_a_clean_pass(monkeypatch, tmp_path):
+    lib = _Library(tmp_path)
+    _full_pass(lib, monkeypatch)
+    scanned, result = lib.run(monkeypatch)
+    assert scanned == []
+    assert result.skipped == 4
+
+
+def test_skip_verified_rescans_a_file_changed_after_a_clean_pass(monkeypatch, tmp_path):
+    lib = _Library(tmp_path)
+    _full_pass(lib, monkeypatch)
+    lib.touch("2")
+    scanned, _ = lib.run(monkeypatch)
+    assert scanned == ["2"]
+
+
+@pytest.mark.parametrize("status", [None, "unverified", "force_imported"])
+def test_skip_verified_only_skips_verified(monkeypatch, tmp_path, status):
+    lib = _Library(tmp_path)
+    _full_pass(lib, monkeypatch)
+    lib.rows["3"] = lib.rows["3"][:-1] + (status,)
+    scanned, _ = lib.run(monkeypatch)
+    assert scanned == ["3"]
+
+
+def test_resumed_run_does_not_move_the_cutoff(monkeypatch, tmp_path):
+    """Stop partway, replace a verified file the first run already checked,
+    resume to the end. The next run has to scan the replaced file."""
+    lib = _Library(tmp_path)
+    scanned, _ = lib.run(monkeypatch, stop_after=2)
+    assert scanned == ["1", "2"]
+    assert lib.cfg[KEY + 'checkpoint_id'] == "2"
+
+    lib.touch("1")
+    scanned, _ = lib.run(monkeypatch)
+    assert scanned == ["3", "4"]
+    assert lib.cfg[KEY + 'checkpoint_id'] is None
+
+    scanned, _ = lib.run(monkeypatch)
+    assert "1" in scanned
+
+
+def test_stopped_run_does_not_set_the_cutoff(monkeypatch, tmp_path):
+    lib = _Library(tmp_path)
+    lib.run(monkeypatch, stop_after=2)
+    assert KEY + 'verified_cutoff' not in lib.cfg
+
+
+def test_errors_before_a_stop_keep_the_resumed_pass_from_promoting(monkeypatch, tmp_path):
+    lib = _Library(tmp_path)
+    lib.run(monkeypatch, stop_after=2, error_on="1")
+    scanned, result = lib.run(monkeypatch)
+    assert result.errors == 0
+    assert KEY + 'verified_cutoff' not in lib.cfg
+
+
+def test_pass_with_an_error_does_not_promote(monkeypatch, tmp_path):
+    lib = _Library(tmp_path)
+    lib.run(monkeypatch, error_on="3")
+    assert KEY + 'verified_cutoff' not in lib.cfg
+
+
+def test_unresolved_path_keeps_the_pass_from_promoting(monkeypatch, tmp_path):
+    lib = _Library(tmp_path)
+    lib.run(monkeypatch, unresolved=("2",))
+    assert KEY + 'verified_cutoff' not in lib.cfg
+
+
+def test_checkpoint_without_a_recorded_pass_never_promotes(monkeypatch, tmp_path):
+    lib = _Library(tmp_path)
+    lib.cfg[KEY + 'checkpoint_id'] = "2"
+    lib.run(monkeypatch)
+    assert KEY + 'verified_cutoff' not in lib.cfg
+
+
+def test_next_fresh_pass_starts_clean_after_a_dirty_one(monkeypatch, tmp_path):
+    lib = _Library(tmp_path)
+    lib.run(monkeypatch, error_on="3")
+    scanned, _ = lib.run(monkeypatch)
+    assert KEY + 'verified_cutoff' in lib.cfg
+
+
+def test_dirty_passes_are_counted_and_reset_by_a_clean_one(monkeypatch, tmp_path):
+    lib = _Library(tmp_path)
+    lib.run(monkeypatch, error_on="3")
+    assert lib.cfg[KEY + 'dirty_passes'] == 1
+    lib.run(monkeypatch, unresolved=("2",))
+    assert lib.cfg[KEY + 'dirty_passes'] == 2
+    lib.run(monkeypatch)
+    assert lib.cfg[KEY + 'dirty_passes'] == 0
+    assert KEY + 'verified_cutoff' in lib.cfg
+
+
+def test_stopped_pass_is_not_counted_as_dirty(monkeypatch, tmp_path):
+    lib = _Library(tmp_path)
+    lib.run(monkeypatch, stop_after=2)
+    assert KEY + 'dirty_passes' not in lib.cfg
+
+
+def test_dirty_pass_is_quiet_when_the_setting_is_off(monkeypatch, tmp_path):
+    # an unresolved path is common; with the setting off it is not news
+    lib = _Library(tmp_path, setting=False)
+    lib.run(monkeypatch, unresolved=("2",))
+    assert lib.warnings == []
+    assert KEY + 'dirty_passes' not in lib.cfg
+
+
+def test_dirty_pass_warns_when_the_setting_is_on(monkeypatch, tmp_path):
+    lib = _Library(tmp_path)
+    lib.run(monkeypatch, unresolved=("2",))
+    assert len(lib.warnings) == 1
+
+
+def test_cutoff_slack_rescans_a_file_stamped_just_before_the_cutoff(monkeypatch, tmp_path):
+    # a nas clock behind the server stamps a fresh change as older than the
+    # pass start. inside the slack it is scanned, not trusted
+    import time
+    lib = _Library(tmp_path)
+    _full_pass(lib, monkeypatch)
+    lib.cfg[KEY + 'verified_cutoff'] = time.time() + 60
+    scanned, _ = lib.run(monkeypatch, slack=600)
+    assert scanned == ["1", "2", "3", "4"]
+    scanned, _ = lib.run(monkeypatch, slack=0)
+    assert scanned == []

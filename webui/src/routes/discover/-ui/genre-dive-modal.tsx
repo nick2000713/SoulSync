@@ -1,3 +1,6 @@
+import { AddToPlaylistButton } from '@/features/playlists/add-to-playlist';
+import addStyles from '@/features/playlists/add-to-playlist.module.css';
+
 import type { CacheItem } from '../-discover.cache-sections';
 
 import {
@@ -94,7 +97,9 @@ export function GenreDiveModal({
             </div>
           ) : phase === 'error' ? (
             // Inline-styled in the vanilla (10884) — kept verbatim, no class.
-            <div style={{ color: 'rgba(255,100,100,0.6)', textAlign: 'center', padding: 40 }}>
+            <div
+              style={{ color: 'rgba(var(--danger-rgb), 0.6)', textAlign: 'center', padding: 40 }}
+            >
               {GENRE_DIVE_ERROR}
             </div>
           ) : (
@@ -226,6 +231,17 @@ function DiveBody({
                 <div className="genre-dive-track-duration">
                   {formatDuration(t.duration_ms as number | undefined)}
                 </div>
+                <AddToPlaylistButton
+                  track={{
+                    track_name: String(t.name ?? ''),
+                    artist_name: String(t.artist_name ?? ''),
+                    album_name: String(t.album_name ?? ''),
+                    duration_ms: Number(t.duration_ms) || 0,
+                    image_url: t.image_url ? String(t.image_url) : null,
+                  }}
+                  className={addStyles.button}
+                  size={15}
+                />
               </div>
             ))}
           </div>

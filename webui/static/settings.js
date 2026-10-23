@@ -78,6 +78,17 @@ function syncRetryConditionalRows() {
 }
 window.syncRetryConditionalRows = syncRetryConditionalRows;
 
+// Sign in with OIDC: the provider's settings (and the admin's connect row
+// inside them) only mean something while the toggle is on, so they hide when
+// it is off. Hidden fields keep their values and still save, so switching
+// OIDC off and on again loses nothing.
+function syncOidcProviderBlock() {
+    const toggle = document.getElementById('security-oidc-signin');
+    const block = document.getElementById('security-oidc-provider');
+    if (block) block.hidden = !(toggle && toggle.checked);
+}
+window.syncOidcProviderBlock = syncOidcProviderBlock;
+
 // Every Settings -> Quality control belongs to the profile currently shown in
 // the editor. Keep this list separate from ordinary app settings so a quality
 // edit uses the profile endpoint (and does not re-initialize every service
@@ -91,7 +102,7 @@ const _QP_BUNDLE_CONTROL_IDS = new Set([
 const _QP_PROFILE_CONTROL_IDS = new Set([
     ..._QP_BUNDLE_CONTROL_IDS,
     'quality-fallback-enabled', 'quality-search-mode', 'quality-rank-candidates',
-    'quality-upgrade-policy', 'quality-upgrade-cutoff',
+    'quality-upgrade-policy', 'quality-upgrade-cutoff', 'quality-release-import-mode',
 ]);
 
 // Route a Quality-page change to the profile editor's lightweight autosave.
@@ -519,8 +530,8 @@ function validateFileOrganizationTemplates() {
 
     // Valid variables for each template type
     const validVars = {
-        album: ['$artist', '$albumartist', '$artistletter', '$album', '$albumtype', '$atypes', '$title', '$track', '$disc', '$discnum', '$cdnum', '$year', '$quality', '$disambiguation', '$label'],
-        single: ['$artist', '$albumartist', '$artistletter', '$album', '$albumtype', '$atypes', '$title', '$track', '$year', '$quality'],
+        album: ['$artist', '$albumartist', '$artistletter', '$albumartistletter', '$album', '$albumtype', '$atypes', '$title', '$track', '$disc', '$discnum', '$cdnum', '$year', '$quality', '$disambiguation', '$label'],
+        single: ['$artist', '$albumartist', '$artistletter', '$albumartistletter', '$album', '$albumtype', '$atypes', '$title', '$track', '$year', '$quality'],
         playlist: ['$artist', '$artistletter', '$playlist', '$title', '$year', '$quality'],
         video: ['$artist', '$artistletter', '$title', '$year'],
         podcast: ['$show', '$podcast', '$author', '$artist', '$title', '$season', '$seasonnum', '$episode', '$episodenum', '$year', '$date', '$type'],
@@ -734,6 +745,30 @@ const SERVICE_GLYPHS = {
     nokey: '\u{1F4FA}',         // tv - community data (TVmaze)
 };
 
+// Grouped by what each service does for you, same headings as the download
+// chain. Order inside a group is the order here, not page order. A service not
+// listed lands in "Other" so a new one can never vanish from the grid.
+const SERVICE_GROUPS = {
+    music: [
+        { label: 'Metadata', hint: 'artists, albums and tracks',
+          ids: ['musicbrainz', 'spotify', 'itunes', 'deezer', 'discogs', 'tidal', 'qobuz', 'hydrabase'] },
+        { label: 'Scrobbling', hint: 'listening history and recommendations',
+          ids: ['lastfm', 'listenbrainz'] },
+        { label: 'Extras', hint: 'lyrics, concerts and fingerprint checks',
+          ids: ['genius', 'concerts', 'acoustid'] },
+    ],
+    video: [
+        { label: 'Metadata', hint: 'movies, shows and episodes',
+          ids: ['tmdb', 'tvdb', 'nokey'] },
+        { label: 'Ratings & lists', hint: 'scores and list collections',
+          ids: ['omdb', 'trakt', 'mdblist'] },
+        { label: 'Subtitles', hint: 'found and downloaded for your library',
+          ids: ['opensubtitles', 'subdl', 'subsource'] },
+        { label: 'Artwork & extras', hint: 'posters, fanart and trailers',
+          ids: ['fanart', 'ytextras'] },
+    ],
+};
+
 // Follow the side you are standing on, exactly like the download chain does.
 // Defaulting to music meant a video user landed on a grid of Spotify and Tidal
 // tiles with their own TMDB key nowhere in sight.
@@ -821,7 +856,7 @@ function buildServiceTiles() {
         return;
     }
     const attr = SERVICE_KINDS[_svcKind].attr;
-    grid.innerHTML = '<div class="svc-tile-row">' + frames.map(frame => {
+    const tile = (frame) => {
         const id = frame.getAttribute(attr);
         const m = _svcMeta(frame);
         const set = _svcConfigured(frame);
@@ -850,7 +885,21 @@ function buildServiceTiles() {
              + `<span class="svc-tile-art">${art}</span>`
              + `<span class="svc-tile-name">${escapeHtml(m.name)}</span>`
              + chip + '</button>';
-    }).join('') + '</div>';
+    };
+
+    const byId = new Map(frames.map(f => [f.getAttribute(attr), f]));
+    const groups = (SERVICE_GROUPS[_svcKind] || []).map(g => ({
+        ...g, frames: g.ids.map(id => byId.get(id)).filter(Boolean),
+    }));
+    const listed = new Set(groups.flatMap(g => g.ids));
+    groups.push({ label: 'Other', hint: '', frames: frames.filter(f => !listed.has(f.getAttribute(attr))) });
+
+    grid.innerHTML = groups.filter(g => g.frames.length).map(g =>
+        `<div class="src-group"><div class="src-group-head">`
+        + `<span class="src-group-label">${g.label}</span>`
+        + `<span class="src-group-count">${g.frames.length}</span>`
+        + (g.hint ? `<span class="src-group-hint">${g.hint}</span>` : '')
+        + `</div><div class="svc-tile-row">${g.frames.map(tile).join('')}</div></div>`).join('');
 }
 window.buildServiceTiles = buildServiceTiles;
 
@@ -1128,6 +1177,12 @@ function switchSettingsTab(tab) {
     }
     if (tab === 'advanced' && typeof loadImageCacheStatus === 'function') {
         try { loadImageCacheStatus(); } catch (e) { }
+    }
+    if (tab === 'advanced' && typeof loadSidebarWeatherSettings === 'function') {
+        try { loadSidebarWeatherSettings(); } catch (e) { }
+    }
+    if (tab === 'advanced' && typeof loadMetaSyncSettings === 'function') {
+        try { loadMetaSyncSettings(); } catch (e) { }
     }
     // First time the Downloads tab is shown, auto-probe source status so the
     // dots reflect real connection state without a manual "Test all sources".
@@ -1908,6 +1963,15 @@ function toggleAudiobookSource(src, on) {
     renderAudiobookHybrid();
 }
 
+// the sources audiobooks actually download through: the chain in hybrid mode,
+// the one picked source otherwise.
+function _audiobookActiveSources() {
+    const mode = document.getElementById('audiobook-download-mode')?.value;
+    if (!mode) return [];
+    const ids = mode === 'hybrid' ? _audiobookHybrid : [mode];
+    return ids.filter(s => AUDIOBOOK_SOURCES.includes(s));
+}
+
 // The chain only applies in hybrid mode; a single-source mode has nothing to
 // order, so showing the rows there would imply a choice that does nothing.
 function onAudiobookModeChange() {
@@ -2378,6 +2442,10 @@ async function testAllSources(opts = {}) {
         sources.add(mode);
     }
     if (sources.size === 0) sources.add('soulseek');
+    // the audiobook chain is its own setting. a user whose books come over
+    // torrent but whose music never does saw a grey torrent tile forever,
+    // because only the music chain got probed.
+    for (const id of _audiobookActiveSources()) sources.add(id);
 
     // Torrent/Usenet downloads go through Prowlarr — its connection must be
     // established first or those source tests fail. Probe Prowlarr up front.
@@ -2650,7 +2718,7 @@ function buildArtSourceList() {
     if (!container) return;
     container.innerHTML = '';
     if (!_artVisualOrder.length) {
-        container.innerHTML = '<div style="padding:10px;color:var(--text-secondary,#888);font-size:13px;">No connected art sources available.</div>';
+        container.innerHTML = '<div style="padding:10px;color:#888;font-size:13px;">No connected art sources available.</div>';
         return;
     }
     const enabledOrder = getArtOrder();
@@ -2899,6 +2967,7 @@ async function loadSettingsData() {
         document.getElementById('navidrome-username').value = settings.navidrome?.username || '';
         document.getElementById('navidrome-password').value = settings.navidrome?.password || '';
         loadNavidromePlaylistLogin();
+        loadMediaServerNames();
 
         // Set active server and toggle visibility
         const activeServer = settings.active_media_server || 'plex';
@@ -3051,6 +3120,7 @@ async function loadSettingsData() {
                 ? defaultPodcastPath
                 : (currentPodcastsVal || defaultPodcastPath);
         }
+        loadAudiobookRoutes();
         const defaultAudiobookPath = isDocker ? '/app/audiobooks' : './audiobooks';
         const audiobooksEl = document.getElementById('audiobooks-path');
         if (audiobooksEl) {
@@ -3224,6 +3294,10 @@ async function loadSettingsData() {
         document.getElementById('embed-lastfm').checked = settings.lastfm?.embed_tags !== false;
         document.getElementById('embed-genius').checked = settings.genius?.embed_tags !== false;
         document.getElementById('embed-hifi').checked = settings.hifi?.embed_tags !== false;
+        const embedBeatport = document.getElementById('embed-beatport');
+        if (embedBeatport) embedBeatport.checked = settings.beatport?.embed_tags !== false;
+        const beatportSearchAll = document.getElementById('beatport-search-all');
+        if (beatportSearchAll) beatportSearchAll.checked = settings.beatport?.search_all_tracks === true;
         // Load per-tag toggles from data-config attributes
         document.querySelectorAll('[data-config]').forEach(cb => {
             const path = cb.dataset.config.split('.');
@@ -3232,7 +3306,7 @@ async function loadSettingsData() {
             cb.checked = val !== false;
         });
         // Apply service disabled state to child tags
-        ['spotify', 'itunes', 'musicbrainz', 'deezer', 'audiodb', 'tidal', 'qobuz', 'lastfm', 'genius', 'hifi'].forEach(svc => {
+        ['spotify', 'itunes', 'musicbrainz', 'deezer', 'audiodb', 'tidal', 'qobuz', 'lastfm', 'genius', 'hifi', 'beatport'].forEach(svc => {
             const master = document.getElementById('embed-' + svc);
             if (master) toggleServiceTags(master, svc);
         });
@@ -3295,6 +3369,10 @@ async function loadSettingsData() {
             Math.round((ab.completeness_tolerance ?? 0.92) * 100));
         abVal(document.getElementById('audiobook-staging-days'), ab.staging_days ?? 7);
         abChecked(document.getElementById('audiobook-renumber-chapters'), ab.renumber_chapters);
+        // Opt-in, off by default: abChecked treats a missing key as on, which
+        // would switch these on for older configs.
+        const mergeM4b = document.getElementById('audiobook-merge-m4b');
+        if (mergeM4b) mergeM4b.checked = ab.merge_m4b === true;
         // Off by default, unlike the toggles above: abChecked treats a
         // missing key as on, which would switch this on for older configs.
         const removeOwned = document.getElementById('audiobook-remove-owned-from-wishlist');
@@ -3312,6 +3390,16 @@ async function loadSettingsData() {
             ? abq.format_order
             : ['m4b', 'm4a', 'mp3', 'opus', 'ogg', 'flac'];
         abVal(document.getElementById('audiobook-format-first'), abOrder[0] || 'm4b');
+        // Empty means every format, so a fresh install shows them all on.
+        const abAllowed = Array.isArray(abq.allowed_formats) ? abq.allowed_formats : [];
+        document.getElementById('audiobook-allowed-formats')?.querySelectorAll('input').forEach(box => {
+            box.checked = !abAllowed.length || abAllowed.includes(box.value);
+        });
+        // "any" shows both switches on; "single"/"multiple" shows just that one.
+        const abLayout = abq.file_layout || 'any';
+        document.getElementById('audiobook-file-layout')?.querySelectorAll('input').forEach(box => {
+            box.checked = abLayout === 'any' || abLayout === box.value;
+        });
         abVal(document.getElementById('audiobook-min-bitrate'), abq.min_bitrate_kbps ?? 0);
         abVal(document.getElementById('audiobook-max-bitrate'), abq.max_bitrate_kbps ?? 0);
         abChecked(document.getElementById('audiobook-allow-dramatized'),
@@ -3332,6 +3420,11 @@ async function loadSettingsData() {
         document.getElementById('write-multi-artist').checked = settings.metadata_enhancement?.tags?.write_multi_artist || false;
         document.getElementById('feat-in-title').checked = settings.metadata_enhancement?.tags?.feat_in_title || false;
         document.getElementById('allow-duplicate-tracks').checked = settings.wishlist?.allow_duplicate_tracks !== false;
+        const _lcOn = document.getElementById('lidarr-compat-enabled');
+        if (_lcOn) _lcOn.checked = settings.lidarr_compat?.enabled === true;
+        loadLidarrCompatProfiles(settings.lidarr_compat?.profile_id ?? 1);
+        const _mcpOn = document.getElementById('mcp-enabled');
+        if (_mcpOn) _mcpOn.checked = settings.mcp?.enabled === true;
         const _wlTtl = document.getElementById('wishlist-ignore-ttl');
         if (_wlTtl) _wlTtl.value = settings.wishlist?.ignore_ttl_days ?? 30;
         const _wlWingIt = document.getElementById('wishlist-wing-it-guesses');
@@ -3392,6 +3485,10 @@ async function loadSettingsData() {
         const _nfoEl = document.getElementById('write-artist-nfo');
         if (_nfoEl) _nfoEl.checked = settings.library?.write_artist_nfo === true;
 
+        // Library v2: re-download files deleted outside SoulSync (default on)
+        const _redlEl = document.getElementById('redownload-externally-deleted');
+        if (_redlEl) _redlEl.checked = settings.library?.redownload_externally_deleted !== false;
+
         // Populate Content Filter settings
         document.getElementById('allow-explicit').checked = settings.content_filter?.allow_explicit !== false;
         document.getElementById('prefer-explicit').checked = settings.content_filter?.prefer_explicit === true;
@@ -3422,6 +3519,8 @@ async function loadSettingsData() {
 
         // Populate M3U Export settings
         document.getElementById('m3u-export-enabled').checked = settings.m3u_export?.enabled === true;
+        const _m3uRelEl = document.getElementById('m3u-relative-paths');
+        if (_m3uRelEl) _m3uRelEl.checked = settings.m3u_export?.relative_paths === true;
         document.getElementById('m3u-entry-base-path').value = settings.m3u_export?.entry_base_path || '';
         document.getElementById('m3u-rewrite-from').value = settings.m3u_export?.rewrite_from || '';
         document.getElementById('m3u-rewrite-to').value = settings.m3u_export?.rewrite_to || '';
@@ -3555,6 +3654,45 @@ async function loadSettingsData() {
             if (authHeader) authHeader.value = settings.security?.auth_proxy_header || '';
             const reqLogin = document.getElementById('security-require-login');
             if (reqLogin) reqLogin.checked = settings.security?.require_login || false;
+            const plexSignin = document.getElementById('security-plex-signin');
+            if (plexSignin) plexSignin.checked = settings.security?.plex_signin || false;
+            const plexCreate = document.getElementById('security-plex-signin-auto-create');
+            if (plexCreate) plexCreate.checked = settings.security?.plex_signin_auto_create !== false;
+            const plexDl = document.getElementById('security-plex-signin-can-download');
+            if (plexDl) plexDl.checked = settings.security?.plex_signin_default_can_download || false;
+            const oidcOn = document.getElementById('security-oidc-signin');
+            if (oidcOn) oidcOn.checked = settings.security?.oidc_signin || false;
+            syncOidcProviderBlock();
+            for (const [id, key] of [
+                ['security-oidc-issuer', 'oidc_issuer'],
+                ['security-oidc-client-id', 'oidc_client_id'],
+                ['security-oidc-client-secret', 'oidc_client_secret'],
+                ['security-oidc-button-label', 'oidc_button_label'],
+                ['security-oidc-icon-url', 'oidc_icon_url'],
+                ['security-oidc-required-group', 'oidc_required_group'],
+                ['security-oidc-groups-claim', 'oidc_groups_claim'],
+                ['security-oidc-scopes', 'oidc_scopes'],
+                ['security-oidc-redirect-uri', 'oidc_redirect_uri'],
+            ]) {
+                const el = document.getElementById(id);
+                if (el) el.value = settings.security?.[key] || '';
+            }
+            const oidcCreate = document.getElementById('security-oidc-signin-auto-create');
+            if (oidcCreate) oidcCreate.checked = settings.security?.oidc_signin_auto_create !== false;
+            const oidcDl = document.getElementById('security-oidc-signin-can-download');
+            if (oidcDl) oidcDl.checked = settings.security?.oidc_signin_default_can_download || false;
+            // the address to register at the provider, as this browser sees it
+            const oidcCb = document.getElementById('security-oidc-callback-url');
+            if (oidcCb) oidcCb.textContent = window.location.origin + '/api/auth/oidc/callback';
+            const signupSides = document.getElementById('security-signup-sides');
+            if (signupSides) {
+                const sides = settings.security?.signup_sides;
+                signupSides.value = ['music', 'video', 'both'].includes(sides) ? sides : 'music';
+            }
+            const signupLimit = document.getElementById('security-signup-request-limit');
+            if (signupLimit) signupLimit.value = settings.security?.signup_request_limit ?? 0;
+            const signupDays = document.getElementById('security-signup-request-limit-days');
+            if (signupDays) signupDays.value = settings.security?.signup_request_limit_days ?? 7;
 
             // Check if admin has a PIN set
             const profilesRes = await fetch('/api/profiles');
@@ -3748,6 +3886,18 @@ function setPlexConfigActionButton(isManualConfig) {
     }
 }
 
+// Re-link: Plex is already configured and the user wants a fresh token
+// through plex.tv/link without clearing anything. The PIN box lives in the
+// setup area (hidden once configured), so re-link shows that area on its own.
+let _plexPinRelink = false;
+
+function startPlexRelink() {
+    _plexPinRelink = true;
+    const plexSetup = document.getElementById('plex-setup');
+    if (plexSetup) plexSetup.style.display = '';
+    startPlexPinAuth();
+}
+
 async function startPlexPinAuth() {
     const setupButtons = document.getElementById('plex-setup-buttons');
     const authFlow = document.getElementById('plex-pin-auth-flow');
@@ -3815,9 +3965,31 @@ async function pollPlexPinAuthStatus() {
 
         if (result.success) {
             stopPlexPinAuthPolling();
-            if (statusEl) statusEl.textContent = 'Authorization complete! Saving Plex configuration...';
-            document.getElementById('plex-url').value = result.found_url || '';
-            document.getElementById('plex-token').value = result.token || '';
+            const urlEl = document.getElementById('plex-url');
+            const currentUrl = (urlEl?.value || '').trim();
+            if (_plexPinRelink && currentUrl) {
+                // Re-link keeps the URL that already works (a docker host or a
+                // reverse proxy Plex can't discover) and only saves the new
+                // token once it's proven to reach that server.
+                if (statusEl) statusEl.textContent = 'Authorized. Checking the new token against your server...';
+                const check = await fetch('/api/plex/verify-token', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url: currentUrl, token: result.token || '' })
+                }).then((r) => r.json()).catch(() => ({ success: false }));
+                if (!check.success) {
+                    if (statusEl) statusEl.textContent = (check.error || "The new token couldn't reach your server")
+                        + '. Nothing was changed.';
+                    showToast("Re-link didn't change anything: that Plex account can't reach your server", 'error');
+                    return;
+                }
+                document.getElementById('plex-token').value = result.token || '';
+            } else {
+                if (statusEl) statusEl.textContent = 'Authorization complete! Saving Plex configuration...';
+                if (urlEl) urlEl.value = result.found_url || '';
+                document.getElementById('plex-token').value = result.token || '';
+            }
+            _plexPinRelink = false;
             if (typeof saveSettings === 'function') {
                 await saveSettings(true);
             }
@@ -3850,11 +4022,19 @@ function cancelPlexPinAuth() {
     const authFlow = document.getElementById('plex-pin-auth-flow');
     if (setupButtons) setupButtons.style.display = '';
     if (authFlow) authFlow.style.display = 'none';
+    if (_plexPinRelink) {
+        // back to the configured view, nothing changed
+        _plexPinRelink = false;
+        const plexSetup = document.getElementById('plex-setup');
+        if (plexSetup) plexSetup.style.display = 'none';
+    }
 }
 
 function restartPlexPinAuth() {
+    const relink = _plexPinRelink;
     cancelPlexPinAuth();
-    startPlexPinAuth();
+    if (relink) startPlexRelink();
+    else startPlexPinAuth();
 }
 
 async function clearPlexConfiguration() {
@@ -3902,19 +4082,36 @@ async function clearPlexConfiguration() {
     }
 }
 
-function toggleServer(serverType) {
-    // Update toggle buttons
-    document.getElementById('plex-toggle').classList.remove('active');
-    document.getElementById('jellyfin-toggle').classList.remove('active');
-    document.getElementById('navidrome-toggle').classList.remove('active');
-    document.getElementById('soulsync-toggle')?.classList.remove('active');
-    document.getElementById(`${serverType}-toggle`)?.classList.add('active');
+// The media server names, in UI order. Refreshed from GET /api/media-servers
+// (the per-server descriptor) when the settings page loads; this list is
+// what the page knew before the endpoint existed and stays the fallback.
+let _mediaServerNames = ['plex', 'jellyfin', 'navidrome', 'soulsync'];
 
-    // Show/hide server containers
-    document.getElementById('plex-container').classList.toggle('hidden', serverType !== 'plex');
-    document.getElementById('jellyfin-container').classList.toggle('hidden', serverType !== 'jellyfin');
-    document.getElementById('navidrome-container').classList.toggle('hidden', serverType !== 'navidrome');
-    document.getElementById('soulsync-container')?.classList.toggle('hidden', serverType !== 'soulsync');
+async function loadMediaServerNames() {
+    try {
+        const res = await fetch('/api/media-servers');
+        if (!res.ok) return;
+        const names = ((await res.json())?.servers || []).map(s => s?.name).filter(Boolean);
+        if (names.length) _mediaServerNames = names;
+    } catch (e) {
+        // fallback list stays
+    }
+}
+
+// The server whose toggle is active, else the first one.
+function activeServerFromToggles() {
+    const hit = _mediaServerNames.find(name => document.getElementById(`${name}-toggle`)?.classList.contains('active'));
+    return hit || _mediaServerNames[0];
+}
+
+function toggleServer(serverType) {
+    // Update toggle buttons and show the matching config container. A
+    // server without a toggle or a container on this page (the standalone
+    // library on the video side) is simply skipped.
+    for (const name of _mediaServerNames) {
+        document.getElementById(`${name}-toggle`)?.classList.toggle('active', name === serverType);
+        document.getElementById(`${name}-container`)?.classList.toggle('hidden', name !== serverType);
+    }
 
     // Show Plex setup when Plex is selected; otherwise hide both Plex panels
     const plexConfig = document.getElementById('plex-configuration');
@@ -4108,11 +4305,14 @@ function populateQualityProfileUI(profile) {
     const rankCandidatesCheckbox = document.getElementById('quality-rank-candidates');
     if (rankCandidatesCheckbox) rankCandidatesCheckbox.checked = profile.rank_candidates_by_quality === true;
 
+    const releaseImportSelect = document.getElementById('quality-release-import-mode');
+    if (releaseImportSelect) releaseImportSelect.value = profile.release_import_mode === 'album_tracks' ? 'album_tracks' : 'requested_tracks';
+
     const upgradePolicySelect = document.getElementById('quality-upgrade-policy');
     if (upgradePolicySelect) {
         upgradePolicySelect.value = ['until_cutoff', 'until_top'].includes(profile.upgrade_policy)
             ? 'until_cutoff'
-            : 'acceptable';
+            : profile.upgrade_policy === 'acceptable' ? 'acceptable' : 'none';
     }
     renderUpgradeCutoffOptions(profile.upgrade_cutoff_index);
 
@@ -4146,7 +4346,7 @@ function renderUpgradeCutoffOptions(selectedIndex = null) {
 }
 
 function onUpgradePolicyChange() {
-    const policy = document.getElementById('quality-upgrade-policy')?.value || 'acceptable';
+    const policy = document.getElementById('quality-upgrade-policy')?.value || 'none';
     const cutoffGroup = document.getElementById('quality-upgrade-cutoff-group');
     if (cutoffGroup) cutoffGroup.style.display = policy === 'until_cutoff' ? '' : 'none';
     renderUpgradeCutoffOptions();
@@ -4344,6 +4544,9 @@ async function applyQualityPreset(presetName) {
                 ...preset,
                 search_mode: uiState.search_mode,
                 rank_candidates_by_quality: uiState.rank_candidates_by_quality,
+                upgrade_policy: uiState.upgrade_policy,
+                upgrade_cutoff_index: uiState.upgrade_cutoff_index,
+                release_import_mode: uiState.release_import_mode,
             };
             currentQualityProfile = merged;
             window._suppressSettingsAutoSave = true;
@@ -4446,7 +4649,10 @@ function collectQualityProfileFromUI() {
         fallback_enabled: document.getElementById('quality-fallback-enabled')?.checked ?? true,
         search_mode: document.getElementById('quality-search-mode')?.value === 'best_quality' ? 'best_quality' : 'priority',
         rank_candidates_by_quality: document.getElementById('quality-rank-candidates')?.checked ?? false,
-        upgrade_policy: document.getElementById('quality-upgrade-policy')?.value === 'until_cutoff' ? 'until_cutoff' : 'acceptable',
+        release_import_mode: document.getElementById('quality-release-import-mode')?.value === 'album_tracks' ? 'album_tracks' : 'requested_tracks',
+        upgrade_policy: ['none', 'acceptable', 'until_cutoff'].includes(
+            document.getElementById('quality-upgrade-policy')?.value)
+            ? document.getElementById('quality-upgrade-policy').value : 'none',
         upgrade_cutoff_index: parseInt(document.getElementById('quality-upgrade-cutoff')?.value || '0', 10) || 0,
         ranked_targets,
     };
@@ -4576,10 +4782,14 @@ function qpProfileSummary(profile) {
             ? `retain ${codec} only (acquisition remembered)`
             : `lossless + ${codec} companion`);
     }
-    if (['until_cutoff', 'until_top'].includes(profile.upgrade_policy)) {
+    if (profile.upgrade_policy === 'acceptable') {
+        parts.push('upgrade until any accepted target');
+    } else if (['until_cutoff', 'until_top'].includes(profile.upgrade_policy)) {
         const cutoffIndex = Math.min(Math.max(parseInt(profile.upgrade_cutoff_index || '0', 10) || 0, 0), Math.max(targets.length - 1, 0));
         const cutoff = targets[cutoffIndex]?.label || 'top target';
         parts.push(`upgrade until ${cutoff}`);
+    } else {
+        parts.push('upgrades off');
     }
     return parts.join(' · ');
 }
@@ -5393,6 +5603,69 @@ function renderSamplePaths(paths) {
     });
 }
 
+// --- Spoken-word artists: music downloads filed in the audiobook library ---
+// The artist page and watchlist own the toggle (React); this is only the list.
+
+async function loadAudiobookRoutes() {
+    const list = document.getElementById('audiobook-routes-list');
+    if (!list) return;
+    try {
+        const { artists = [] } = await (await fetch('/api/audiobook-routes')).json();
+        list.innerHTML = artists.length
+            ? artists.map(a => `<div class="abr-row"><span>${escapeHtml(a.label || a.route_key)}</span>
+                <button class="test-button" type="button" data-route="${escapeHtml(a.route_key)}" data-action="move">Move existing…</button>
+                <button class="test-button abr-remove" type="button" data-route="${escapeHtml(a.route_key)}" data-action="remove">&times;</button></div>`).join('')
+            : '<div class="abr-empty">No artists routed. Use “Treat as audiobook” on an artist’s page.</div>';
+        list.onclick = e => {
+            const btn = e.target.closest('button[data-action]');
+            if (btn) audiobookRouteAction(btn.dataset.action, btn.dataset.route);
+        };
+    } catch (e) {
+        list.textContent = 'Could not load the list.';
+    }
+}
+
+async function audiobookRouteAction(action, key) {
+    const url = '/api/audiobook-routes/' + encodeURIComponent(key);
+    const call = (path, init) => fetch(url + path, init).then(async r => {
+        const data = await r.json();
+        if (!data.success) throw new Error(data.error || 'failed');
+        return data;
+    });
+    const post = apply => call('/move', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ apply }),
+    });
+    try {
+        if (action === 'remove') {
+            await call('', { method: 'DELETE' });
+            await loadAudiobookRoutes();
+            return;
+        }
+        const items = (await post(false)).items || [];
+        const todo = items.filter(i => i.action === 'move').length;
+        const clash = items.filter(i => i.action === 'exists').length;
+        if (!todo) {
+            showToast(clash ? `Nothing to move: ${clash} album(s) already exist in the audiobook folder.`
+                            : 'No albums of this artist in the music library.', 'info');
+            return;
+        }
+        if (!await showConfirmDialog({
+            title: 'Move albums',
+            message: `Move ${todo} album folder(s) from the music library to the audiobook folder? `
+                + `${clash ? `${clash} album(s) already exist there and stay as they are. ` : ''}`
+                + 'Your media server needs a library scan afterwards.',
+            confirmText: 'Move',
+        })) return;
+        const done = await post(true);
+        showToast(`Moved ${done.moved} album(s)` + (done.failed ? `, ${done.failed} failed` : ''),
+                  done.failed ? 'error' : 'success');
+    } catch (e) {
+        showToast(e.message, 'error');
+    }
+}
+
 function addSamplePathRow() {
     const container = document.getElementById('sample-paths-list');
     if (!container) return;
@@ -6075,14 +6348,7 @@ async function saveSettings(quiet = false) {
     }
 
     // Determine active server from toggle buttons
-    let activeServer = 'plex';
-    if (document.getElementById('jellyfin-toggle').classList.contains('active')) {
-        activeServer = 'jellyfin';
-    } else if (document.getElementById('navidrome-toggle').classList.contains('active')) {
-        activeServer = 'navidrome';
-    } else if (document.getElementById('soulsync-toggle')?.classList.contains('active')) {
-        activeServer = 'soulsync';
-    }
+    let activeServer = activeServerFromToggles();
     // ISOLATION: this page is reused on the video side. Connection details (Plex/
     // Jellyfin creds) ARE shared and save fine — but the video side must NEVER
     // change the MUSIC active server. So when saving from the video side, keep
@@ -6294,6 +6560,13 @@ async function saveSettings(quiet = false) {
             embed_tags: document.getElementById('embed-hifi').checked,
             tags: _collectServiceTags('hifi')
         },
+        // read only when the inputs exist: a missing element must leave the
+        // stored setting alone rather than save over it
+        beatport: document.getElementById('embed-beatport') ? {
+            embed_tags: document.getElementById('embed-beatport').checked,
+            search_all_tracks: _cfgBool('beatport-search-all'),
+            tags: _collectServiceTags('beatport')
+        } : undefined,
         deezer_download: {
             arl: document.getElementById('deezer-download-arl').value || '',
         },
@@ -6390,6 +6663,13 @@ async function saveSettings(quiet = false) {
                 sample_path: document.getElementById('template-sample-path').value
             }
         },
+        mcp: {
+            enabled: _cfgBool('mcp-enabled'),
+        },
+        lidarr_compat: {
+            enabled: _cfgBool('lidarr-compat-enabled'),
+            profile_id: _cfgInt('lidarr-compat-profile', _lidarrCompatProfileId),
+        },
         wishlist: {
             allow_duplicate_tracks: document.getElementById('allow-duplicate-tracks').checked,
             ignore_ttl_days: Math.max(1, Math.min(365,
@@ -6427,7 +6707,8 @@ async function saveSettings(quiet = false) {
             podcasts_path: _cfgStr('podcasts-path', { fallback: './podcasts' }),
             audiobooks_path: _cfgStr('audiobooks-path', { fallback: './audiobooks' }),
             reorganize_preserve_casing: _cfgBool('reorganize-preserve-casing'),
-            write_artist_nfo: _cfgBool('write-artist-nfo')
+            write_artist_nfo: _cfgBool('write-artist-nfo'),
+            redownload_externally_deleted: _cfgBool('redownload-externally-deleted')
         },
         podcasts: {
             download_path: _cfgStr('podcasts-path', { fallback: './podcasts' }),
@@ -6454,6 +6735,7 @@ async function saveSettings(quiet = false) {
             staging_days: Math.min(90, Math.max(1,
                 _cfgInt('audiobook-staging-days', 7))),
             renumber_chapters: _cfgBool('audiobook-renumber-chapters'),
+            merge_m4b: _cfgBool('audiobook-merge-m4b'),
             remove_owned_from_wishlist: _cfgBool('audiobook-remove-owned-from-wishlist'),
             embed_metadata: _cfgBool('audiobook-embed-metadata'),
             embed_artwork: _cfgBool('audiobook-embed-artwork'),
@@ -6467,6 +6749,25 @@ async function saveSettings(quiet = false) {
                     const rest = ['m4b', 'm4a', 'mp3', 'opus', 'ogg', 'flac']
                         .filter(f => f !== first);
                     return [first, ...rest];
+                })(),
+                // Every format on is stored as [] ("no restriction"), so a format
+                // added later is not refused by a list that predates it.
+                // Undefined when the toggles are not on the page, like _cfgBool,
+                // so a missing panel cannot wipe a stored restriction.
+                allowed_formats: (function () {
+                    const group = document.getElementById('audiobook-allowed-formats');
+                    if (!group) return undefined;
+                    const boxes = [...group.querySelectorAll('input')];
+                    const on = boxes.filter(box => box.checked).map(box => box.value);
+                    return on.length === boxes.length ? [] : on;
+                })(),
+                // Exactly one switch on picks that layout; both on, or both off,
+                // means either. Undefined when the switches are not on the page.
+                file_layout: (function () {
+                    const group = document.getElementById('audiobook-file-layout');
+                    if (!group) return undefined;
+                    const on = [...group.querySelectorAll('input')].filter(box => box.checked);
+                    return on.length === 1 ? on[0].value : 'any';
                 })(),
                 min_bitrate_kbps: Math.max(0,
                     _cfgInt('audiobook-min-bitrate', 0)),
@@ -6516,6 +6817,7 @@ async function saveSettings(quiet = false) {
         },
         m3u_export: {
             enabled: document.getElementById('m3u-export-enabled').checked,
+            relative_paths: _cfgBool('m3u-relative-paths'),
             entry_base_path: document.getElementById('m3u-entry-base-path').value || '',
             rewrite_from: document.getElementById('m3u-rewrite-from').value || '',
             rewrite_to: document.getElementById('m3u-rewrite-to').value || '',
@@ -6550,6 +6852,24 @@ async function saveSettings(quiet = false) {
             trust_reverse_proxy: _cfgBool('security-trust-proxy'),
             auth_proxy_header: _cfgStr('security-auth-proxy-header', { trim: true }),
             require_login: _cfgBool('security-require-login'),
+            plex_signin: _cfgBool('security-plex-signin'),
+            plex_signin_auto_create: _cfgBool('security-plex-signin-auto-create'),
+            plex_signin_default_can_download: _cfgBool('security-plex-signin-can-download'),
+            oidc_signin: _cfgBool('security-oidc-signin'),
+            oidc_issuer: _cfgStr('security-oidc-issuer', { trim: true }),
+            oidc_client_id: _cfgStr('security-oidc-client-id', { trim: true }),
+            oidc_client_secret: _cfgStr('security-oidc-client-secret'),
+            oidc_button_label: _cfgStr('security-oidc-button-label', { trim: true }),
+            oidc_icon_url: _cfgStr('security-oidc-icon-url', { trim: true }),
+            oidc_required_group: _cfgStr('security-oidc-required-group', { trim: true }),
+            oidc_groups_claim: _cfgStr('security-oidc-groups-claim', { trim: true }),
+            oidc_scopes: _cfgStr('security-oidc-scopes', { trim: true }),
+            oidc_redirect_uri: _cfgStr('security-oidc-redirect-uri', { trim: true }),
+            oidc_signin_auto_create: _cfgBool('security-oidc-signin-auto-create'),
+            oidc_signin_default_can_download: _cfgBool('security-oidc-signin-can-download'),
+            signup_sides: _cfgStr('security-signup-sides', { fallback: 'music' }),
+            signup_request_limit: _cfgInt('security-signup-request-limit', 0),
+            signup_request_limit_days: _cfgInt('security-signup-request-limit-days', 7),
         }
     };
 
@@ -6684,6 +7004,11 @@ async function authorizeLastfmScrobbling() {
 
 async function testConnection(service) {
     try {
+        if (typeof settingsAutoSaveTimer !== 'undefined' && settingsAutoSaveTimer) {
+            clearTimeout(settingsAutoSaveTimer);
+            settingsAutoSaveTimer = null;
+            if (typeof saveSettings === 'function') await saveSettings(true);
+        }
         showLoadingOverlay(`Testing ${service} connection...`);
 
         const response = await fetch(API.testConnection, {
@@ -6695,8 +7020,10 @@ async function testConnection(service) {
         const result = await response.json();
 
         if (result.success) {
-            // Use backend's message which contains dynamic source name
-            showToast(result.message || `${service} connection successful`, 'success');
+            // Use backend's message which contains dynamic source name. a pass
+            // can still carry a warning (leading \u26a0), which shouldn't read as green
+            const warned = String(result.message || '').trim().startsWith('\u26a0');
+            showToast(result.message || `${service} connection successful`, warned ? 'warning' : 'success');
 
             // Load music libraries after successful connection
             if (service === 'plex') {
@@ -6712,6 +7039,40 @@ async function testConnection(service) {
     } catch (error) {
         console.error(`Error testing ${service} connection:`, error);
         showToast(`Failed to test ${service} connection`, 'error', 'gs-connecting');
+    } finally {
+        hideLoadingOverlay();
+    }
+}
+
+// the deezer card holds two logins: the oauth app (favorites, playlists) and an
+// ARL (playlists + downloads). testConnection('deezer') covers the public api and
+// the oauth token; the ARL has its own check, so run both and say what each found.
+async function testDeezerConnection() {
+    let arl = document.getElementById('deezer-connection-arl')?.value || '';
+    if (!arl.trim()) return testConnection('deezer');
+    // an untouched field holds the redaction mask; empty means "test the saved one" (#870)
+    if (arl === REDACTED_SECRET_SENTINEL) arl = '';
+    try {
+        if (typeof settingsAutoSaveTimer !== 'undefined' && settingsAutoSaveTimer) {
+            clearTimeout(settingsAutoSaveTimer);
+            settingsAutoSaveTimer = null;
+            if (typeof saveSettings === 'function') await saveSettings(true);
+        }
+        showLoadingOverlay('Testing Deezer connection...');
+        const post = (url, body) => fetch(url, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+        }).then(r => r.json()).catch(() => ({ success: false, error: 'request failed' }));
+        const [api, arlRes] = await Promise.all([
+            post(API.testConnection, { service: 'deezer' }),
+            post('/api/deezer-download/test', { arl }),
+        ]);
+        const apiMsg = api.success ? (api.message || 'Deezer reachable') : `Deezer failed: ${api.error}`;
+        const arlMsg = arlRes.success
+            ? `ARL: ${arlRes.user || 'Unknown'} (${arlRes.tier || 'Free'})`
+            : `ARL failed: ${arlRes.error || 'rejected'}`;
+        const ok = api.success && arlRes.success;
+        const warned = String(api.message || '').trim().startsWith('\u26a0');
+        showToast(`${apiMsg} · ${arlMsg}`, !ok ? 'error' : (warned ? 'warning' : 'success'), ok ? undefined : 'gs-connecting');
     } finally {
         hideLoadingOverlay();
     }
@@ -6737,6 +7098,29 @@ async function clearQuarantine() {
 }
 
 // ======================== API Key Management ========================
+
+// the saved profile, so a save before the list loads keeps it
+let _lidarrCompatProfileId = 1;
+
+async function loadLidarrCompatProfiles(selectedId) {
+    _lidarrCompatProfileId = parseInt(selectedId, 10) || 1;
+    const select = document.getElementById('lidarr-compat-profile');
+    if (!select) return;
+    try {
+        const response = await fetch('/api/profiles');
+        const data = await response.json();
+        const profiles = data.profiles || [];
+        if (!profiles.length) return;
+        select.innerHTML = profiles.map(p => {
+            const note = p.can_download === false ? ' (needs approval)' : '';
+            return `<option value="${escapeHtml(String(p.id))}">${escapeHtml(p.name || 'Profile ' + p.id)}${note}</option>`;
+        }).join('');
+        select.value = String(_lidarrCompatProfileId);
+        if (select.value !== String(_lidarrCompatProfileId)) select.value = '1';
+    } catch (e) {
+        console.debug('lidarr profile list failed', e);
+    }
+}
 
 async function loadApiKeys() {
     const container = document.getElementById('api-keys-list');
@@ -6767,7 +7151,9 @@ function renderApiKeys(keys) {
     container.innerHTML = keys.map(k => `
         <div style="display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; margin-bottom: 4px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); border-radius: 6px;">
             <div style="flex: 1; min-width: 0;">
-                <div style="font-size: 13px; color: #e0e0e0; font-weight: 500;">${escapeHtml(k.label || 'Unnamed')}</div>
+                <div style="font-size: 13px; color: #e0e0e0; font-weight: 500;">${escapeHtml(k.label || 'Unnamed')}
+                    <span style="margin-left: 6px; padding: 1px 6px; border-radius: 4px; font-size: 10px; font-weight: 600; ${k.scope === 'read' ? 'background: rgba(100,255,218,0.12); color: #64ffda;' : 'background: rgba(255,171,64,0.12); color: #ffab40;'}">${k.scope === 'read' ? 'Read-only' : 'Admin'}</span>
+                </div>
                 <div style="font-size: 11px; color: #666; margin-top: 2px;">
                     <code>${escapeHtml(k.key_prefix || 'sk_...')}...</code>
                     &middot; Created ${k.created_at ? new Date(k.created_at).toLocaleDateString() : 'unknown'}
@@ -6798,12 +7184,14 @@ function _initApiKeyClickHandler() {
 async function generateApiKey() {
     const labelInput = document.getElementById('api-key-label');
     const label = labelInput ? labelInput.value.trim() : '';
+    const scopeInput = document.getElementById('api-key-scope');
+    const scope = scopeInput && scopeInput.value === 'admin' ? 'admin' : 'read';
 
     try {
         const response = await fetch('/api/v1/api-keys-internal/generate', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ label: label || 'Default' })
+            body: JSON.stringify({ label: label || 'Default', scope })
         });
         const data = await response.json();
 
@@ -8624,7 +9012,16 @@ async function loadImageCacheStatus() {
         if (!data.success) return;
         const entries = document.getElementById('imgcache-entries');
         const size = document.getElementById('imgcache-size');
-        if (entries) entries.textContent = (data.entries || 0).toLocaleString();
+        if (entries) {
+            // A "pending" row is a registered URL nothing ever loaded. When it
+            // dominates the count, the URLs being handed out are changing
+            // between renders (a media-server auth salt used to rotate on every
+            // call), and the entry count alone hides that completely.
+            const pending = data.pending || 0;
+            entries.textContent = pending
+                ? `${(data.entries || 0).toLocaleString()} (${pending.toLocaleString()} pending)`
+                : (data.entries || 0).toLocaleString();
+        }
         if (size) {
             size.textContent = data.max_bytes
                 ? `${_imgCacheBytes(data.bytes)} of ${_imgCacheBytes(data.max_bytes)}`
@@ -8690,6 +9087,418 @@ async function runImageCacheClear() {
         _imgCacheStatus('Could not clear the cache: ' + e.message, 'error');
     } finally {
         if (btn) { btn.disabled = false; btn.textContent = 'Clear cache'; }
+    }
+}
+
+// == SIDEBAR WEATHER (Advanced tab)               ==
+// Opt-in weather line / forecast popover / particle scene in the sidebar.
+// No API keys: the server geocodes the location once and caches Open-Meteo
+// snapshots for 30 minutes.
+
+async function _swApi(method, path, body) {
+    const resp = await fetch('/api/weather' + path, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    return resp.json();
+}
+
+function _swStatus(text) {
+    const el = document.getElementById('sw-status');
+    if (el) el.textContent = text;
+}
+
+function _swRebootSidebar() {
+    // the shell bundle exports bootSidebarWeather on window; re-run it so the
+    // sidebar line/popover/scene pick up the change without a page reload
+    if (typeof window.bootSidebarWeather === 'function') {
+        try {
+            // bootSidebarWeather is async: a .catch keeps a rejected promise
+            // from surfacing as an unhandled rejection
+            Promise.resolve(window.bootSidebarWeather()).catch(function (e) {
+                console.warn('sidebar weather re-boot failed', e);
+            });
+        } catch (e) {
+            console.warn('sidebar weather re-boot failed', e);
+        }
+    } else {
+        console.warn('sidebar weather re-boot skipped: bootSidebarWeather is not on window');
+    }
+}
+
+async function loadSidebarWeatherSettings() {
+    try {
+        const data = await _swApi('GET', '');
+        // GET /api/weather always answers success:true. A missing snapshot just
+        // means no forecast is cached yet — the sidebar stays empty until then.
+        if (!data || data.success !== true) {
+            _swStatus('Could not load weather settings');
+            return;
+        }
+        const loc = document.getElementById('sw-location');
+        if (loc && document.activeElement !== loc) loc.value = data.location ? data.location.query || '' : '';
+        const en = document.getElementById('sw-enabled');
+        if (en) en.checked = data.enabled !== false;
+        const c = document.getElementById('sw-celsius');
+        if (c) c.checked = data.units === 'celsius';
+        if (data.location && data.snapshot) {
+            const cur = data.snapshot.current;
+            const t = cur && typeof cur.temp === 'number' ? Math.round(cur.temp) : null;
+            const unit = data.units === 'celsius' ? '°C' : '°F';
+            _swStatus(t === null
+                ? `${data.location.name} — waiting for first forecast`
+                : `${data.location.name} — ${t}${unit}, updated ${data.snapshot.fetched_at || 'recently'}`);
+        } else if (data.location) {
+            // enabled=false also yields a null snapshot — say so instead of
+            // implying a fetch failure
+            _swStatus(data.enabled === false
+                ? `${data.location.name} — weather display off`
+                : `${data.location.name} — forecast unavailable right now`);
+        } else {
+            _swStatus('Off — set a location to turn it on');
+        }
+    } catch (e) {
+        console.error('sidebar weather settings failed', e);
+        _swStatus('Could not load weather settings');
+    }
+}
+
+async function saveSidebarWeatherLocation() {
+    const input = document.getElementById('sw-location');
+    const location = input ? input.value.trim() : '';
+    if (!location) {
+        if (typeof showToast === 'function') showToast('Enter a ZIP or city first', 'error');
+        return;
+    }
+    try {
+        const data = await _swApi('PUT', '/location', { location });
+        if (data.success) {
+            if (typeof showToast === 'function') showToast(`Weather location set to ${data.location.name}`, 'success');
+            loadSidebarWeatherSettings();
+            _swRebootSidebar();
+        } else if (typeof showToast === 'function') {
+            showToast(data.error || 'Could not resolve that location', 'error');
+        }
+    } catch (e) {
+        if (typeof showToast === 'function') showToast('Could not save location: ' + e.message, 'error');
+    }
+}
+
+async function clearSidebarWeatherLocation() {
+    try {
+        const data = await _swApi('PUT', '/location', { location: '' });
+        if (data.success) {
+            if (typeof showToast === 'function') showToast('Sidebar weather turned off', 'success');
+            const input = document.getElementById('sw-location');
+            if (input) input.value = '';
+            loadSidebarWeatherSettings();
+            _swRebootSidebar();
+        } else if (typeof showToast === 'function') {
+            showToast(data.error || 'Could not clear the location', 'error');
+        }
+    } catch (e) {
+        if (typeof showToast === 'function') showToast('Could not clear location: ' + e.message, 'error');
+    }
+}
+
+async function toggleSidebarWeatherEnabled() {
+    const el = document.getElementById('sw-enabled');
+    const enabled = el ? el.checked : true;
+    try {
+        const data = await _swApi('PUT', '/display', { enabled });
+        if (data.success) {
+            if (typeof showToast === 'function') showToast(enabled ? 'Sidebar weather on' : 'Sidebar weather off', 'success');
+            _swRebootSidebar();
+        } else if (typeof showToast === 'function') {
+            showToast(data.error || 'Could not update the setting', 'error');
+        }
+    } catch (e) {
+        if (typeof showToast === 'function') showToast('Could not update the setting: ' + e.message, 'error');
+    }
+}
+
+async function saveSidebarWeatherUnits() {
+    const el = document.getElementById('sw-celsius');
+    const use_celsius = el ? el.checked : false;
+    try {
+        const data = await _swApi('PUT', '/units', { use_celsius });
+        if (data.success) {
+            if (typeof showToast === 'function') showToast(`Using °${use_celsius ? 'C' : 'F'}`, 'success');
+            loadSidebarWeatherSettings();
+            _swRebootSidebar();
+        } else if (typeof showToast === 'function') {
+            showToast(data.error || 'Could not update units', 'error');
+        }
+    } catch (e) {
+        if (typeof showToast === 'function') showToast('Could not update units: ' + e.message, 'error');
+    }
+}
+
+// == METASYNC (Advanced tab)               ==
+// Connection to the local MetaSync node: pairing (or a pasted local API
+// key), the pool key SoulSync holds and hands over, live status, and
+// disconnect. All calls go to SoulSync's own /api/metasync endpoints — the
+// server talks to the node, so the browser never has to reach it. Stored
+// secrets are never sent back here: the key fields only ever carry what
+// the user just typed, and an empty field on save means "unchanged".
+
+async function _msApi(method, path, body) {
+    const resp = await fetch('/api/metasync' + path, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    return resp.json();
+}
+
+function _msStatus(text) {
+    const el = document.getElementById('metasync-status');
+    if (el) el.textContent = text;
+}
+
+function _msDetail(html) {
+    const el = document.getElementById('metasync-status-detail');
+    if (el) el.innerHTML = html;
+}
+
+function _msEscape(text) {
+    const div = document.createElement('div');
+    div.textContent = text == null ? '' : String(text);
+    return div.innerHTML;
+}
+
+let _msAutoDetectTried = false;
+
+// Ask SoulSync to probe the usual places for the MetaSync node. On a find,
+// fill the URL field and return the URL; on no find, return '' and stay
+// quiet — the manual field remains the fallback either way.
+async function metasyncDetect() {
+    try {
+        const data = await _msApi('POST', '/detect');
+        if (data && data.success && data.found && data.node_url) {
+            const field = document.getElementById('metasync-node-url');
+            if (field) field.value = data.node_url;
+            return data.node_url;
+        }
+    } catch (e) {
+        console.error('metasync detect failed', e);
+    }
+    return '';
+}
+
+// Auto-detect runs once per page load, and only while there is nothing to
+// lose: no connection stored yet and no URL typed or saved. A find fills
+// the field and says so; finding nothing changes nothing on screen.
+async function _msMaybeAutoDetect(view) {
+    if (_msAutoDetectTried || view.local_key_set) return;
+    const field = document.getElementById('metasync-node-url');
+    if (!field || field.value.trim()) return;
+    _msAutoDetectTried = true;
+    const found = await metasyncDetect();
+    if (found) _msStatus('Found MetaSync on this machine at ' + found + ' — click Connect to pair with it.');
+}
+
+async function loadMetaSyncSettings() {
+    try {
+        const data = await _msApi('GET', '');
+        if (!data || data.success !== true) {
+            _msStatus('Could not load MetaSync settings');
+            return;
+        }
+        const nodeUrl = document.getElementById('metasync-node-url');
+        if (nodeUrl && document.activeElement !== nodeUrl) nodeUrl.value = data.node_url || '';
+        const poolUrl = document.getElementById('metasync-pool-url');
+        if (poolUrl && document.activeElement !== poolUrl) poolUrl.value = data.pool_url || '';
+        const poolKey = document.getElementById('metasync-pool-key');
+        if (poolKey) {
+            poolKey.placeholder = data.pool_key_set
+                ? 'Saved — type a new key only to replace it'
+                : 'Your pool account key';
+        }
+        const state = document.getElementById('metasync-connect-state');
+        if (state) {
+            state.textContent = data.local_key_set
+                ? 'Connected' + (data.node_fingerprint ? ' — MetaSync ID ' + data.node_fingerprint : '')
+                : 'Not connected';
+        }
+        await refreshMetaSyncStatus();
+        await _msMaybeAutoDetect(data);
+    } catch (e) {
+        console.error('metasync settings load failed', e);
+        _msStatus('Could not load MetaSync settings');
+    }
+}
+
+async function saveMetaSyncSettings() {
+    const body = {
+        node_url: document.getElementById('metasync-node-url')?.value.trim() || '',
+        pool_url: document.getElementById('metasync-pool-url')?.value.trim() || '',
+    };
+    const poolKey = document.getElementById('metasync-pool-key')?.value.trim();
+    if (poolKey) body.pool_key = poolKey;
+    const localKey = document.getElementById('metasync-local-key')?.value.trim();
+    if (localKey) body.local_api_key = localKey;
+    try {
+        const data = await _msApi('PUT', '/settings', body);
+        if (data.success) {
+            if (typeof showToast === 'function') showToast('MetaSync settings saved', 'success');
+            const pk = document.getElementById('metasync-pool-key');
+            if (pk) pk.value = '';
+            const lk = document.getElementById('metasync-local-key');
+            if (lk) lk.value = '';
+            loadMetaSyncSettings();
+        } else if (typeof showToast === 'function') {
+            showToast(data.error || 'Could not save MetaSync settings', 'error');
+        }
+    } catch (e) {
+        if (typeof showToast === 'function') showToast('Could not save MetaSync settings: ' + e.message, 'error');
+    }
+}
+
+async function metasyncPairRequest() {
+    // persist the node URL with the request so claim/handoff use the same one
+    let nodeUrl = document.getElementById('metasync-node-url')?.value.trim() || '';
+    if (!nodeUrl) {
+        // Nothing typed — try to find the node before asking the user for it.
+        nodeUrl = await metasyncDetect();
+    }
+    if (!nodeUrl) {
+        if (typeof showToast === 'function') showToast('Enter the MetaSync URL first', 'error');
+        return;
+    }
+    try {
+        const data = await _msApi('POST', '/pair/request', { node_url: nodeUrl });
+        if (!data.success) {
+            if (typeof showToast === 'function') showToast(data.error || 'Pairing request failed', 'error');
+            return;
+        }
+        const box = document.getElementById('metasync-pair-box');
+        if (box) box.style.display = '';
+        const code = document.getElementById('metasync-pair-code');
+        if (code) code.textContent = data.pairing_code || '';
+        const fp = document.getElementById('metasync-pair-fingerprint');
+        if (fp) fp.textContent = data.node_fingerprint || '';
+        if (typeof showToast === 'function') showToast('Approve the pairing in the MetaSync dashboard', 'success');
+    } catch (e) {
+        if (typeof showToast === 'function') showToast('Pairing request failed: ' + e.message, 'error');
+    }
+}
+
+async function metasyncPairClaim() {
+    try {
+        const data = await _msApi('POST', '/pair/claim');
+        if (data.success) {
+            if (typeof showToast === 'function') showToast('MetaSync connected', 'success');
+            const box = document.getElementById('metasync-pair-box');
+            if (box) box.style.display = 'none';
+            loadMetaSyncSettings();
+        } else if (typeof showToast === 'function') {
+            showToast(data.error || 'Could not finish connecting', 'error');
+        }
+    } catch (e) {
+        if (typeof showToast === 'function') showToast('Could not finish connecting: ' + e.message, 'error');
+    }
+}
+
+async function metasyncHandoff() {
+    // unsaved field values ride along; the server persists what it used
+    const body = {
+        pool_url: document.getElementById('metasync-pool-url')?.value.trim() || '',
+    };
+    const poolKey = document.getElementById('metasync-pool-key')?.value.trim();
+    if (poolKey) body.pool_key = poolKey;
+    try {
+        const data = await _msApi('POST', '/handoff', body);
+        if (!data.success) {
+            if (typeof showToast === 'function') showToast(data.error || 'Handoff failed', 'error');
+            return;
+        }
+        if (data.exchange_status === 'bound') {
+            if (typeof showToast === 'function') showToast('Pool key handed over — MetaSync is bound to the pool', 'success');
+        } else if (data.exchange_status === 'binding_pending') {
+            if (typeof showToast === 'function') showToast('Pool key handed over — waiting for approval in the portal', 'warning');
+        } else if (data.exchange_status === 'error') {
+            if (typeof showToast === 'function') showToast('Pool key handed over, but the pool exchange failed: ' + (data.exchange_error || 'unknown error'), 'error');
+        } else {
+            if (typeof showToast === 'function') showToast('Pool key handed over to MetaSync', 'success');
+        }
+        loadMetaSyncSettings();
+    } catch (e) {
+        if (typeof showToast === 'function') showToast('Handoff failed: ' + e.message, 'error');
+    }
+}
+
+// The node's binding words, in plain language for the status readout.
+const _MS_BINDING_TEXT = {
+    bound: 'Bound to the pool',
+    pending_approval: 'Waiting for approval in the portal',
+    auth_failed: 'Pool authentication failed',
+    unbound: 'Not bound yet',
+    not_checked: 'Not checked yet',
+    not_connected: 'No pool key on MetaSync',
+    not_applicable: 'Direct key (no binding)',
+};
+
+async function refreshMetaSyncStatus() {
+    try {
+        const data = await _msApi('GET', '/status');
+        if (!data || data.success !== true) {
+            _msStatus((data && data.error) || 'MetaSync status unavailable');
+            _msDetail('');
+            return;
+        }
+        const s = data.status || {};
+        _msStatus('Step 1: connected — MetaSync ' + (s.version || '') +
+            (s.soulsync_connected ? ' is reading this SoulSync' : ' is not reading this SoulSync yet'));
+        const lines = [];
+        if (s.node_fingerprint) lines.push('MetaSync ID: ' + _msEscape(s.node_fingerprint) +
+            ' (the same ID MetaSync shows in its dashboard)');
+        const pools = Array.isArray(s.pools) ? s.pools : [];
+        if (!pools.length) {
+            lines.push('Step 2: no pool joined yet — send your pool key above to join one.');
+        }
+        pools.forEach(p => {
+            const binding = _MS_BINDING_TEXT[p.binding_status] || p.binding_status || 'Unknown';
+            let line = 'Pool — ' + _msEscape(p.name || p.id || 'Pool') + ' (' + _msEscape(p.url || '') + '): ' +
+                _msEscape(binding);
+            if (p.last_exchange_error) line += ' — last error: ' + _msEscape(p.last_exchange_error);
+            lines.push(line);
+        });
+        if (s.pairing_status === 'pending') lines.push('A pairing request is waiting for approval in the MetaSync dashboard.');
+        _msDetail(lines.join('<br>'));
+    } catch (e) {
+        _msStatus('MetaSync status unavailable');
+        _msDetail('');
+    }
+}
+
+async function metasyncDisconnect() {
+    const ok = await showConfirmDialog({
+        title: 'Disconnect MetaSync?',
+        message: 'The pool key on MetaSync is cleared and the SoulSync key it holds is revoked. ' +
+            'Your pool key stays saved here.',
+        confirmText: 'Disconnect',
+        cancelText: 'Cancel',
+        destructive: true
+    });
+    if (!ok) return;
+    try {
+        const data = await _msApi('POST', '/disconnect');
+        if (data.success) {
+            if (typeof showToast === 'function') {
+                showToast(data.node_notified
+                    ? 'MetaSync disconnected'
+                    : 'Disconnected here — MetaSync could not be reached, so clear its pool key from its dashboard too', 'success');
+            }
+            const box = document.getElementById('metasync-pair-box');
+            if (box) box.style.display = 'none';
+            loadMetaSyncSettings();
+        } else if (typeof showToast === 'function') {
+            showToast(data.error || 'Disconnect failed', 'error');
+        }
+    } catch (e) {
+        if (typeof showToast === 'function') showToast('Disconnect failed: ' + e.message, 'error');
     }
 }
 

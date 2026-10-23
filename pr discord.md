@@ -1,13 +1,13 @@
-**SoulSync 3.5.1 is out** :musical_note:
+**SoulSync 3.6.0 is out** :musical_note:
 
-Download Discography now has a Wishlist + Watchlist button: grab the releases you picked and start watching the artist in one go, with release types and filters set right in the modal. A new edition preference stops the watchlist from grabbing both the standard and deluxe of the same album.
+You can now sign in with any OpenID Connect provider, like Pocket ID, Authentik, Authelia or Keycloak. Members link their own accounts, an optional required group keeps everyone else out, and new accounts start with your new sign-up defaults. Turn it on in Settings > Security (thanks @PapaBearDoes).
 
-Non-admin profiles can request music videos and single episodes, approved from the same requests page as music. The dashboard got a visual refresh plus a weekly listening digest built from your real plays.
+Anime is now picked by library instead of guessed from a genre tag, so shows like Star Wars: Visions stop landing in the anime folder. Mark any TV library as anime, scan more than one TV library, and set the type by hand for shows you don't own yet (thanks @PapaBearDoes).
 
-Playlist sync: wishlisted tracks download as a playlist-named batch so the library scan runs after them, new mirrors get their server playlist on the first sync, completion stops claiming 100% when tracks still need identifying, and ListenBrainz weekly playlists stop getting stuck on an old week (thanks @ifedan-ed).
+Prowlarr outages are handled better. Search names the indexers that failed next to the results (thanks @glebosotov), and a search that didn't complete no longer counts as a failed attempt on the wishlist or shows "No releases found" for audiobooks (thanks @SimpleSimonLA).
 
-Tagging: MusicBrainz stops matching the wrong same-named band, wishlist downloads keep featured artists, sort tags follow the primary source, "hip hop" and "hip-hop" merge, full-depth re-tag actually writes, and versioned recordings can be told apart. New opt-in artist.nfo for Jellyfin/Kodi/Emby, original date as DATE, and $label in album paths.
+Audiobook fixes: a wrong book far longer than the one you wanted fails and moves to the next release instead of sitting in staging, and artists set to treat as audiobook stop showing every release as missing. Batch complete notifications also name the track for wishlist singles (thanks @SimpleSimonLA).
 
-Fixes: singles no longer show owned because the album has the same song, single-file audiobook torrents import instead of stalling (thanks SeadogsBooty), audiobook search finds "Series 03" volumes (thanks @SimpleSimonLA), Soulseek cleanup only touches its own transfers (thanks @splitsec2), and repair and tools fixes from @mandos21.
+Under the hood: more of the CSS token system filled in (thanks @Thundernerd).
 
 Full notes on GitHub.

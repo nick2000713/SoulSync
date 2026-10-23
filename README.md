@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Nezreka/SoulSync/releases"><img alt="Version" src="https://img.shields.io/badge/version-3.4.7-8b5cf6?style=flat-square"></a>
+  <a href="https://github.com/Nezreka/SoulSync/releases"><img alt="Version" src="https://img.shields.io/github/v/release/Nezreka/SoulSync?style=flat-square&label=version&color=8b5cf6"></a>
   <a href="https://hub.docker.com/r/boulderbadgedad/soulsync"><img alt="Docker" src="https://img.shields.io/badge/docker-boulderbadgedad%2Fsoulsync-2496ED?style=flat-square&logo=docker&logoColor=white"></a>
   <a href="https://discord.gg/wGvKqVQwmy"><img alt="Discord" src="https://img.shields.io/badge/discord-join-5865F2?style=flat-square&logo=discord&logoColor=white"></a>
   <a href="./license.txt"><img alt="License" src="https://img.shields.io/badge/license-MIT-22c55e?style=flat-square"></a>
@@ -66,7 +66,7 @@ Most self-hosted media setups are a relay race: one app wants things, another se
 | **Download sources** | Soulseek (slskd), Tidal, Qobuz, Deezer, HiFi, YouTube, SoundCloud, Lidarr, Torrent and Usenet (via Prowlarr). One source or a drag-ordered hybrid chain. |
 | **Metadata** | Spotify (with or without an account), Apple Music / iTunes, Deezer, Discogs, MusicBrainz, plus 14 background enrichment workers |
 | **Media servers** | Plex, Jellyfin, Navidrome, or **SoulSync Standalone** (no server needed) |
-| **Playlist sources** | Spotify, Tidal, Qobuz, Deezer, YouTube, YouTube Music, Apple Music links, ListenBrainz, Last.fm, Beatport, SoulSync's own mixes, and CSV / TSV / TXT / M3U files |
+| **Playlist sources** | Spotify, Tidal, Qobuz, Deezer, YouTube, YouTube Music, Apple Music links, ListenBrainz, Last.fm, Beatport, SoulSync's own mixes, CSV / TSV / TXT / M3U files, and NewPipe backups |
 | **Video** | Movies, TV and YouTube channels with TMDB / TVDB, Prowlarr, qBittorrent / Transmission / Deluge / SABnzbd / NZBGet, Plex and Jellyfin |
 | **Automation** | Visual WHEN → DO → THEN builder, 60+ triggers and actions, Discord / Telegram / Pushbullet / webhook notifications |
 | **Runs on** | Docker (amd64 + arm64), Unraid, or plain Python 3.11 |
@@ -92,12 +92,12 @@ The home screen is split in two: your music on the left, the machine on the righ
 
 Bring a playlist in from anywhere, keep a mirror of it, and keep your media server's copy in step on a schedule.
 
-- **Add playlist**: paste any link and SoulSync works out the service, or pick from a connected account, or drop a CSV / TSV / TXT / M3U file and map its columns.
+- **Add playlist**: paste any link and SoulSync works out the service, or pick from a connected account, or drop a CSV / TSV / TXT / M3U file and map its columns, or a NewPipe backup to bring its playlists over.
 - **Mirrored library**: every playlist as a card whose artwork carries its state (a coverage ring, a pulse while syncing, desaturated when something's wrong). Filter by *Needs attention / Working / Discovered / Scheduled*, search, sort, bulk delete.
 - **Discovery**: matches each source track to real metadata with live progress. Fix any match by hand (including by MusicBrainz ID), retry the failures, or let **Wing It** make best-effort guesses that you can review later in the **Wing It Pool**.
 - **Sync modes**: *Replace*, *Reconcile* (edit in place, keep the server playlist's image and description) or *Append*.
 - **Schedules**: per playlist, from hourly to weekly, or on a drag-and-drop **Auto-Sync board** with a live pipeline monitor and run history. A scheduled pipeline does refresh → discover → sync → download missing, unattended.
-- **Server playlists**: a side-by-side **compare editor** for Plex / Jellyfin / Navidrome (matched, missing, extra), swap versions, find & add, reorder to match the source, export M3U.
+- **Server playlists**: a side-by-side **compare editor** for Plex / Jellyfin / Navidrome (matched, missing, extra), swap versions, find & add, unmatch a wrong pairing while keeping the track, reorder to match the source, export M3U.
 - **Export** any playlist to Spotify, Deezer, ListenBrainz or a JSPF file.
 - **Beatport**: Top 100, Hype 100, top 10 lists and releases, and a full genre browser.
 - **Organize by playlist**: optionally download a playlist into its own folder.
@@ -129,12 +129,12 @@ One search box with three modes.
 | **Torrent** | Prowlarr search; qBittorrent, Transmission, Deluge or aria2; seeding goals; archive extraction |
 | **Usenet** | Prowlarr search; SABnzbd or NZBGet; remote path mappings |
 
-**Downloads page.** Live batches with speed and ETA, "download this next", per-track audit trails (lifecycle, embedded tags, lyrics), a **Review** queue for anything that needs a human, and a **Clients** pane that manages slskd, your torrent client and your usenet client from one place.
+**Downloads page.** Live batches with speed and ETA, "download this next", a step-by-step detail sheet on every download (found, downloaded, verified, imported), manual search on failed tracks, play straight from finished ones, per-track audit trails (lifecycle, embedded tags, lyrics), a **Review** queue for anything that needs a human, and a **Clients** pane that manages slskd, your torrent client and your usenet client from one place.
 
 ## Quality, verification & tagging
 
 - **Quality profiles**: named profiles built from a ranked ladder of formats, bit depths, sample rates and bitrates, with a cutoff. Start from *Audiophile*, *Balanced* or *Space Saver*, then assign profiles per playlist, artist or wishlist item. **Upgrade until cutoff** keeps chasing a better copy, and a file is only ever replaced by a measured upgrade.
-- **Verification**: AcoustID fingerprinting, real-audio checks with ffmpeg (catches padded previews), silence, duration and integrity guards, and a **fake-lossless** detector.
+- **Verification**: AcoustID fingerprinting, real-audio checks with ffmpeg (catches padded previews), silence, duration (with an adjustable tolerance) and integrity guards, and a **fake-lossless** detector.
 - **Quarantine & review**: anything that fails is held with its reason and uploader. Approve it, recover it to staging, or delete it. Removed files go to a **recycle bin** with configurable retention.
 - **Tagging**: Picard-style **MusicBrainz release preflight** pins one release per album so every track agrees. Tags are written with mutagen (ID3v2.4, FLAC, Vorbis, MP4), enriched in the order you choose.
 - **Extras**: preferred-source cover art with a minimum size, synced lyrics from LRClib, **ReplayGain 2.0** (track + album), optional lossy copies (MP3 / Opus / AAC), and **atomic album publishing** so half-downloaded albums never appear in your server.
@@ -167,7 +167,7 @@ A personal front page shaped by your library, your listening and your watchlist.
 ## Watchlist & wishlist
 
 - **Watchlist**: follow artists and labels. SoulSync scans for new releases on a schedule, with per-artist rules (albums, EPs, singles, live, remixes, compilations), lookback windows, scan source and auto-download. The **Artist Inspector** shows linked IDs per provider and recent releases, and a **Blocklist** keeps things you never want.
-- **Wishlist**: everything wanted, retried automatically with progressive backoff. Browse it as a **Nebula** (an orb per artist, albums and singles in orbit) or a dense list, find what keeps failing, or pick a source by hand.
+- **Wishlist**: everything wanted, retried automatically with progressive backoff. Browse it as a **Nebula** (an orb per artist, grouped by what's stuck: no match found, or downloaded then rejected) or a dense list. Open an artist to see why each track failed in plain words, retry it, or pick a source by hand.
 - **Requests**: Overseerr-style for music too — profiles without download rights add to their wishlist like anyone else, and the scheduled run only downloads what an admin approved.
 
 ## Import
@@ -239,7 +239,7 @@ A complete video side with its own database, pages and pipeline. Switch sides fr
 **Getting things**
 - **Watchlist → wishlist → download**:
   - Follow shows, people, studios and YouTube channels, with back-catalog policies.
-  - The wishlist retries with backoff, and a diagnostics drawer shows why each release was refused.
+  - The wishlist (Movies, TV and YouTube tabs, the same design as the music one) retries with backoff and groups what's stuck by cause: found but refused by your rules, nothing found, couldn't search, or not posted yet. Open a title to see every release the last search judged and why each was refused.
 - **Requests**: Overseerr-style. Non-admins request, admins approve.
 - **Import lists**: TMDB, IMDb and Plex Watchlist.
 - **Indexers & clients**:
@@ -263,7 +263,7 @@ A complete video side with its own database, pages and pipeline. Switch sides fr
 - **Poster Manager** for TMDB posters, including textless ones.
 - **Maintenance jobs**: broken files, duplicates, naming, quality upgrades, watched cleanup and more. Plus backups and mass rename.
 - **Server Activity**: a Tautulli-style live view of streams, history and stats.
-- **Movie night** in chat: vote on a title and watch together.
+- **Watch Together** in chat: vote on a title and watch together.
 
 **YouTube**
 - Follow channels and playlists as TV shows, with no API key.
@@ -309,7 +309,7 @@ Soulseek rooms and private messages through slskd, in a Discord-style layout.
 - `/np`, `/want`, `/poll` and friends.
 - **Room activities**:
   - A shared YouTube **jukebox** with voting.
-  - **Movie night**, polls and trivia.
+  - **Watch Together**, polls and trivia.
 - **Arcade**: chess, Connect 4, Battleship, Othello and Gomoku, plus a slot machine.
   - Everyone's client computes the same game state from the room messages, so no game server is needed.
   - Room-vs-player voting, and commit-reveal boards so nobody can cheat.
@@ -320,6 +320,9 @@ Soulseek rooms and private messages through slskd, in a Discord-style layout.
 - **REST API** at `/api/v1` covering library, search, wishlist, watchlist, downloads, playlists, discover, settings, profiles and video.
   - Keys are hashed at rest and rate limited. See [Support/API.md](Support/API.md).
 - **Inbound request webhook**: `POST /api/v1/request` with a query and SoulSync searches, matches and downloads it. Good for Discord bots and shortcuts.
+- **MCP server** at `/mcp`, so Claude and other AI apps can search, check your library and download through SoulSync with an API key. A read-only key can look but not change anything.
+- **Lidarr compatible API** at `/lidarr`, so request apps that only speak Lidarr (Singarr, MusicSeerr 1.x) can send their album requests to SoulSync instead.
+- Both are off until you turn them on in **Settings > Advanced > SoulSync API**. See [Support/API.md](Support/API.md#mcp-for-ai-clients).
 
 ## Mobile, PWA & theming
 
@@ -363,7 +366,7 @@ The image runs as a non-root user with `PUID` / `PGID` / `UMASK` support, and bu
 | Channel | Image | What it is |
 |---|---|---|
 | **Stable** | `boulderbadgedad/soulsync:latest` | Promoted from `dev` to `main` when a release is ready. Recommended. |
-| **Pinned** | `boulderbadgedad/soulsync:3.4.7` or `ghcr.io/nezreka/soulsync:3.4.7` | A permanent tag for each stable release |
+| **Pinned** | `boulderbadgedad/soulsync:3.4.9` or `ghcr.io/nezreka/soulsync:3.4.9` | A permanent tag for each stable release |
 | **Dev** | `ghcr.io/nezreka/soulsync:dev` | Rebuilt on every push to `dev`. New features first, occasional rough edges |
 | **Nightly** | `ghcr.io/nezreka/soulsync:nightly` | Built at 04:00 UTC when `dev` changed that day |
 | **Snapshot** | `ghcr.io/nezreka/soulsync:dev-YYYYMMDD-<sha>` | An exact dev build to pin to |
@@ -446,7 +449,7 @@ Behind Docker or a remote host? See [Support/DOCKER-OAUTH-FIX.md](Support/DOCKER
 
 ### 3. Configure SoulSync
 
-Open `http://localhost:8008`. The setup wizard walks you through the basics; everything else lives in **Settings**:
+Open `http://localhost:8008`. Setup finds your media server, slskd, Prowlarr and download clients on its own, signs in to Plex, Tidal and Qobuz, checks every folder and connection for real, and leaves a **Finish setting up** checklist on the dashboard for anything you skip. Everything else lives in **Settings**:
 
 - **Sources / Downloads**: pick a source or build your hybrid chain.
 - **Quality**: pick a preset or build a quality profile.

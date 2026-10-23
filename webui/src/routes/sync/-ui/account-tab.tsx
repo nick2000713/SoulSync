@@ -35,6 +35,7 @@
 import { useCallback, useRef, useState } from 'react';
 
 import type { SourceVerticalConfig } from '../-sync.sources';
+import type { SourceSkipped } from '../-sync.state';
 import type { UrlTabPlaylist } from '../-sync.url-tabs';
 import type { SourceVertical } from '../-sync.use-vertical';
 
@@ -48,6 +49,7 @@ import { asString, deezerMirrorTracks } from '../-sync.url-tabs';
 import { fetchAndHydrateState } from '../-sync.use-vertical';
 import { cardProgressLine } from './card-progress';
 import { playlistArtUrl } from './playlist-art';
+import { PlaylistSearch, noMatchText, playlistNameMatches } from './playlist-search';
 import { SourceCard } from './source-card';
 import { hydrateStatesForLoaded } from './url-import-tab';
 
@@ -104,6 +106,7 @@ function AccountVerticalTab({
   );
   const [loading, setLoading] = useState(false);
   const [errorText, setErrorText] = useState<string | null>(null);
+  const [query, setQuery] = useState('');
   const playlistsRef = useRef(playlists);
   playlistsRef.current = playlists;
   /** Invalidates the background mirror loop when Refresh re-runs. */
@@ -148,6 +151,8 @@ function AccountVerticalTab({
               owner: p.owner as string | undefined,
               image_url: p.image_url as string | undefined,
               description: p.description as string | undefined,
+              // tidal says what it couldn't load; the rest never set it (#1613)
+              source_skipped: p.source_skipped as SourceSkipped | null | undefined,
             },
           ),
         ).catch(() => undefined);
@@ -166,6 +171,7 @@ function AccountVerticalTab({
           const tracks = Array.isArray(fullData.tracks) ? (fullData.tracks as unknown[]) : [];
           if (tracks.length > 0) {
             p.tracks = tracks;
+            if ('source_skipped' in fullData) p.source_skipped = fullData.source_skipped;
             setPlaylistTracks(String(p.id), tracks);
             mirror(p, tracks);
           }
@@ -289,6 +295,7 @@ function AccountVerticalTab({
     <div>
       <div className="playlist-header">
         <h3>{chrome.title}</h3>
+        {playlists && playlists.length > 0 && <PlaylistSearch value={query} onChange={setQuery} />}
         <button
           type="button"
           className={`refresh-button ${chrome.refreshBtnClass}`}
@@ -308,8 +315,11 @@ function AccountVerticalTab({
           </div>
         ) : playlists.length === 0 ? (
           <div className="playlist-placeholder">{`No ${chrome.noun} playlists found.`}</div>
+        ) : !playlists.some((p) => playlistNameMatches([p.name], query)) ? (
+          <div className="playlist-placeholder">{noMatchText(query)}</div>
         ) : (
           playlists.map((p) => {
+            if (!playlistNameMatches([p.name], query)) return null;
             const sourceId = String(p.id);
             const state = vertical.states[sourceId] ?? freshSourceState(config, sourceId);
             return (

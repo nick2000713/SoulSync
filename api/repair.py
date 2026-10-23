@@ -166,14 +166,43 @@ def repair_job_settings(job_id):
 
 @bp.route('/api/repair/jobs/<job_id>/run', methods=['POST'])
 def repair_job_run(job_id):
-    """Trigger immediate run of a specific job"""
+    """Trigger immediate run of a specific job.
+
+    Optional JSON body ``{"artist_id": 1, "artist_name": "..."}`` resolves a
+    Library-v2 artist to an exact file allowlist. Jobs that move/delete files
+    enforce that path scope; metadata-only jobs use the accompanying name.
+    Other jobs ignore the scope and run library-wide."""
     try:
         if _repair_worker() is None:
             return jsonify({'error': 'Repair worker not initialized'}), 400
 
-        _repair_worker().run_job_now(job_id)
-        logger.info("Repair job %s triggered manually via UI", job_id)
-        return jsonify({'success': True, 'job_id': job_id}), 200
+        body = request.get_json(silent=True) or {}
+        artist_name = str(body.get('artist_name') or '').strip()
+        artist_id = body.get('artist_id')
+        scope = None
+        if artist_id is not None:
+            from core.repair_jobs.base import build_artist_file_scope
+            scope = build_artist_file_scope(_repair_worker().db, artist_id, artist_name)
+            artist_name = scope['artist_name']
+        elif artist_name:
+            scope = {'artist_name': artist_name}
+        # E-14: a run started by hand covers the library the caller has
+        # selected. Only where there is more than one to choose between.
+        from core.library_scope import any_own_library_exists, current_library_scope
+        if any_own_library_exists():
+            scope = dict(scope or {})
+            scope['library'] = current_library_scope()
+        _repair_worker().run_job_now(job_id, scope=scope)
+        logger.info("Repair job %s triggered manually via UI%s", job_id,
+                    f" (artist scope: {artist_name})" if artist_name else "")
+        return jsonify({
+            'success': True,
+            'job_id': job_id,
+            'scoped_to': artist_name or None,
+            'scope_files': len(scope.get('file_paths', [])) if scope else None,
+        }), 200
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
     except Exception as e:
         logger.error(f"Error running repair job {job_id}: {e}")
         return jsonify({'error': str(e)}), 500
@@ -303,6 +332,23 @@ def repair_finding_reopen(finding_id):
         return jsonify({'success': True}), 200
     except Exception as e:
         logger.error(f"Error reopening finding {finding_id}: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@bp.route('/api/repair/findings/reopen-all', methods=['POST'])
+def repair_findings_reopen_all():
+    """Bulk reopen dismissed findings, optionally filtered by
+    job_id and/or finding_type. The bulk undo for dismiss. Only
+    dismissed rows are touched; resolved findings are never reopened."""
+    try:
+        if _repair_worker() is None:
+            return jsonify({'success': False, 'error': 'Repair worker not initialized'}), 400
+        data = request.get_json(silent=True) or {}
+        job_id = data.get('job_id')
+        finding_type = data.get('finding_type')
+        count = _repair_worker().reopen_findings_bulk(job_id=job_id, finding_type=finding_type)
+        return jsonify({'success': True, 'reopened': count}), 200
+    except Exception as e:
+        logger.error(f"Error bulk reopening findings: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @bp.route('/api/repair/finding-types', methods=['GET'])

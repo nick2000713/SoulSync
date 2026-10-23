@@ -11,10 +11,13 @@
  * history your stats read (#1293).
  *
  * the admin never gets this, it uses Settings (the sidebar hides the button).
+ * the one exception is the sign-in card: an admin who connects oidc from
+ * Settings comes back here to see how it went.
  *
  * Backend: GET /api/profiles/me/connections, the per-service save/OAuth
  * routes, POST /api/profiles/me/connections/<service>/disconnect, and the
- * media-server routes the old My Settings used.
+ * media-server routes the old My Settings used, and GET/DELETE
+ * /api/profiles/me/oidc for the sign-in card.
  */
 
 import { escapeHtml, toast } from './html';
@@ -88,6 +91,18 @@ interface MaConnections {
   listening?: { scope?: string; sources?: string[] };
 }
 
+interface OidcStatus {
+  enabled?: boolean;
+  label?: string;
+  /** the admin's https logo url, or '' for the plain key icon */
+  icon?: string;
+  connected?: boolean;
+  /** how the connect that just came back went, handed over once */
+  last?: { connected?: boolean; error?: string | null } | null;
+}
+
+export const OIDC_CONNECT_URL = '/api/profiles/me/oidc-connect/start';
+
 interface ImportStatus {
   own_account?: boolean;
   running?: boolean;
@@ -131,13 +146,18 @@ const SERVER_META: Record<ServerModel['type'], { name: string; logo: string }> =
   none: { name: 'Media server', logo: '' },
 };
 
+// init.js fires this when the signed-in profile is known or changes (the same
+// name as SHELL_PROFILE_CONTEXT_CHANGED_EVENT; the shell bundle keeps its own copy)
+const PROFILE_CONTEXT_CHANGED_EVENT = 'ss:webui-profile-context-changed';
+
 const _ma: {
   data: MaConnections | null;
   server: ServerModel | null;
+  oidc: OidcStatus | null;
   imports: Partial<Record<'listenbrainz' | 'lastfm', ImportStatus>>;
   open: string | null;
   poll: ReturnType<typeof setTimeout> | null;
-} = { data: null, server: null, imports: {}, open: null, poll: null };
+} = { data: null, server: null, oidc: null, imports: {}, open: null, poll: null };
 
 function _maProfile(): { id: number; name: string; color: string; avatar: string } {
   try {
@@ -158,7 +178,32 @@ function _maProfile(): { id: number; name: string; color: string; avatar: string
 
 // ── open / close ────────────────────────────────────────────────────────────
 
+/**
+ * Close the mobile nav drawer, if it is open (Oct 13 fold, M-04).
+ *
+ * The My Account button lives INSIDE the sidebar drawer, so the natural
+ * phone flow is drawer-first: drawer open → tap My Account → this modal.
+ * The drawer is z-10001 and this overlay z-10000, so without this the modal
+ * opened UNDER the still-open drawer — and the hamburger that closes the
+ * drawer is hidden while the modal is open, trapping the user. This mirrors
+ * init.js's closeMobileNav teardown exactly (that function is scoped inside
+ * initializeMobileNavigation and is not reachable from here).
+ */
+function _maCloseMobileNav(): void {
+  const sidebar = document.querySelector('.sidebar');
+  const hamburger = document.getElementById('hamburger-btn');
+  const overlay = document.getElementById('mobile-overlay');
+  if (!sidebar?.classList.contains('mobile-open')) return;
+  sidebar.classList.remove('mobile-open');
+  hamburger?.classList.remove('active');
+  hamburger?.setAttribute('aria-expanded', 'false');
+  hamburger?.setAttribute('aria-label', 'Open navigation');
+  overlay?.classList.remove('active');
+  document.body.classList.remove('mobile-nav-open');
+}
+
 export function openMyAccountsModal(): void {
+  _maCloseMobileNav();
   let overlay = document.getElementById('my-accounts-overlay');
   if (!overlay) {
     overlay = document.createElement('div');
@@ -184,13 +229,23 @@ export function openMyAccountsModal(): void {
     modal.focus();
   }
   document.addEventListener('keydown', _maOnKeydown);
+  // opened straight after a page load (back from an oidc connect) this can
+  // beat the shell to knowing who is signed in, so the header redraws when it
+  // finds out instead of staying on "?"
+  window.addEventListener(PROFILE_CONTEXT_CHANGED_EVENT, _maRefreshHeader);
   void _maLoad();
+}
+
+function _maRefreshHeader(): void {
+  const head = document.querySelector('#my-accounts-overlay .ma-head');
+  if (head) head.outerHTML = _maHeader();
 }
 
 export function closeMyAccountsModal(): void {
   const o = document.getElementById('my-accounts-overlay');
   if (o) o.classList.add('hidden');
   document.removeEventListener('keydown', _maOnKeydown);
+  window.removeEventListener(PROFILE_CONTEXT_CHANGED_EVENT, _maRefreshHeader);
   _maStopPoll();
 }
 
@@ -216,13 +271,25 @@ async function _maJson<T>(url: string): Promise<T | null> {
 }
 
 async function _maLoad(): Promise<void> {
-  const [data, server] = await Promise.all([
+  const [data, server, oidc] = await Promise.all([
     _maJson<MaConnections>('/api/profiles/me/connections'),
     _maLoadServer(),
+    _maJson<OidcStatus>('/api/profiles/me/oidc'),
   ]);
   _ma.data = data || { connections: {}, is_admin: false };
   _ma.server = server;
+  _ma.oidc = oidc;
+  _maRefreshHeader();
   _maRender();
+  const last = oidc?.last;
+  if (last) {
+    if (last.connected)
+      toast(
+        `Connected. You can now ${(oidc?.label || 'sign in with OIDC').toLowerCase()}`,
+        'success',
+      );
+    else toast(last.error || 'Connecting failed. Try again.', 'error');
+  }
   await _maLoadImports();
 }
 
@@ -345,7 +412,7 @@ function _maRender(): void {
   const body = document.getElementById('ma-body');
   if (!body || !_ma.data) return;
   if (_ma.data.is_admin) {
-    body.innerHTML = `<div class="ma-empty">Your accounts are the app's own. They're set up in Settings.</div>`;
+    body.innerHTML = `<div class="ma-empty">Your accounts are the app's own. They're set up in Settings.</div>${_maSignInSection()}`;
     return;
   }
   body.innerHTML = `
@@ -358,10 +425,53 @@ function _maRender(): void {
       <h4 class="ma-section-title" id="ma-services-h">Music services</h4>
       <div class="ma-group">${_MA_SERVICES.map(_maServiceRow).join('')}</div>
     </section>
+    ${_maSignInSection()}
     <p class="ma-foot">The app's own accounts are set up by the admin in Settings. Anything you change here only affects you.</p>`;
   for (const s of ['listenbrainz', 'lastfm'] as const) _maPaintImport(s);
   const focus = body.querySelector<HTMLElement>('.ma-row.is-open input, .ma-row.is-open select');
   focus?.focus();
+}
+
+/** sign in with oidc: connect this profile to your account at the provider,
+ * or stop it signing in. only shown when the admin turned oidc sign-in on */
+export function _maSignInSection(): string {
+  const o = _ma.oidc;
+  if (!o?.enabled) return '';
+  const label = escapeHtml(o.label || 'Sign in with OIDC');
+  const sub = o.connected
+    ? `Connected. You can use "${label}" on the sign-in screen.`
+    : `Not connected. Connect your account to use "${label}".`;
+  const trailing = o.connected
+    ? '<button type="button" class="ma-btn ma-btn-danger" data-ma="oidc-disconnect">Disconnect</button>'
+    : '<button type="button" class="ma-btn ma-btn-outline" data-ma="oidc-connect">Connect</button>';
+  return `
+    <section class="ma-section" aria-labelledby="ma-signin-h">
+      <h4 class="ma-section-title" id="ma-signin-h">Sign-in</h4>
+      <div class="ma-group">
+        <div class="ma-row">
+          <div class="ma-row-main">
+            ${_maSignInLogo(o.icon || '')}
+            <div class="ma-row-text">
+              <div class="ma-row-name">${label}</div>
+              <div class="ma-row-sub">${sub}</div>
+            </div>
+            ${trailing}
+          </div>
+        </div>
+      </div>
+    </section>`;
+}
+
+const _KEY = `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="15" r="4"/><path d="M10.8 12.2 20 3M16 7l3 3M14 9l2 2"/></svg>`;
+
+/** the provider's logo when the admin set one, else a plain key. the url is
+ * the admin's, so it is escaped like any other value and only https reaches
+ * here (the server drops anything else) */
+function _maSignInLogo(icon: string): string {
+  if (icon.startsWith('https://')) {
+    return `<span class="ma-logo"><img src="${escapeHtml(icon)}" alt="" onerror="this.style.display='none'"></span>`;
+  }
+  return `<span class="ma-logo ma-logo-key">${_KEY}</span>`;
 }
 
 function _maListeningCard(): string {
@@ -435,7 +545,7 @@ function _maServerLine(s: ServerModel): string {
     const lib = s.plexLibrary ? `, syncing to ${escapeHtml(s.plexLibrary)}` : '';
     return s.plexLinkedUser
       ? `You're ${escapeHtml(s.plexLinkedUser)} on Plex${lib}.`
-      : `Using the app's account${lib}. Pick who you are on Plex.`;
+      : `Using the app's account${lib}. Connect your Plex account to make it yours.`;
   }
   const user = s.jellyUsers?.find((u) => u.id === s.jellyUser)?.name;
   const lib = s.jellyLibraries?.find((l) => l.id === s.jellyLibrary)?.name;
@@ -489,11 +599,22 @@ function _maServerForm(s: ServerModel): string {
   if (s.type === 'plex') {
     const users = s.plexHomeUsers || [];
     const picked = users.find((u) => String(u.id) === s.plexHomeUserId);
+    // connect with plex: proves the account on plex's own page, so it works
+    // for everyone the server is shared with, not just plex home users
+    const connect = `
+      <div class="ma-actions">
+        <button type="button" class="ma-btn ma-btn-primary" data-ma="plex-connect">${
+          s.plexLinkedUser ? 'Connect a different Plex account' : 'Connect with Plex'
+        }</button>
+        ${s.plexLinkedUser ? '<button type="button" class="ma-btn ma-btn-quiet" data-ma="plex-unlink">Use app account</button>' : ''}
+      </div>`;
     const who = users.length
       ? `
+        <div class="ma-divider"></div>
+        <p class="ma-panel-text">Or pick a Plex Home user on this server.</p>
         ${_maField(
           'ma-plex-user',
-          'Who you are on Plex',
+          'Plex Home user',
           `<select class="ma-input" id="ma-plex-user">${_maOptions(
             users.map((u) => ({
               value: String(u.id),
@@ -508,12 +629,12 @@ function _maServerForm(s: ServerModel): string {
           <input class="ma-input" id="ma-plex-pin" type="password" inputmode="numeric" autocomplete="off" placeholder="Used once to link, never saved">
         </div>
         <div class="ma-actions">
-          ${s.plexLinkedUser ? '<button type="button" class="ma-btn ma-btn-quiet" data-ma="plex-unlink">Use app account</button>' : ''}
-          <button type="button" class="ma-btn ma-btn-primary" data-ma="plex-link">Link</button>
+          <button type="button" class="ma-btn ma-btn-quiet" data-ma="plex-link">Link Home user</button>
         </div>`
-      : '<p class="ma-panel-text">No Plex Home users on this server, so playlists go to the app account.</p>';
+      : '';
     return `
-      <p class="ma-panel-text">Pick who you are on Plex and the playlists you sync will belong to you there.</p>
+      <p class="ma-panel-text">Connect your own Plex account. The playlists you sync belong to you there, and what you play on Plex stays in your own listening history.</p>
+      ${connect}
       ${who}
       <div class="ma-divider"></div>
       ${_maField(
@@ -525,7 +646,7 @@ function _maServerForm(s: ServerModel): string {
           "Admin's default",
         )}</select>`,
       )}
-      <div class="ma-actions"><button type="button" class="ma-btn ma-btn-primary" data-ma="plex-lib-save">Save library</button></div>`;
+      <div class="ma-actions"><button type="button" class="ma-btn ma-btn-quiet" data-ma="plex-lib-save">Save library</button></div>`;
   }
   return `
     <p class="ma-panel-text">Choose which Jellyfin user and library your playlists sync to.</p>
@@ -719,6 +840,16 @@ function _maOnClick(e: Event): void {
       break;
     case 'plex-link':
       void _maPlexLink();
+      break;
+    case 'plex-connect':
+      void _maPlexConnect(btn);
+      break;
+    case 'oidc-connect':
+      // a page navigation: the provider sends the browser back here after
+      window.location.assign(OIDC_CONNECT_URL);
+      break;
+    case 'oidc-disconnect':
+      void _maServerCall('/api/profiles/me/oidc', 'DELETE', null, 'Disconnected');
       break;
     case 'plex-unlink':
       void _maServerCall(
@@ -946,4 +1077,98 @@ async function _maPlexLink(): Promise<void> {
     { user_id: userId, pin },
     'Plex user linked, the playlists you sync belong to you there',
   );
+}
+
+const _MA_PLEX_POLL_MS = 1500;
+const _MA_PLEX_GIVE_UP_MS = 4 * 60_000;
+
+async function _maPost(
+  url: string,
+): Promise<{ ok: boolean; body: Record<string, unknown> } | null> {
+  try {
+    const res = await fetch(url, { method: 'POST', headers: { Accept: 'application/json' } });
+    let body: Record<string, unknown> = {};
+    try {
+      body = (await res.json()) as Record<string, unknown>;
+    } catch {
+      // the status says enough
+    }
+    return { ok: res.ok, body };
+  } catch {
+    return null;
+  }
+}
+
+/** the server's error message, or the fallback when it sent none */
+function _maError(body: Record<string, unknown> | undefined, fallback: string): string {
+  return typeof body?.error === 'string' && body.error ? body.error : fallback;
+}
+
+/**
+ * connect with plex: plex's own page in a popup (opened straight from the
+ * click so a blocker lets it through), then poll until plex says yes
+ */
+export async function _maPlexConnect(
+  button: HTMLElement | null,
+  openPopup: () => Window | null = () =>
+    window.open('', 'soulsync-plex-connect', 'width=520,height=720'),
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+): Promise<boolean> {
+  const btn = button instanceof HTMLButtonElement ? button : null;
+  const label = btn?.textContent || '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Waiting for Plex...';
+  }
+  const popup = openPopup();
+  try {
+    const start = await _maPost('/api/profiles/me/plex-connect/start');
+    const url = start?.body.url;
+    if (!start?.ok || typeof url !== 'string') {
+      popup?.close();
+      toast(_maError(start?.body, "Couldn't reach Plex. Try again in a moment."), 'error');
+      return false;
+    }
+    if (popup) popup.location.href = url;
+    else window.open(url, '_blank', 'noopener');
+    const until = Date.now() + _MA_PLEX_GIVE_UP_MS;
+    while (Date.now() < until) {
+      await sleep(_MA_PLEX_POLL_MS);
+      const check = await _maPost('/api/profiles/me/plex-connect/check');
+      if (!check) continue; // a blip; keep waiting
+      if (!check.ok) {
+        popup?.close();
+        toast(_maError(check.body, 'Connecting with Plex failed. Try again.'), 'error');
+        return false;
+      }
+      if (check.body.pending) {
+        if (popup?.closed) {
+          // closed without approving: one last look, then stop
+          const last = await _maPost('/api/profiles/me/plex-connect/check');
+          if (!(last?.ok && last.body.pending === false)) {
+            toast('Connecting with Plex was cancelled', 'info');
+            return false;
+          }
+          check.body = last.body;
+        } else {
+          continue;
+        }
+      }
+      popup?.close();
+      const who =
+        typeof check.body.title === 'string' && check.body.title ? check.body.title : 'you';
+      toast(`Connected to Plex as ${who}`, 'success');
+      _ma.open = null;
+      await _maLoad();
+      return true;
+    }
+    popup?.close();
+    toast('Connecting with Plex timed out. Try again.', 'error');
+    return false;
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = label;
+    }
+  }
 }

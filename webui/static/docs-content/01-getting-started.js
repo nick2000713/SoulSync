@@ -47,22 +47,30 @@ Switch sides with the toggle in the sidebar. Profiles can be limited to one side
         {
             id: 'gs-first-setup',
             title: 'First-Time Setup',
-            lede: 'Get from a fresh install to your first download in about ten minutes.',
+            lede: 'Get from a fresh install to a working library in about five minutes.',
             body: `
 ## The setup wizard
 
-The first time you open SoulSync, a **setup wizard** walks you through the essentials:
+The first time you open SoulSync, setup takes over the screen. While the welcome page is up it looks around on its own: whether it's running in Docker, and which of Plex, Jellyfin, Navidrome, slskd, Prowlarr, qBittorrent and SABnzbd it can reach (including compose service names like \`slskd\` or \`prowlarr\`). Most steps then start with the answer filled in.
 
 ::: steps
-1. **Welcome** — a quick introduction to what SoulSync does.
-2. **Metadata source** — pick where artist/album/track info comes from (Deezer works with no account; Spotify needs a free developer app).
-3. **Download source** — choose Soulseek (via slskd), YouTube, Tidal, Qobuz, HiFi, or Deezer, and enter its credentials.
-4. **Paths** — set your download and transfer folders. In Docker these default to \`/app/downloads\` and \`/app/Transfer\`.
-5. **Watchlist** — add a few favorite artists so discovery and new-release scanning have something to work with.
-6. **First download** — try a test download to verify the whole pipeline works end to end.
+1. **Your account**: name the admin profile and choose how SoulSync is unlocked. Leave it open on a private network, lock it with a PIN, or turn on usernames and passwords if it faces the internet.
+2. **What it's for**: music, movies and TV, YouTube channels, podcasts, audiobooks. Later steps only ask about what you pick.
+3. **Media server**: Plex signs in with a code at plex.tv/link (no token hunting); Jellyfin and Navidrome take their address and key. Once connected you pick the music, movies and TV libraries by name, with their sizes. Or choose **No server** and SoulSync keeps the library itself.
+4. **Folders**: every folder is checked as you type: does it exist, can SoulSync write there, how much space is free, and where your media server reads the same library from. Docker installs start on the container paths, other installs on folders next to the app.
+5. **Download sources**: an ordered list, tried top to bottom. HiFi and YouTube are already in because they need no account; Soulseek goes first when slskd was found. Tidal and Qobuz sign in right here. Pick a quality preset (Audiophile, Balanced or Space saver) on the same page.
+6. **Metadata and accounts**: the main catalogue (Deezer, Apple Music or Spotify) and optional Spotify, ListenBrainz and Last.fm accounts.
+7. **Movies and TV** (if picked): a TMDB key, Prowlarr and a download client, each with its own check.
+8. **Make it yours**: the artists you play most on your server come pre-picked to follow, and you can paste a playlist link to mirror.
+9. **Ready**: everything is saved and checked for real. Anything amber has a **Fix** button that jumps back to its step.
 :::
 
-You can re-run or skip any step — nothing is locked in.
+**Finish later** closes setup without saving; it comes back next time, where you left off (passwords and keys are never kept in the browser). Whatever you skip shows up as a **Finish setting up** checklist on the dashboard, and ticks itself off when you do it anywhere in the app.
+
+> [!TIP]
+> Moving to a new machine? **Restore from a SoulSync backup** on the welcome page loads a config export and skips setup.
+
+To see setup again without touching your install, open **Settings → Advanced → Developer → Setup preview**. It runs the real flow, saves nothing, and keeps a Preview tag in the corner.
 
 ![Settings page first-time setup](gs-first-setup.jpg)
 
@@ -121,7 +129,7 @@ If you skipped the wizard (or want to double-check), open **Settings** and confi
 
 ## Tips per service
 
-- **Spotify** — create the app at [developer.spotify.com](https://developer.spotify.com/dashboard), add \`http://127.0.0.1:8888/callback\` as a redirect URI (Spotify rejects \`localhost\` — use the literal IP), then paste the Client ID and Secret into SoulSync and click Authenticate.
+- **Spotify** — create the app at [developer.spotify.com](https://developer.spotify.com/dashboard), then paste the Client ID and Secret into SoulSync and click Authenticate. The **Redirect URI** in SoulSync must also be registered in the Spotify dashboard and match **exactly** (scheme, host, port, path). Spotify only allows plain \`http://\` for loopback addresses — use \`http://127.0.0.1:8888/callback\` when SoulSync runs on the same machine as your browser (note: \`localhost\` is rejected, use the literal IP). **NAS / Docker / remote server:** Spotify requires **HTTPS** for anything that isn't loopback. Put an HTTPS proxy in front of SoulSync, paste the proxy's URL (e.g. \`https://<your-host>/callback\`) into the **Redirect URI** field under Settings → Connections → Spotify, and register that exact same URI in the Spotify dashboard. With Tailscale: \`sudo docker exec tailscale tailscale serve --bg --https=443 http://127.0.0.1:8008/\` — this assumes the tailscale container can reach SoulSync at 127.0.0.1:8008 (host networking, or SoulSync running on the host); otherwise substitute SoulSync's container address — then register \`https://<nas-name>.<tailnet>.ts.net/callback\`. The dashboard edit can be done from any browser, but click Authenticate from one that can reach the URL.
 - **slskd** — SoulSync talks to slskd over HTTP. In Docker, use the container name (e.g. \`http://slskd:5030\`); outside Docker, \`http://localhost:5030\`. Paste the API key from slskd's own config.
 - **Deezer ARL** — copy the \`arl\` cookie value while logged into deezer.com in your browser's dev tools.
 - **Qobuz** — username + password works for most accounts; if login fails, a user auth token captured from the Qobuz web player's dev tools also works.

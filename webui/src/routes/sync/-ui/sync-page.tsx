@@ -18,13 +18,16 @@
  * `ServerCompareEditor` had no mount site anywhere before this file.
  */
 
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+
+import { takeSetupPlaylistLink } from '@/features/onboarding/handoff';
 
 import type { MirroredMatch, ServerPlaylist } from '../-sync.server';
 import type { SyncTabId } from '../-sync.shell';
 
 import { metadataSourceLabel } from '../-sync.modal-core';
 import { normalizeSyncTab } from '../-sync.shell';
+import { DETECTED_SOURCE_TAB_IDS, detectPlaylistUrl, isDetected } from '../-sync.url-detect';
 import { useAutoSync, useAutoSyncActions } from '../-sync.use-autosync';
 import { useSyncHistory } from '../-sync.use-history';
 import { useSyncPage } from '../-sync.use-page';
@@ -101,6 +104,16 @@ export function SyncPage() {
     setPending(null);
   }, []);
 
+  // a playlist link pasted during first-run setup lands here, routed exactly
+  // like the Add playlist sheet would. SyncShell registers openTab in its own
+  // effect, which runs before this one.
+  useEffect(() => {
+    const url = takeSetupPlaylistLink();
+    if (!url) return;
+    const detection = detectPlaylistUrl(url);
+    if (isDetected(detection)) routeAdd(DETECTED_SOURCE_TAB_IDS[detection.source], url);
+  }, [routeAdd]);
+
   /**
    * The mirrored tab's detail-modal opener.
    *
@@ -127,11 +140,6 @@ export function SyncPage() {
     [pending],
   );
 
-  /**
-   * `runPipeline` is the page's ONE controller, injected rather than reached
-   * for on `window` — `runMirroredPlaylistPipeline` lives in auto-sync.js,
-   * which the flip deletes.
-   */
   /**
    * Open for the Auto-Sync modal OR for Activity's scheduled-runs tab, which
    * reads the same run history. Leaving it closed there would show an empty
@@ -244,7 +252,12 @@ export function SyncPage() {
         onOpen={(sourceId) => openSourceModal('qobuz', sourceId)}
       />
     ),
-    beatport: <BeatportTab />,
+    beatport: (
+      <BeatportTab
+        vertical={page.verticals.beatport}
+        onOpen={(sourceId) => openSourceModal('beatport', sourceId)}
+      />
+    ),
     deezer: <DeezerArlTab />,
     // The link variant is the same SERVICE: one config, one vertical, one
     // modal id space. Only the way a playlist arrives differs.
@@ -284,6 +297,27 @@ export function SyncPage() {
         pipeline={page.pipeline}
         registerReload={page.registerMirroredReload}
         registerOpenDetail={registerOpenDetail}
+      />
+    ),
+    // the same tab over the playlists made here: one vertical, one pipeline
+    'my-playlists': (
+      <MirroredTab
+        scope="user"
+        vertical={page.verticals.mirrored}
+        onOpen={(sourceId) => openSourceModal('mirrored', sourceId)}
+        sourceName={sourceName}
+        pipeline={page.pipeline}
+        registerReload={page.registerMirroredReload}
+      />
+    ),
+    'request-lists': (
+      <MirroredTab
+        scope="requests"
+        vertical={page.verticals.mirrored}
+        onOpen={(sourceId) => openSourceModal('mirrored', sourceId)}
+        sourceName={sourceName}
+        pipeline={page.pipeline}
+        registerReload={page.registerMirroredReload}
       />
     ),
   };
