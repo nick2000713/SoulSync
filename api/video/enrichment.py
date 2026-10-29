@@ -11,6 +11,8 @@ Manage-Workers modal can drive video workers by pointing at /api/video/...
 
 from __future__ import annotations
 
+import sqlite3
+
 from flask import jsonify, request
 
 from utils.logging_config import get_logger
@@ -82,6 +84,8 @@ def register_routes(bp):
             # Backfill-worker keys (free, optional) + no-key toggles.
             "fanart_api_key": db.get_setting("fanart_api_key") or "",
             "opensubtitles_api_key": db.get_setting("opensubtitles_api_key") or "",
+            "subdl_api_key": db.get_setting("subdl_api_key") or "",
+            "subsource_api_key": db.get_setting("subsource_api_key") or "",
             "trakt_api_key": db.get_setting("trakt_api_key") or "",
             "mdblist_api_key": db.get_setting("mdblist_api_key") or "",
             "ryd_enabled": (db.get_setting("ryd_enabled") or "1") == "1",
@@ -96,12 +100,16 @@ def register_routes(bp):
 
     @bp.route("/prefs", methods=["GET"])
     def video_prefs():
-        # Lightweight UI prefs for the detail page (no API keys).
+        # Lightweight UI prefs for the detail page (no API keys). The subtitle
+        # languages you grab lead the "subtitles exist in" fact.
         from . import get_video_db
+        from core.video import organization
         db = get_video_db()
+        langs = str(organization.load(db).get("subtitle_langs") or "en")
         return jsonify({
             "billboard_autoplay": (db.get_setting("billboard_autoplay") or "1") == "1",
             "watch_region": (db.get_setting("watch_region") or "US").upper(),
+            "subtitle_langs": [x for x in langs.split(",") if x],
         })
 
     @bp.route("/enrichment/config", methods=["POST"])
@@ -123,6 +131,8 @@ def register_routes(bp):
         put_key("tvdb_api_key")
         put_key("fanart_api_key")
         put_key("opensubtitles_api_key")
+        put_key("subdl_api_key")
+        put_key("subsource_api_key")
         put_key("trakt_api_key")
         put_key("mdblist_api_key")
         # No-key worker on/off toggles (read live by the worker — no rebuild needed).
@@ -227,11 +237,32 @@ def register_routes(bp):
 
     @bp.route("/enrichment/<service>/test", methods=["POST"])
     def video_enrichment_test(service):
+        if service == "mdblist":
+            # a list source, not a worker or a subtitle provider. same key the
+            # collection studio reads.
+            from core.video.collections.list_sources import check_mdblist_key
+            from . import get_video_db
+            ok, msg = check_mdblist_key(get_video_db().get_setting("mdblist_api_key") or "")
+            return jsonify({"success": ok, "message": msg, "error": None if ok else msg})
         w = engine().worker(service)
-        if not w:
-            return jsonify({"success": False, "error": "unknown service"}), 404
+        if w:
+            # matcher workers wrap a client; backfill workers (fanart,
+            # opensubtitles, trakt...) carry test() themselves.
+            run_test = (getattr(w, "client", None) or w).test
+        else:
+            # subtitle-only providers (subdl, subsource) aren't enrichment
+            # workers; their keys live top-level like the rest.
+            from core.video.subtitles.providers import get_providers
+            from . import get_video_db
+            provider = get_providers().get(service)
+            if provider is None:
+                return jsonify({"success": False, "error": "unknown service"}), 404
+            db = get_video_db()
+
+            def run_test():
+                return provider.test(lambda k, d=None: db.get_setting(k) or d)
         try:
-            ok, msg = w.client.test()
+            ok, msg = run_test()
             return jsonify({"success": bool(ok), "message": msg, "error": None if ok else msg})
         except Exception:
             logger.exception("video enrichment test failed for %s", service)
@@ -327,11 +358,33 @@ def register_routes(bp):
                 except (TypeError, ValueError):
                     return jsonify({"error": "external_id must be numeric"}), 400
         from . import get_video_db
+        if service == "tmdb" and external_id is not None and kind in ("movie", "show"):
+            # the identity re-point: fills the new title's imdb/tvdb ids and
+            # name straight away, and locks them so a scan can't undo it
+            from core.video.identity import identify
+            res = identify(get_video_db(), kind, item_id, external_id)
+            if not res.get("success"):
+                return jsonify(res), 400
+            return jsonify(res)
         try:
             ok = get_video_db().rematch_item(kind, item_id, service, external_id)
             if not ok:
                 return jsonify({"success": False, "error": "Unknown item or service"}), 400
             return jsonify({"success": True})
+        except sqlite3.IntegrityError:
+            # an older database allows one row per id; the boot rebuild lifts
+            # that, so this only fires if it couldn't run. say who has it.
+            holder = get_video_db().external_id_holder(kind, service, external_id, exclude_id=item_id)
+            label = {"tvdb": "TVDB", "tmdb": "TMDB", "imdb": "IMDb"}.get(service, service)
+            if holder:
+                msg = ("%s %s is already on \u201c%s\u201d%s in your library (row %s, %s). If that's "
+                       "the same show listed twice by your server, merge them there."
+                       % (label, external_id, holder.get("title"),
+                          " (%s)" % holder["year"] if holder.get("year") else "", holder.get("id"),
+                          "%s owned" % holder.get("owned") if holder.get("owned") else "nothing owned"))
+            else:
+                msg = "%s %s is already used by another title in your library" % (label, external_id)
+            return jsonify({"success": False, "error": msg, "conflict": holder}), 409
         except Exception:
             logger.exception("video match apply failed for %s %s (%s)", kind, item_id, service)
             return jsonify({"success": False, "error": "Failed to update the match"}), 500

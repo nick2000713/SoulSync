@@ -155,7 +155,15 @@ export interface BulkFixStatus {
   total?: number;
   fixed?: number;
   failed?: number;
+  /** Findings held back by design (e.g. the album completeness gate),
+   *  tallied apart from failures. */
+  skipped?: number;
+  /** Tracks the album gate held back across the run, including on
+   *  findings that otherwise fixed successfully. */
+  other_artist_skipped?: number;
   stopped?: boolean;
+  error?: string | null;
+  note?: string | null;
   errors?: Array<{ error: string }> | null;
 }
 
@@ -165,6 +173,10 @@ export type DeadFileFixAction = 'redownload' | 'remove';
 export type AcoustidFixAction = 'retag' | 'relocate' | 'redownload' | 'delete';
 export type QualityFixAction = 'redownload' | 'delete' | 'ignore';
 export type BackfillFixAction = 'add_to_wishlist' | 'dismiss';
+/** `safe` keeps a field the user set by hand, which is the default everywhere
+ *  in Library v2; `overwrite_manual` deliberately hands it back to the
+ *  catalogue. Sent as the finding's `fix_action`, per row or per group. */
+export type RetagFixAction = 'safe' | 'overwrite_manual';
 
 // ── Cache health ─────────────────────────────────────────────────────────────
 
@@ -192,6 +204,8 @@ export interface DatabaseStats {
   tracks: number;
   database_size_mb: number;
   last_full_refresh?: string | null;
+  /** the weekly deep scan reads the whole server too; same naive local time */
+  last_deep_scan?: string | null;
   /** Drives the "<Plex|Jellyfin|Navidrome> Database Updater" card title. */
   server_source?: string | null;
 }

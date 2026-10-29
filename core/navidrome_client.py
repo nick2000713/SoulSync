@@ -1,5 +1,9 @@
 from core.library.navidrome_identity import validated_playlist_write
+import http.cookiejar
+import threading
+
 import requests
+from requests.adapters import HTTPAdapter
 import hashlib
 import secrets
 import time
@@ -19,153 +23,182 @@ from core.media_server.types import TrackInfo, PlaylistInfo
 logger = get_logger("navidrome_client")
 
 
-class NavidromeArtist:
-    """Wrapper class to mimic Plex artist object interface"""
+# one kept-alive connection pool for every subsonic call. a bare requests.get
+# opens a new connection, and python caches no dns, so each api call was also
+# a dns lookup: a pi-hole saw 1,000+ an hour from soulsync. the pool reuses
+# connections, so a lookup happens per new connection, not per call. subsonic
+# auth rides in the params, and cookies are refused so nothing one caller
+# (or one profile acting as its own user) gets back can follow another's call.
+_http_session: Optional[requests.Session] = None
+_http_session_lock = threading.Lock()
+
+
+def _http() -> requests.Session:
+    global _http_session
+    if _http_session is None:
+        with _http_session_lock:
+            if _http_session is None:
+                session = requests.Session()
+                session.cookies.set_policy(http.cookiejar.DefaultCookiePolicy(allowed_domains=[]))
+                adapter = HTTPAdapter(pool_connections=4, pool_maxsize=16)
+                session.mount('http://', adapter)
+                session.mount('https://', adapter)
+                _http_session = session
+    return _http_session
+
+
+from core.media_server.items import MediaAlbum, MediaArtist, MediaTrack, parse_iso_date
+
+
+class NavidromeArtist(MediaArtist):
+    """Subsonic artist. Shape owned by ``core.media_server.items``."""
+    server = 'navidrome'
+
     def __init__(self, navidrome_data: Dict[str, Any], client: 'NavidromeClient'):
-        self._data = navidrome_data
-        self._client = client
-        self.ratingKey = navidrome_data.get('id', '')
-        self.title = navidrome_data.get('name', 'Unknown Artist')
-        self.addedAt = self._parse_date(navidrome_data.get('dateAdded'))
+        artist_id = navidrome_data.get('id', '')
+        super().__init__(
+            artist_id,
+            navidrome_data.get('name', 'Unknown Artist'),
+            client=client,
+            data=navidrome_data,
+            added_at=parse_iso_date(navidrome_data.get('dateAdded')),
+            # TODO: Map Navidrome genre data to match Plex format
+            genres=[],
+            summary=navidrome_data.get('biography', '') or '',
+            # Subsonic getCoverArt API for artist images
+            thumb=f"/rest/getCoverArt?id={artist_id}" if artist_id else None,
+        )
 
-        # Create genres property from Navidrome data
-        self.genres = []
-        # TODO: Map Navidrome genre data to match Plex format
+class NavidromeAlbum(MediaAlbum):
+    """Subsonic album. Shape owned by ``core.media_server.items``."""
+    server = 'navidrome'
 
-        # Create summary property (used for timestamp storage)
-        self.summary = navidrome_data.get('biography', '') or ''
-
-        # Create thumb property for artist images
-        self.thumb = self._get_artist_image_url()
-
-    def _parse_date(self, date_str: Optional[str]) -> Optional[datetime]:
-        """Parse Navidrome date string to datetime"""
-        if not date_str:
-            return None
-        try:
-            # Navidrome uses ISO format
-            return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-        except:
-            return None
-
-    def _get_artist_image_url(self) -> Optional[str]:
-        """Generate Navidrome artist image URL using Subsonic getCoverArt API"""
-        if not self.ratingKey:
-            return None
-
-        # Subsonic getCoverArt API for artist images
-        return f"/rest/getCoverArt?id={self.ratingKey}"
-
-    def albums(self) -> List['NavidromeAlbum']:
-        """Get all albums for this artist"""
-        return self._client.get_albums_for_artist(self.ratingKey)
-
-    def albums_verified(self):
-        """(albums, ok): ok is False when the server gave no answer, which
-        albums() folds into an empty list. the deep scan reads this one."""
-        return self._client.get_albums_for_artist_verified(self.ratingKey)
-
-class NavidromeAlbum:
-    """Wrapper class to mimic Plex album object interface"""
     def __init__(self, navidrome_data: Dict[str, Any], client: 'NavidromeClient'):
-        self._data = navidrome_data
-        self._client = client
-        self.ratingKey = navidrome_data.get('id', '')
-        self.title = navidrome_data.get('name', 'Unknown Album')
-        self.year = navidrome_data.get('year')
-        self.addedAt = self._parse_date(navidrome_data.get('created'))
-        self._artist_id = navidrome_data.get('artistId', '')
-        self.thumb = self._get_album_image_url()
+        album_id = navidrome_data.get('id', '')
+        # Navidrome exposes the stable artwork key as ``coverArt``. Falling
+        # back to the album ID keeps compatibility with older responses while
+        # ensuring library refreshes do not mark albums as artless.
+        cover_id = navidrome_data.get('coverArt') or album_id
+        super().__init__(
+            album_id,
+            navidrome_data.get('name', 'Unknown Album'),
+            client=client,
+            data=navidrome_data,
+            added_at=parse_iso_date(navidrome_data.get('created')),
+            year=navidrome_data.get('year'),
+            thumb=f"/rest/getCoverArt?id={cover_id}" if cover_id else None,
+            artist_id=navidrome_data.get('artistId', ''),
+        )
 
-    def _parse_date(self, date_str: Optional[str]) -> Optional[datetime]:
-        if not date_str:
-            return None
-        try:
-            return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-        except:
-            return None
+def _entry_artist_names(raw: Dict[str, Any]) -> List[str]:
+    """Artist names on a subsonic song: the opensubsonic ``artists`` list
+    plus the plain ``artist`` string."""
+    names = [a.get('name') for a in (raw.get('artists') or [])
+             if isinstance(a, dict) and a.get('name')]
+    if raw.get('artist'):
+        names.append(str(raw['artist']))
+    return names
 
-    def _get_album_image_url(self) -> Optional[str]:
-        """Generate a Subsonic getCoverArt URL for this album.
 
-        Navidrome exposes the stable artwork key as ``coverArt``. Falling
-        back to the album ID keeps compatibility with older responses while
-        ensuring library refreshes do not mark albums as artless.
-        """
-        cover_id = self._data.get('coverArt') or self.ratingKey
-        if not cover_id:
-            return None
-        return f"/rest/getCoverArt?id={cover_id}"
+class NavidromeTrack(MediaTrack):
+    """Subsonic song. Shape owned by ``core.media_server.items``."""
+    server = 'navidrome'
 
-    def artist(self) -> Optional[NavidromeArtist]:
-        """Get the album artist"""
-        if self._artist_id:
-            return self._client.get_artist_by_id(self._artist_id)
-        return None
-
-    def tracks(self) -> List['NavidromeTrack']:
-        """Get all tracks for this album"""
-        return self._client.get_tracks_for_album(self.ratingKey)
-
-    def tracks_verified(self):
-        """(tracks, ok): ok is False when the server gave no answer."""
-        return self._client.get_tracks_for_album_verified(self.ratingKey)
-
-class NavidromeTrack:
-    """Wrapper class to mimic Plex track object interface"""
     def __init__(self, navidrome_data: Dict[str, Any], client: 'NavidromeClient'):
-        self._data = navidrome_data
-        self._client = client
-        self.ratingKey = navidrome_data.get('id', '')
-        self.title = navidrome_data.get('title', 'Unknown Track')
-        self.duration = navidrome_data.get('duration', 0) * 1000  # Convert to milliseconds
-        self.trackNumber = navidrome_data.get('track')
-        self.discNumber = navidrome_data.get('discNumber')  # multi-disc: disc number
-        self.year = navidrome_data.get('year')
-        self.userRating = navidrome_data.get('userRating')
-        self.addedAt = self._parse_date(navidrome_data.get('created'))
-
-        # Subsonic API file/quality fields
-        self.suffix = navidrome_data.get('suffix')      # e.g. "flac", "mp3"
-        self.bitRate = navidrome_data.get('bitRate')     # e.g. 320
-        self.path = navidrome_data.get('path')           # e.g. "/music/Artist/Album/track.flac"
-        # File size in bytes (Subsonic <song size="..."/>) — powers the
+        # File size in bytes (Subsonic <song size="..."/>) powers the
         # Library Disk Usage card on Stats. None when the server didn't
         # report a size (rare but possible for streaming-only nodes).
         _nv_size = navidrome_data.get('size')
         try:
-            self.file_size = int(_nv_size) if _nv_size else None
+            file_size = int(_nv_size) if _nv_size else None
         except (TypeError, ValueError):
-            self.file_size = None
+            file_size = None
+        super().__init__(
+            navidrome_data.get('id', ''),
+            navidrome_data.get('title', 'Unknown Track'),
+            client=client,
+            data=navidrome_data,
+            added_at=parse_iso_date(navidrome_data.get('created')),
+            duration_ms=navidrome_data.get('duration', 0) * 1000,  # seconds on the wire
+            track_number=navidrome_data.get('track'),
+            disc_number=navidrome_data.get('discNumber'),
+            year=navidrome_data.get('year'),
+            user_rating=navidrome_data.get('userRating'),
+            path=navidrome_data.get('path'),           # e.g. "/music/Artist/Album/track.flac"
+            bitrate_kbps=navidrome_data.get('bitRate'),  # e.g. 320
+            file_size=file_size,
+            suffix=navidrome_data.get('suffix'),       # e.g. "flac", "mp3"
+            musicbrainz_id=navidrome_data.get('musicBrainzId'),
+            album_id=navidrome_data.get('albumId', ''),
+            artist_ids=[navidrome_data.get('artistId', '')],
+        )
 
-        self._album_id = navidrome_data.get('albumId', '')
-        self._artist_id = navidrome_data.get('artistId', '')
-        self.musicBrainzId = navidrome_data.get('musicBrainzId')
+from core.media_server.base import MediaServerBase
+from core.media_server.contract import Capability
 
-    def _parse_date(self, date_str: Optional[str]) -> Optional[datetime]:
-        if not date_str:
-            return None
+
+class NavidromeClient(MediaServerBase):
+    # update_artist_* and update_album_poster exist but only log "not
+    # implemented", so METADATA_WRITE is not declared. Navidrome picks up
+    # tag changes on disk by itself (TAGS_AUTODETECTED).
+    CAPABILITIES = frozenset({
+        Capability.SEARCH, Capability.RECENTLY_ADDED, Capability.SCAN_TRIGGER,
+        Capability.LIBRARY_STATS, Capability.PLAYLISTS, Capability.PLAYLIST_IMAGE,
+        Capability.PLAY_HISTORY, Capability.CURATION_SIGNALS, Capability.PER_USER_VIEWS,
+        Capability.TAGS_AUTODETECTED,
+    })
+
+    def scan_hints(self):
+        return {'preparing_message': 'Connecting to Navidrome server...',
+                'caches_listings': True}
+
+    def post_scan(self, database) -> bool:
+        """Merge same-path duplicate rows a rescan rekeyed. The pre-check and
+        the repair live in core.library.navidrome_identity (the one place
+        that knows the table layout); this is the shared hook name so the
+        worker can stop branching on the server type."""
+        if database is None:
+            return False
         try:
-            return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-        except:
+            from core.library.navidrome_identity import repair_if_needed
+            repaired = repair_if_needed(database, self)
+            if repaired:
+                logger.info("Navidrome identity repair: %s obsolete same-path rows merged", repaired)
+            return True
+        except Exception as exc:
+            logger.warning("Navidrome identity repair skipped: %s", exc)
+            return False
+
+    def image_url(self, thumb):
+        """A getCoverArt reference becomes the SoulSync proxy path
+        /api/navidrome/cover/<id>: the proxy authenticates and caches when
+        the image is requested, so no salted auth URL is built here or
+        stored in library JSON. Any other /rest/ path gets Subsonic auth."""
+        if not thumb:
             return None
+        from urllib.parse import parse_qs, quote, urlparse
+        parsed = urlparse(thumb)
+        cover_id = parse_qs(parsed.query).get('id', [''])[0]
+        if parsed.path.rstrip('/').endswith('/getCoverArt') and cover_id:
+            return '/api/navidrome/cover/' + quote(cover_id, safe='')
+        if not (self.base_url and self.username and self.password):
+            return None
+        path = thumb if thumb.startswith('/rest/') else parsed.path
+        if not path.startswith('/rest/'):
+            return None
+        import hashlib
+        import secrets
+        salt = secrets.token_hex(6)
+        token = hashlib.md5((self.password + salt).encode()).hexdigest()
+        separator = '&' if '?' in path else '?'
+        return f"{self.base_url.rstrip('/')}{path}{separator}u={self.username}&t={token}&s={salt}&v=1.16.1&c=SoulSync&f=json"
 
-    def artist(self) -> Optional[NavidromeArtist]:
-        """Get the track artist"""
-        if self._artist_id:
-            return self._client.get_artist_by_id(self._artist_id)
-        return None
+    def user_view(self, identity):
+        """``as_user`` under the shared hook name (see MediaServerBase)."""
+        username = (identity or {}).get('username')
+        password = (identity or {}).get('password')
+        return self.as_user(username, password) if username and password else None
 
-    def album(self) -> Optional[NavidromeAlbum]:
-        """Get the track's album"""
-        if self._album_id:
-            return self._client.get_album_by_id(self._album_id)
-        return None
-
-from core.media_server.contract import MediaServerClient
-
-
-class NavidromeClient(MediaServerClient):
     def __init__(self):
         self.base_url: Optional[str] = None
         self.username: Optional[str] = None
@@ -179,10 +212,24 @@ class NavidromeClient(MediaServerClient):
         self._artist_cache = {}
         self._album_cache = {}
         self._track_cache = {}
+        # play data per (user, album): the songs from the last getAlbum, kept
+        # until the album's own played / playCount moves (see _played_songs)
+        self._album_play_cache: Dict[tuple, tuple] = {}
         self._folder_album_ids: Optional[set] = None  # Album IDs in selected music folder
 
         # Progress callback for UI updates
         self._progress_callback = None
+
+        # Server IDs the most recent validated playlist write could not
+        # resolve (navidrome no longer has them), recorded by the guard
+        # in core.library.navidrome_identity so the sync layer can stop
+        # counting those tracks as synced (#1754). Cleared when a write
+        # starts and set when it reaches track resolution, so it always
+        # describes the latest write that got that far; on a per-user
+        # view the record lives on the view, the object its caller holds.
+        self._last_validated_write_skipped: list = []
+        # ids an append took off as old wrong matches (#1801), read by the guard
+        self._last_append_removed: list = []
 
     def set_progress_callback(self, callback):
         """Set callback function for progress updates"""
@@ -493,9 +540,9 @@ class NavidromeClient(MediaServerClient):
             # Use POST for write operations to avoid URL length limits
             # (e.g., createPlaylist with 161 songId params would exceed GET URL limits)
             if endpoint in self._WRITE_ENDPOINTS:
-                response = requests.post(url, data=auth_params, timeout=timeout if timeout is not None else 30)
+                response = _http().post(url, data=auth_params, timeout=timeout if timeout is not None else 30)
             else:
-                response = requests.get(url, params=auth_params, timeout=timeout if timeout is not None else 60)
+                response = _http().get(url, params=auth_params, timeout=timeout if timeout is not None else 60)
             response.raise_for_status()
 
             data = response.json()
@@ -887,6 +934,31 @@ class NavidromeClient(MediaServerClient):
             logger.error(f"Error getting recently added albums from Navidrome: {e}")
             return []
 
+    def get_album_census(self) -> Optional[List[Dict[str, Any]]]:
+        """every album in the library (the selected music folder), as Navidrome
+        lists them: raw getAlbumList2 entries with id, songCount and artistId.
+        500 a page, so a 5,000-album library is 10 requests. None when a page
+        fails, so a short answer is never mistaken for a smaller library."""
+        if not self.ensure_connection():
+            return None
+        albums: List[Dict[str, Any]] = []
+        offset = 0
+        page = 500
+        while True:
+            params = {'type': 'alphabeticalByName', 'size': page, 'offset': offset}
+            if self.music_folder_id:
+                params['musicFolderId'] = self.music_folder_id
+            response = self._make_request('getAlbumList2', params)
+            if response is None:
+                return None
+            batch = response.get('albumList2', {}).get('album', [])
+            if not isinstance(batch, list):
+                batch = [batch] if batch else []
+            albums.extend(a for a in batch if isinstance(a, dict) and a.get('id'))
+            if len(batch) < page or offset > 1_000_000:
+                return albums
+            offset += page
+
     def get_tracks_for_album(self, album_id: str) -> List[NavidromeTrack]:
         """Get all tracks for a specific album"""
         return self.get_tracks_for_album_verified(album_id)[0]
@@ -1002,6 +1074,40 @@ class NavidromeClient(MediaServerClient):
             logger.error(f"Error getting library stats: {e}")
             return {}
 
+    _ALBUM_PLAY_CACHE_MAX = 2000
+
+    def _played_songs(self, album: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """an album's songs with their play data, fetched only when the album's
+        own played stamp or play count has moved since the last fetch.
+
+        the listening poll asked getAlbum for up to 50 recent and 100 frequent
+        albums every time, about 150 requests a poll per user whether anything
+        was played or not. TheHomeGuy's Pi-hole rate-limited SoulSync at over
+        1,000 an hour. the album list already carries both values, so a quiet
+        poll is now the two list calls. play data is per user, so is the key.
+        a server that sends neither value gets no caching at all."""
+        album_id = album.get('id')
+        if not album_id:
+            return []
+        mark = (album.get('played'), album.get('playCount'))
+        cache = self._album_play_cache
+        key = (self.username or '', str(album_id))
+        if mark != (None, None):
+            hit = cache.get(key)
+            if hit and hit[0] == mark:
+                return hit[1]
+        resp = self._make_request('getAlbum', {'id': album_id})
+        if not resp:
+            return []
+        songs = resp.get('album', {}).get('song', [])
+        if not isinstance(songs, list):
+            songs = [songs] if songs else []
+        if mark != (None, None):
+            if len(cache) >= self._ALBUM_PLAY_CACHE_MAX:
+                cache.pop(next(iter(cache)))
+            cache[key] = (mark, songs)
+        return songs
+
     def get_play_history(self, limit=500):
         """Fetch recently played tracks via Subsonic API.
 
@@ -1017,7 +1123,9 @@ class NavidromeClient(MediaServerClient):
         try:
             response = self._make_request('getAlbumList2', {
                 'type': 'recent',
-                'size': min(limit, 500),
+                # limit=None (the one-off old-plays tagger) means "as much as
+                # there is"; min(None, 500) raised and the tagger got nothing
+                'size': min(limit or 500, 500),
             })
             if not response:
                 return []
@@ -1028,16 +1136,7 @@ class NavidromeClient(MediaServerClient):
 
             results = []
             for album in album_list[:50]:  # Limit album fetches to avoid API spam
-                album_id = album.get('id')
-                if not album_id:
-                    continue
-                album_resp = self._make_request('getAlbum', {'id': album_id})
-                if not album_resp:
-                    continue
-                songs = album_resp.get('album', {}).get('song', [])
-                if not isinstance(songs, list):
-                    songs = [songs] if songs else []
-                for song in songs:
+                for song in self._played_songs(album):
                     played = song.get('played')
                     if not played:
                         continue
@@ -1081,16 +1180,7 @@ class NavidromeClient(MediaServerClient):
 
             counts = {}
             for album in album_list[:100]:
-                album_id = album.get('id')
-                if not album_id:
-                    continue
-                album_resp = self._make_request('getAlbum', {'id': album_id})
-                if not album_resp:
-                    continue
-                songs = album_resp.get('album', {}).get('song', [])
-                if not isinstance(songs, list):
-                    songs = [songs] if songs else []
-                for song in songs:
+                for song in self._played_songs(album):
                     pc = song.get('playCount', 0)
                     if pc and pc > 0:
                         counts[song.get('id', '')] = pc
@@ -1627,7 +1717,8 @@ class NavidromeClient(MediaServerClient):
 
     @validated_playlist_write
     def append_to_playlist(self, playlist_name: str, tracks, *,
-                           playlist_id: Optional[str] = None) -> bool:
+                           playlist_id: Optional[str] = None,
+                           source_hints=None) -> bool:
         """Append tracks to an existing playlist (creates it if missing).
 
         Differs from `update_playlist`: never deletes existing tracks,
@@ -1639,7 +1730,13 @@ class NavidromeClient(MediaServerClient):
         `playlist_id`, when given and still on the server, is written to
         directly (#1289 item 6: follow the mirrored playlist's stored server
         ID silently across server-side renames). Falls back to the legacy
-        name-match when absent or stale."""
+        name-match when absent or stale.
+
+        `source_hints`, ``(title, artists, matched_id)`` per matched source
+        track, lets the append drop an old wrong match that the right track
+        has replaced (#1801, see plan_append_superseded). The ids it drops
+        land on ``_last_append_removed`` for the write guard's readback."""
+        self._last_append_removed = []
         if not self.ensure_connection():
             return False
 
@@ -1663,9 +1760,10 @@ class NavidromeClient(MediaServerClient):
             # defines `ratingKey`, so the existing-ids set was ALWAYS empty and
             # every sync re-appended the whole matched list (every track N
             # times). Same bug as the Jellyfin append; dedupe on ratingKey.
+            existing_tracks = self.get_playlist_tracks(primary.id)
             existing_ids = {
                 str(getattr(t, 'ratingKey', '') or '')
-                for t in self.get_playlist_tracks(primary.id)
+                for t in existing_tracks
             } - {''}
 
             desired_ids = []
@@ -1680,10 +1778,15 @@ class NavidromeClient(MediaServerClient):
                 if tid:
                     desired_ids.append(tid)
 
-            from core.sync.playlist_edit import plan_playlist_append
+            from core.sync.playlist_edit import plan_append_superseded, plan_playlist_append
             new_track_ids = plan_playlist_append(existing_ids, desired_ids)
+            superseded = plan_append_superseded(
+                [(getattr(t, 'ratingKey', ''), getattr(t, 'title', ''),
+                  _entry_artist_names(getattr(t, 'raw', None) or {}))
+                 for t in existing_tracks],
+                source_hints, desired_ids)
 
-            if not new_track_ids:
+            if not new_track_ids and not superseded:
                 logger.info(
                     f"Navidrome append: no new tracks to add to '{playlist_name}' "
                     f"(all matched tracks already present)"
@@ -1692,10 +1795,17 @@ class NavidromeClient(MediaServerClient):
 
             # Subsonic updatePlaylist: `songIdToAdd` accepts repeated values
             # (requests serializes list values as repeated query/form params).
-            params = {
-                'playlistId': primary.id,
-                'songIdToAdd': new_track_ids,
-            }
+            params = {'playlistId': primary.id}
+            if new_track_ids:
+                params['songIdToAdd'] = new_track_ids
+            if superseded:
+                drop = set(superseded)
+                # indices into the current list, descending, same as reconcile
+                params['songIndexToRemove'] = sorted(
+                    (i for i, t in enumerate(existing_tracks)
+                     if str(getattr(t, 'ratingKey', '') or '') in drop),
+                    reverse=True,
+                )
             response = self._make_request('updatePlaylist', params)
             if response and response.get('status') == 'ok':
                 logger.info(
@@ -1703,6 +1813,16 @@ class NavidromeClient(MediaServerClient):
                     f"'{playlist_name}' (skipped {len(tracks) - len(new_track_ids)} "
                     f"already present)"
                 )
+                if superseded:
+                    self._last_append_removed = list(superseded)
+                    logger.info(
+                        "Navidrome append: removed %d old wrong match(es) from '%s' "
+                        "that the right track replaced: %s",
+                        len(superseded), playlist_name, ", ".join(
+                            f"'{getattr(t, 'title', '')}' by "
+                            f"'{', '.join(_entry_artist_names(getattr(t, 'raw', None) or {}))}'"
+                            for t in existing_tracks
+                            if str(getattr(t, 'ratingKey', '')) in drop)[:500])
                 return True
             logger.error(
                 f"Failed to append to Navidrome playlist '{playlist_name}'"
@@ -1868,6 +1988,23 @@ class NavidromeClient(MediaServerClient):
         except Exception as e:
             logger.error(f"Failed to trigger Navidrome scan: {e}")
             return False
+
+    def get_scan_state(self):
+        """getScanStatus in full: ``{scanning, last_scan, count, folder_count}``,
+        or None when it can't be read. Navidrome adds ``lastScan`` (and
+        ``folderCount``) to the Subsonic answer, which is what lets a finished
+        scan be told apart from one that hasn't started yet (#1899)."""
+        try:
+            result = self._make_request('getScanStatus')
+        except Exception:   # noqa: BLE001 - unreadable is "unknown", never "done"
+            return None
+        if result is None:
+            return None
+        status = result.get('scanStatus') or {}
+        return {"scanning": bool(status.get('scanning', False)),
+                "last_scan": status.get('lastScan'),
+                "count": status.get('count'),
+                "folder_count": status.get('folderCount')}
 
     def is_library_scanning(self, library_name: str = "Music") -> bool:
         """Check if Navidrome library is currently scanning via Subsonic getScanStatus."""

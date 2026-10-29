@@ -34,22 +34,6 @@ let spotifyPlaylists = [];
 let selectedPlaylists = new Set();
 let activeSyncPollers = {}; // Key: playlist_id, Value: intervalId
 
-/**
- * Whether the download engine still holds a sync poller for this playlist.
- *
- * A SEAM for the React sync page. `activeSyncPollers` is a top-level `let`,
- * which — unlike a `function` declaration — creates NO property on `window`,
- * so React cannot read it however it is spelled. The sequential-sync runner
- * needs exactly one bit from it: is this playlist still syncing. It watches
- * the poller's disappearance rather than any completion event, because
- * `stopSyncPolling` is the single place every terminal path funnels through.
- *
- * A function rather than an alias of the object: the binding stays private,
- * and the closure reads it live even if it were ever reassigned.
- */
-window.isPlaylistSyncing = function isPlaylistSyncing(playlistId) {
-    return Boolean(activeSyncPollers[playlistId]);
-};
 // Phase 5: WebSocket sync/discovery/scan state
 let _syncProgressCallbacks = {};
 let _discoveryProgressCallbacks = {};
@@ -110,50 +94,6 @@ window.startDiscoverVirtualSync = function (virtualPlaylistId, name, spotifyTrac
 window.discoverDownloadProcess = function (virtualPlaylistId) {
     return activeDownloadProcesses[virtualPlaylistId] || null;
 };
-
-/**
- * Bridge for the React SYNC page's account tabs (Spotify + Deezer ARL): put a
- * playlist row into `spotifyPlaylists` so `openDownloadMissingModal` can find
- * it. Same lexical-scope story as startDiscoverVirtualSync above — and the same
- * shape, minus the sync kickoff, because this one only seeds.
- *
- * Without it openDownloadMissingModal bails at its `if (!playlist)` guard with
- * 'Could not find playlist data.' (sync-spotify.js 2235-2240). The vanilla page
- * never needed a bridge: loadSpotifyPlaylists assigns the whole array (1612)
- * and the ARL flow pushes its own shim rows (sync-services.js 2471, 2646-2654).
- * Once React owns those tabs, neither of those runs.
- *
- * Idempotent by id, exactly like the push it replaces.
- */
-window.registerSyncAccountPlaylist = function (row) {
-    if (!row || !row.id) return;
-    if (!spotifyPlaylists.find(p => p.id === row.id)) {
-        spotifyPlaylists.push(row);
-    }
-};
-
-/**
- * The registered account playlists, in registration order.
- *
- * The SECOND half of the seam above, and the React sync page needs both:
- * `startSequentialSync` has to know what order to queue the selection in, and
- * the sidebar has to resolve a playlist id to a name for "Syncing 2/5: Beta".
- * `spotifyPlaylists` is a top-level `let`, so — like `activeSyncPollers` — it
- * is NOT a window property and React cannot read it directly.
- *
- * Reading the ENGINE's array rather than the tab's React state is deliberate.
- * `startPlaylistSync` resolves every id against this same array and bails with
- * 'Could not find playlist data.' for anything missing, so a queue built from
- * it can only contain ids the engine can actually run. The tab renders its
- * rows in the order it registers them, so this order is also the display
- * order the vanilla read off the DOM.
- *
- * A COPY, so a caller cannot reorder or splice the engine's own array.
- */
-window.getSyncAccountPlaylists = function () {
-    return spotifyPlaylists.slice();
-};
-
 
 /**
  * Bridge for the React discover page: the ListenBrainz/Last.fm playlist
@@ -443,6 +383,10 @@ window.openDownloadBatchModal = function (batchId, playlistId, batchName) {
  * caps at 300 rows and would under-report a bigger queue.
  */
 function _updateDlNavBadge(count) {
+    // the downloads page's Music | Video switch shows this same number while
+    // you're on the video side, so hand it over too
+    window.__soulsyncMusicActiveDownloads = count;
+    document.dispatchEvent(new CustomEvent('soulsync:music-active-downloads', { detail: count }));
     const badge = document.getElementById('dl-nav-badge');
     if (badge) {
         if (count > 0) {
@@ -526,21 +470,6 @@ function stopBeatportDiscoveryAndSyncPolling() {
     });
 }
 
-function resetBeatportSliderInitFlags() {
-    // The four `dataset.initialized = 'false'` writes that stood here are gone.
-    // They targeted #beatport-{rebuild,releases,charts,dj}-slider, ids the sync
-    // flip deleted along with the page — every lookup returned null, so every
-    // write was already a no-op. Removing them is behaviour-neutral and stops
-    // four dead `getElementById` calls tripping the class-as-id guard.
-    //
-    // The state resets below are KEPT: they are plain object writes, not DOM,
-    // and the slider state objects still exist in this file.
-    beatportReleasesSliderState.isInitialized = false;
-    beatportHypePicksSliderState.isInitialized = false;
-    beatportChartsSliderState.isInitialized = false;
-    beatportDJSliderState.isInitialized = false;
-}
-
 function cleanupBeatportContent() {
     const wasLoaded = beatportContentState.loaded || !!beatportContentState.loadingPromise;
     if (!wasLoaded) return;
@@ -552,14 +481,9 @@ function cleanupBeatportContent() {
         beatportContentState.abortController = null;
     }
 
+    // the sliders went with beatport-ui.js; the react tab owns that view now
     stopBeatportDiscoveryAndSyncPolling();
-    cleanupBeatportRebuildSlider();
-    cleanupBeatportReleasesSlider();
-    cleanupBeatportHypePicksSlider();
-    cleanupBeatportChartsSlider();
-    cleanupBeatportDJSlider();
-    resetBeatportSliderInitFlags();
-
+    // React BeatportSlider releases its autoplay timer when it unmounts.
     beatportContentState.loadingPromise = null;
     beatportContentState.loaded = false;
 
@@ -695,7 +619,7 @@ function showWitnessMeDialog(orphanCount) {
         overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:10000;display:flex;align-items:center;justify-content:center;';
 
         overlay.innerHTML = `
-            <div style="background:var(--bg-secondary, #1e1e2e);border:2px solid #e74c3c;border-radius:12px;padding:28px;max-width:480px;width:90%;color:var(--text-primary, #fff);font-family:inherit;">
+            <div style="background:var(--bg-secondary);border:2px solid #e74c3c;border-radius:12px;padding:28px;max-width:480px;width:90%;color:var(--text-primary);font-family:inherit;">
                 <h3 style="margin:0 0 8px;color:#e74c3c;font-size:1.2em;">Mass Deletion Warning</h3>
                 <p style="margin:0 0 12px;font-size:0.95em;opacity:0.9;">
                     You are about to <strong>permanently delete ${orphanCount.toLocaleString()} files</strong> from your disk.
@@ -709,9 +633,9 @@ function showWitnessMeDialog(orphanCount) {
                 </p>
                 <input type="text" id="witness-me-input" autocomplete="off" spellcheck="false"
                        placeholder="Type the phrase here..."
-                       style="width:100%;padding:10px;border:1px solid #555;border-radius:6px;background:var(--bg-primary, #111);color:var(--text-primary, #fff);font-size:1em;margin:8px 0 16px;box-sizing:border-box;">
+                       style="width:100%;padding:10px;border:1px solid #555;border-radius:6px;background:#111;color:var(--text-primary);font-size:1em;margin:8px 0 16px;box-sizing:border-box;">
                 <div style="display:flex;gap:10px;justify-content:flex-end;">
-                    <button id="witness-cancel" style="padding:8px 20px;border:1px solid #555;border-radius:6px;background:transparent;color:var(--text-primary, #fff);cursor:pointer;font-size:0.9em;">
+                    <button id="witness-cancel" style="padding:8px 20px;border:1px solid #555;border-radius:6px;background:transparent;color:var(--text-primary);cursor:pointer;font-size:0.9em;">
                         Cancel
                     </button>
                     <button id="witness-confirm" disabled
@@ -810,6 +734,8 @@ function refreshMusicRequestsBadge() {
             const n = admin ? (d.pending || 0) : (d.updates || 0);
             badge.textContent = n > 99 ? '99+' : String(n);
             badge.classList.toggle('hidden', !n);
+            // nothing waiting on anyone = no button
+            if (nav) nav.classList.toggle('nav-idle', !(d.pending || d.updates));
         })
         .catch(() => { /* badge is best-effort */ });
 }
@@ -995,6 +921,7 @@ function initializeWebSocket() {
     socket.on('enrichment:repair', (data) => updateRepairStatusFromData(data));
     socket.on('enrichment:soulid', (data) => updateSoulIDStatusFromData(data));
     socket.on('enrichment:listening-stats', () => { }); // Status only, no UI update needed
+    socket.on('library:changed', (data) => window.dispatchEvent(new CustomEvent('ss:library-changed', { detail: data })));
     socket.on('repair:progress', (data) => { qaSignal('tools'); updateRepairJobProgressFromData(data); if (typeof updateMusicRepairTask === 'function') updateMusicRepairTask(data); });
     // Server Activity live push — feed the open drawer (Tautulli replacement)
     socket.on('activity:update', (data) => {
@@ -1024,9 +951,15 @@ function initializeWebSocket() {
     // 'tool:stream' is intentionally NOT wired: stream state is per-listener
     // (session cookie), so the global broadcast could only carry the DEFAULT
     // session's eternal "stopped" — the player polls /api/stream/status instead.
-    socket.on('tool:duplicate-cleaner', (data) => { if (_qaToolBusy(data)) qaSignal('tools'); updateDuplicateCleanProgressFromData(data); });
-    socket.on('tool:db-update', (data) => { if (_qaToolBusy(data)) qaSignal('tools'); updateDbProgressFromData(data); });
-    socket.on('tool:metadata', (data) => { if (_qaToolBusy(data)) qaSignal('tools'); updateMetadataStatusFromData(data); });
+    // The Tools page is React now and each of these cards polls its own
+    // status and renders it. The old vanilla writers still targeted the same
+    // element ids, so two writers took turns on one card: the db updater's
+    // progress line flipped between "tracks" (React) and a hardcoded
+    // "artists" (vanilla) every second during the tag reconcile. Only the
+    // quick-access signal stays here.
+    socket.on('tool:duplicate-cleaner', (data) => { if (_qaToolBusy(data)) qaSignal('tools'); });
+    socket.on('tool:db-update', (data) => { if (_qaToolBusy(data)) qaSignal('tools'); });
+    socket.on('tool:metadata', (data) => { if (_qaToolBusy(data)) qaSignal('tools'); });
     socket.on('tool:logs', (data) => updateLogsFromData(data));
 
     // Phase 5 event listeners (sync/discovery progress + scans)
@@ -1101,7 +1034,9 @@ function initializeWebSocket() {
     socket.on('collections:sync', (data) => { if (typeof updateCollectionSyncTask === 'function') updateCollectionSyncTask(data); });
     socket.on('collections:artwork', (data) => { if (typeof updateCollectionArtTask === 'function') updateCollectionArtTask(data); });
     socket.on('video:bulk', (data) => { if (typeof updateVideoBulkTask === 'function') updateVideoBulkTask(data); });
-    socket.on('video:repair:progress', (data) => { if (typeof updateVideoRepairProgressFromData === 'function') updateVideoRepairProgressFromData(data); });
+    // the video tools page is React now (/tools?media=video): hand the frame
+    // over the same ss: seam the music maintenance hero listens on.
+    socket.on('video:repair:progress', (data) => { window.dispatchEvent(new CustomEvent('ss:video-repair-progress', { detail: data })); });
 }
 
 // ── Quick Actions tiles: animation == gauge ──
@@ -1751,15 +1686,15 @@ async function rehydrateDiscoverDownloadModal(playlistId) {
         if (playlistId === 'discover_release_radar') {
             apiEndpoint = '/api/discover/release-radar';
         } else if (playlistId === 'discover_discovery_weekly') {
-            apiEndpoint = '/api/discover/discovery-weekly';
+            apiEndpoint = '/api/discover/weekly';
         } else if (playlistId === 'discover_seasonal_playlist') {
-            apiEndpoint = '/api/discover/seasonal-playlist';
+            apiEndpoint = '/api/discover/seasonal/current/playlist';
         } else if (playlistId === 'discover_popular_picks') {
-            apiEndpoint = '/api/discover/popular-picks';
+            apiEndpoint = '/api/discover/personalized/popular-picks';
         } else if (playlistId === 'discover_hidden_gems') {
-            apiEndpoint = '/api/discover/hidden-gems';
+            apiEndpoint = '/api/discover/personalized/hidden-gems';
         } else if (playlistId === 'discover_discovery_shuffle') {
-            apiEndpoint = '/api/discover/discovery-shuffle';
+            apiEndpoint = '/api/discover/personalized/discovery-shuffle';
         } else if (playlistId === 'build_playlist_custom') {
             apiEndpoint = '/api/discover/build-playlist';
         } else if (playlistId.startsWith('discover_lb_')) {

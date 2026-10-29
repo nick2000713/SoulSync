@@ -171,7 +171,7 @@ describe('OperationsStudio (Simple Mode)', () => {
     }
   });
 
-  it('renders the Smart Action Triage Center with its 3 authority buckets', async () => {
+  it('sorts every open type into what fixing it would do', async () => {
     render(
       <OperationsStudio
         jobs={testJobs}
@@ -183,20 +183,65 @@ describe('OperationsStudio (Simple Mode)', () => {
       />,
     );
 
-    expect(screen.getByText('Smart Action Triage')).not.toBeNull();
-    expect(screen.getByText('Zero-Risk Auto-Fixes')).not.toBeNull();
-    expect(screen.getByText('Curator Recommendations')).not.toBeNull();
-    expect(screen.getByText('Quarantine & Review')).not.toBeNull();
+    expect(screen.getByText('What needs you')).not.toBeNull();
+    expect(screen.getByText('Safe to fix')).not.toBeNull();
+    expect(screen.getByText('Needs your call')).not.toBeNull();
+    expect(screen.getByText('Review only')).not.toBeNull();
 
-    // Verify counts populated from mockFindingGroups
     await waitFor(() => {
-      expect(screen.getByText('42 Ready')).not.toBeNull();
-      expect(screen.getByText('8 Suggestions')).not.toBeNull();
-      expect(screen.getByText('⚠️ 3 In Quarantine')).not.toBeNull();
+      expect(screen.getByText('42 ready')).not.toBeNull();
+      expect(screen.getByText('3 to decide')).not.toBeNull();
+      expect(screen.getByText('8 to look at')).not.toBeNull();
     });
+    // each card names the types inside it
+    const chips = [...document.querySelectorAll('.operations-triage-type')].map((el) =>
+      el.textContent?.trim(),
+    );
+    expect(chips).toEqual(['Missing Lyrics42', 'Corrupt Audio3', 'Canonical Version8']);
   });
 
-  it('triggers safe bulk fix when "Apply All Safe Fixes" is clicked', async () => {
+  it('shows the same health score advanced mode does', async () => {
+    // 42 info (0.02 each) + 3 errors (1 each) + 8 info over a 1,000 track
+    // library: 100 - (0.84 + 3 + 0.16) = 96. the old simple-mode number was
+    // (1000 - 53) / 1000 = 95%, and advanced said something else again.
+    render(
+      <OperationsStudio
+        jobs={testJobs}
+        progress={{}}
+        runs={[]}
+        trackCount={1000}
+        onChanged={vi.fn()}
+        onShowFindings={vi.fn()}
+        onSwitchToAdvanced={vi.fn()}
+      />,
+    );
+    await waitFor(() =>
+      expect(document.querySelector('.operations-exec-num')?.textContent).toBe('96'),
+    );
+    expect(document.querySelector('.operations-exec-status')?.textContent).toBe('healthy');
+    expect(screen.getByText('53 open findings')).not.toBeNull();
+  });
+
+  it('opens a type straight from its chip', async () => {
+    const onShowFindings = vi.fn();
+    render(
+      <OperationsStudio
+        jobs={testJobs}
+        progress={{}}
+        runs={[]}
+        onChanged={vi.fn()}
+        onShowFindings={onShowFindings}
+        onSwitchToAdvanced={vi.fn()}
+      />,
+    );
+    await waitFor(() =>
+      expect(document.querySelectorAll('.operations-triage-type').length).toBe(3),
+    );
+    fireEvent.click(document.querySelectorAll('.operations-triage-type')[1]);
+    expect(onShowFindings).toHaveBeenCalledWith('', { findingType: 'corrupt_audio' });
+  });
+
+  it('triggers the safe fix-all when "Fix all" is clicked', async () => {
     routes({
       '/api/repair/findings/groups': { groups: mockFindingGroups },
       '/api/repair/findings/bulk-fix-start': { started: true, total: 42 },
@@ -214,11 +259,10 @@ describe('OperationsStudio (Simple Mode)', () => {
     );
 
     await waitFor(() => {
-      expect(screen.getAllByText('⚡ Apply All 42 Safe Fixes').length).toBeGreaterThan(0);
+      expect(screen.getByText('Fix all 42')).not.toBeNull();
     });
 
-    const safeBtns = screen.getAllByText('⚡ Apply All 42 Safe Fixes');
-    fireEvent.click(safeBtns[0]);
+    fireEvent.click(screen.getByText('Fix all 42'));
 
     await waitFor(() => {
       const calls = fetchMock.mock.calls.map((c) => String(c[0]));
@@ -252,13 +296,17 @@ describe('OperationsStudio (Simple Mode)', () => {
       />,
     );
 
-    expect(screen.getByText('Active Operation Telemetry')).not.toBeNull();
-    expect(screen.getByText('Audio Corruption Detector')).not.toBeNull();
+    expect(screen.getByText('Running now')).not.toBeNull();
+    expect(document.querySelector('.operations-live-hud-name')?.textContent).toBe(
+      'Audio Corruption Detector',
+    );
     expect(screen.getByText('Verifying FLAC frame signatures…')).not.toBeNull();
-    expect(screen.getByText('⏹ Stop Operation')).not.toBeNull();
+    expect(screen.getByText('⏹ Stop')).not.toBeNull();
   });
 
-  it('navigates with severity filtering when Quarantine or Suggestions is clicked', async () => {
+  it('opens the biggest type in each bucket when Quarantine or Suggestions is clicked', async () => {
+    // the buckets are destructive / fixable, not severity. a severity filter
+    // showed something other than what the card counted (orphans are 'info')
     const onShowFindings = vi.fn();
     render(
       <OperationsStudio
@@ -272,14 +320,19 @@ describe('OperationsStudio (Simple Mode)', () => {
     );
 
     await waitFor(() => {
-      expect(screen.getByText('Review Suggestions ➔')).not.toBeNull();
+      expect(screen.getByText('Review Canonical Version →')).not.toBeNull();
     });
 
-    fireEvent.click(screen.getByText('Review Suggestions ➔'));
-    expect(onShowFindings).toHaveBeenCalledWith('', { severity: 'info' });
+    await waitFor(() => {
+      expect(screen.getByText('Review Canonical Version →').closest('button')?.disabled).toBe(
+        false,
+      );
+    });
+    fireEvent.click(screen.getByText('Review Canonical Version →'));
+    expect(onShowFindings).toHaveBeenCalledWith('', { findingType: 'canonical_version' });
 
-    fireEvent.click(screen.getByText('🛡️ Inspect Quarantine ➔'));
-    expect(onShowFindings).toHaveBeenCalledWith('', { severity: 'error' });
+    fireEvent.click(screen.getByText('Review Corrupt Audio →'));
+    expect(onShowFindings).toHaveBeenCalledWith('', { findingType: 'corrupt_audio' });
   });
 
   it('renders all 1-Click Playbooks', () => {
@@ -322,7 +375,7 @@ describe('OperationsStudio (Simple Mode)', () => {
     await waitFor(() => {
       expect(toastSpy).toHaveBeenCalledWith(
         expect.stringContaining('Audio Fidelity Sweep'),
-        'info',
+        'success',
       );
     });
   });
@@ -335,12 +388,12 @@ describe('OperationsStudio (Simple Mode)', () => {
         'album_tag_consistency',
         'missing_lyrics',
         'missing_cover_art',
-        'duplicate_detector',
+        'empty_folder_cleaner',
       ],
     ],
     [
       'Audio Fidelity Sweep',
-      ['audio_corruption_detector', 'fake_lossless_detector', 'quality_upgrade_scanner'],
+      ['audio_corruption_detector', 'fake_lossless_detector', 'short_preview_track'],
     ],
     [
       'Metadata Polish',
@@ -353,9 +406,7 @@ describe('OperationsStudio (Simple Mode)', () => {
     const catalogueIds = [
       'audio_corruption_detector',
       'fake_lossless_detector',
-      'quality_upgrade_scanner',
       'short_preview_track',
-      'duplicate_detector',
       'album_tag_consistency',
       'comma_artist_splitter',
       'genre_cleanup',

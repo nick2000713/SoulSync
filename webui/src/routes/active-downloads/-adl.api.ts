@@ -1,3 +1,5 @@
+import type { ResponsePromise } from 'ky';
+
 import { apiClient, readJson } from '@/app/api-client';
 
 import type {
@@ -58,6 +60,22 @@ export async function fetchTaskDetail(taskId: string): Promise<AdlTaskDetail | n
   }
 }
 
+/**
+ * How many downloads the history holds, for the header's History button.
+ * One row asked for, only the total read. null on any failure: the button
+ * just shows no number.
+ */
+export async function fetchMusicHistoryCount(): Promise<number | null> {
+  try {
+    const data = await readJson<{ success?: boolean; total?: number }>(
+      apiClient.get('library/history', { searchParams: { type: 'download', limit: 1 } }),
+    );
+    return data?.success && typeof data.total === 'number' ? data.total : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Completed batches for the history rail — 7 days, 50 max, as the vanilla asked. */
 export async function fetchBatchHistory(): Promise<AdlBatchHistoryEntry[]> {
   try {
@@ -112,22 +130,36 @@ export async function fetchReviewQueueSummary(): Promise<AdlReviewSummary | null
   }
 }
 
+/** Page size for the paginated quarantine list. */
+export const QUARANTINE_PAGE_SIZE = 100;
+
 /**
- * The list, or the reason it could not be fetched. Failure must be
- * distinguishable from empty: the server reads one sidecar per entry, so a
- * big quarantine can outlast ky's 10s default - swallowing that into []
- * showed "hundreds in the badge, list empty" (user report, aug 25).
+ * The list (or one page of it), or the reason it could not be fetched.
+ * Failure must be distinguishable from empty: the server reads one sidecar
+ * per entry, so a big quarantine can outlast ky's 10s default - swallowing
+ * that into [] showed "hundreds in the badge, list empty" (user report,
+ * aug 25). When `page` is given the server slices before annotating, so
+ * only that page pays the library-presence cost; `total` is the full
+ * count and falls back to the page length when the server omits it.
  */
-export async function fetchQuarantine(): Promise<
-  { entries: AdlQuarantineEntry[] } | { error: string }
-> {
+export async function fetchQuarantine(page?: {
+  limit: number;
+  offset: number;
+}): Promise<{ entries: AdlQuarantineEntry[]; total: number } | { error: string }> {
   try {
     const data = await readJson<{
       success?: boolean;
       error?: string;
       entries?: AdlQuarantineEntry[];
-    }>(apiClient.get('quarantine/list', { timeout: 60000 }));
-    if (data?.success && Array.isArray(data.entries)) return { entries: data.entries };
+      total?: number;
+    }>(
+      apiClient.get('quarantine/list', {
+        timeout: 60000,
+        ...(page ? { searchParams: { limit: page.limit, offset: page.offset } } : {}),
+      }),
+    );
+    if (data?.success && Array.isArray(data.entries))
+      return { entries: data.entries, total: data.total ?? data.entries.length };
     return { error: data?.error || 'the server said no' };
   } catch (error) {
     return { error: error instanceof Error ? error.message : String(error) };
@@ -273,6 +305,18 @@ export function verificationApprove(historyId: string): Promise<AdlResult> {
 export function verificationDelete(historyId: string): Promise<AdlResult> {
   return readJson<AdlResult>(
     apiClient.post(`verification/${encodeURIComponent(historyId)}/delete`),
+  );
+}
+
+export interface WrongSongResult extends AdlResult {
+  /** the song that was asked for, back on the wishlist to search for again. */
+  wishlist_track?: { id: string; name: string; artist?: string; album?: string };
+}
+
+/** reject the file like a delete, and put the asked-for song back on the wishlist. */
+export function verificationWrongSong(historyId: string): Promise<WrongSongResult> {
+  return readJson<WrongSongResult>(
+    apiClient.post(`verification/${encodeURIComponent(historyId)}/wrong-song`),
   );
 }
 
@@ -496,4 +540,164 @@ export function slskdClientCancel(
   return readJson<AdlResult>(
     apiClient.post('clients/slskd/action', { json: { id, username, action: 'cancel', remove } }),
   );
+}
+
+// ── Match & import ──────────────────────────────────────────────────────────
+// A download in the client that SoulSync didn't send, matched by hand and then
+// handed to the same tracking the matching grab would have written.
+
+export type MatchKind = 'album' | 'track' | 'movie' | 'episode' | 'season' | 'audiobook';
+
+export interface MatchSuggestion {
+  kind: MatchKind | null;
+  query: string;
+  year: number | null;
+  season: number | null;
+  episode: number | null;
+}
+
+/** A first guess at the type and search, from the release name. */
+export async function fetchMatchSuggestion(name: string): Promise<MatchSuggestion> {
+  try {
+    const data = await readJson<MatchSuggestion & AdlResult>(
+      apiClient.get('clients/match/suggest', { searchParams: { name } }),
+    );
+    return {
+      kind: data.kind ?? null,
+      query: data.query || name,
+      year: data.year ?? null,
+      season: data.season ?? null,
+      episode: data.episode ?? null,
+    };
+  } catch {
+    return { kind: null, query: name, year: null, season: null, episode: null };
+  }
+}
+
+export interface MatchFiles {
+  visible: boolean;
+  reportedPath: string;
+}
+
+/** A Soulseek match is a folder: who it is from and the transfers in it. */
+export interface SoulseekFolder {
+  username: string;
+  files: { filename: string; size: number }[];
+}
+
+/** Whether SoulSync can read the download's files. null when it couldn't ask. */
+export async function fetchMatchFiles(
+  client: 'torrent' | 'usenet' | 'soulseek',
+  id: string,
+  folder?: SoulseekFolder,
+): Promise<MatchFiles | null> {
+  try {
+    const searchParams = new URLSearchParams({ client, id });
+    if (folder) {
+      searchParams.set('username', folder.username);
+      for (const file of folder.files) searchParams.append('file', file.filename);
+    }
+    const data = await readJson<{ visible?: boolean; reported_path?: string } & AdlResult>(
+      apiClient.get('clients/match/files', { searchParams }),
+    );
+    if (!data.success) return null;
+    return { visible: Boolean(data.visible), reportedPath: data.reported_path || '' };
+  } catch {
+    return null;
+  }
+}
+
+export interface VideoSearchHit {
+  kind: 'movie' | 'show' | 'person';
+  tmdb_id: number;
+  title: string;
+  year?: string | null;
+  poster?: string | null;
+}
+
+/** TMDB movies and shows, the same search the video pages use. */
+export async function searchVideoTitles(query: string): Promise<VideoSearchHit[]> {
+  if (!query.trim()) return [];
+  try {
+    const data = await readJson<{ results?: VideoSearchHit[] }>(
+      apiClient.get('video/search', { searchParams: { q: query.trim() } }),
+    );
+    return (data.results ?? []).filter((r) => r.kind === 'movie' || r.kind === 'show');
+  } catch {
+    return [];
+  }
+}
+
+export interface MatchOutcome {
+  ok: boolean;
+  error: string;
+}
+
+async function submitMatch(call: () => ResponsePromise): Promise<MatchOutcome> {
+  try {
+    const data = await readJson<{ ok?: boolean; success?: boolean; error?: string }>(call());
+    const ok = Boolean(data.ok ?? data.success);
+    return { ok, error: ok ? '' : data.error || 'The match was not accepted.' };
+  } catch (err) {
+    // readJson carries the server's reason (already followed, no library folder)
+    return { ok: false, error: err instanceof Error ? err.message : 'The match failed.' };
+  }
+}
+
+export function adoptAudiobook(body: {
+  source: 'torrent' | 'usenet' | 'soulseek';
+  client_ref: string;
+  /** soulseek only: the folder's peer and remote filenames */
+  username?: string;
+  files?: string[];
+  asin: string;
+  release_title: string;
+  size_bytes: number;
+}): Promise<MatchOutcome> {
+  return submitMatch(() => apiClient.post('audiobooks/adopt', { json: body }));
+}
+
+export function adoptVideo(body: {
+  source: 'torrent' | 'usenet' | 'soulseek';
+  client_ref: string;
+  /** soulseek only: the folder's peer and files */
+  username?: string;
+  files?: { filename: string; size: number }[];
+  kind: 'movie' | 'show';
+  title: string;
+  year?: string | number | null;
+  media_id: number;
+  media_source: 'tmdb';
+  poster_url?: string | null;
+  release_title: string;
+  size_bytes: number;
+  search_ctx: {
+    scope: 'movie' | 'episode' | 'season';
+    title: string;
+    year?: string | number | null;
+    season?: number | null;
+    episode?: number | null;
+  };
+}): Promise<MatchOutcome> {
+  return submitMatch(() => apiClient.post('video/downloads/adopt', { json: body }));
+}
+
+export function matchMusic(body: {
+  client: 'torrent' | 'usenet' | 'soulseek';
+  id: string;
+  /** soulseek only: the folder's peer and remote filenames */
+  username?: string;
+  files?: string[];
+  kind: 'album' | 'track';
+  match: {
+    id: string;
+    name: string;
+    artist: string;
+    source: string;
+    image_url?: string | null;
+    album?: string | null;
+  };
+  release_title: string;
+}): Promise<MatchOutcome> {
+  return submitMatch(() => apiClient.post('clients/match/music', { json: body }));
 }

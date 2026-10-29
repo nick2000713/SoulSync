@@ -50,6 +50,10 @@ _ALLOWED_GET = frozenset({
     '/api/profiles/current',
     '/api/setup/status',
     '/api/auth/recovery-question',
+    '/api/auth/plex/available',      # sign in with plex: show the button or not
+    '/api/auth/oidc/available',      # sign in with oidc: show the button, last error
+    '/api/auth/oidc/start',          # sign in with oidc: off to the provider
+    '/api/auth/oidc/callback',       # sign in with oidc: back from the provider
 })
 
 _ALLOWED_POST = frozenset({
@@ -60,16 +64,24 @@ _ALLOWED_POST = frozenset({
     '/api/auth/login',
     '/api/auth/logout',
     '/api/auth/recovery-reset',
+    '/api/auth/plex/start',          # sign in with plex: the pin, bound to this session
+    '/api/auth/plex/check',          # sign in with plex: poll it, sign in on approval
 })
 
 
 def is_open_profile_path(path: str, method: str) -> bool:
     """paths every gate leaves open: accepting an invite link (the token is
-    the credential, an admin minted it) and a profile's avatar image, which
-    the picker draws before anyone is signed in."""
+    the credential, an admin minted it), a profile's video calendar feed (same,
+    its token), and a profile's avatar image, which the picker draws before
+    anyone is signed in."""
     import re
     method = (method or 'GET').upper()
     if path.startswith('/api/invite/') and method in ('GET', 'POST'):
+        return True
+    # the video calendar's iCal feed: calendar apps fetch it with no cookie, and
+    # the token in the path is the credential (the route refuses unknown ones)
+    from core.video.calendar_feed import is_feed_path
+    if is_feed_path(path, method):
         return True
     return method == 'GET' and re.fullmatch(r'/api/profiles/\d+/avatar', path or '') is not None
 
@@ -94,4 +106,18 @@ def no_profile_request_is_blocked(path: str, method: str) -> bool:
     return True
 
 
-__all__ = ['resolve_session_profile', 'no_profile_request_is_blocked', 'is_open_profile_path']
+def client_gate_rules() -> dict:
+    """the rules above, for profile-api-gate.js. the browser holds a call the
+    server would 401 until a profile is picked, and needs the same open list:
+    a path missing from a copy would hang the picker (#1763)."""
+    from core.permissions import PAGE_EXCLUSIVE_APIS
+    return {
+        'data_prefixes': list(_DATA_PREFIXES),
+        'open_get': sorted(_ALLOWED_GET),
+        'open_post': sorted(_ALLOWED_POST),
+        'page_apis': [list(pair) for pair in PAGE_EXCLUSIVE_APIS],
+    }
+
+
+__all__ = ['resolve_session_profile', 'no_profile_request_is_blocked', 'is_open_profile_path',
+           'client_gate_rules']

@@ -27,11 +27,14 @@
  * empty and hidden, exactly as the markup has it, and the vanilla paints it.
  */
 
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 
 import type { BeatportGenre } from '../-beatport.api';
+import type { BeatportDownloadEnv } from '../-beatport.downloads';
+import type { BeatportListRequest } from '../-beatport.lists';
 
-import { defaultBeatportDownloadEnv, openBeatportTop100 } from '../-beatport.downloads';
+import { defaultBeatportDownloadEnv } from '../-beatport.downloads';
+import { importBeatportList } from '../-beatport.lists';
 import {
   BeatportDJChartsSection,
   BeatportFeaturedChartsSection,
@@ -42,15 +45,43 @@ import {
 import { BeatportTop10Lists, BeatportTop10Releases } from './beatport-top10';
 import { GenreBrowserModal } from './genre-browser-modal';
 import { GenrePage } from './genre-page';
+import { useImporter } from './use-importer';
 
 export function BeatportTab() {
   /**
-   * ONE env for the whole tab. `defaultBeatportDownloadEnv()` builds a bag of
-   * injected vanilla functions (toast, overlay, openDownloadModal); rebuilding
-   * it per render would hand every section a new object each time, and the
-   * modal-open latch inside the download module is keyed on nothing else.
+   * every chart-type list imports into SoulSync and lands on it (a release
+   * still opens its album download). the importer changes every render; the
+   * env must not, or every section would get a new object, so the list
+   * opener reads it through a ref.
    */
-  const env = useMemo(() => defaultBeatportDownloadEnv(), []);
+  const importer = useImporter();
+  const importerRef = useRef(importer);
+  importerRef.current = importer;
+
+  /**
+   * ONE env for the whole tab. `defaultBeatportDownloadEnv()` builds a bag of
+   * injected vanilla functions (toast, overlay, openDownloadModal) for the
+   * release cards; `openList` imports every chart-type list.
+   */
+  const env = useMemo<BeatportDownloadEnv>(
+    () => ({
+      ...defaultBeatportDownloadEnv(),
+      openList: (request: BeatportListRequest) => {
+        const key = request.ref || request.url;
+        if (!key) {
+          window.showToast?.(`No link for ${request.label}`, 'error');
+          return;
+        }
+        void importerRef.current.importOrOpen({
+          source: 'beatport',
+          sourceId: key,
+          name: request.label,
+          save: () => importBeatportList(request),
+        });
+      },
+    }),
+    [],
+  );
 
   const [browsingGenres, setBrowsingGenres] = useState(false);
   const [genre, setGenre] = useState<BeatportGenre | null>(null);
@@ -79,9 +110,9 @@ export function BeatportTab() {
     <div id="beatport-rebuild-content" className="beatport-tab-content active">
       <BeatportHeroSection env={env} />
 
-      {/* 2846-2861. Three buttons, and none of them switches an inner view:
-          Browse by Genre opens the modal, and both Top 100s scrape, enrich and
-          hand off to the download modal (beatport-ui.js 2161 / 2197). */}
+      {/* Three buttons, and none of them switches an inner view: Browse by
+          Genre opens the modal, and both Top 100s open as playlists to
+          identify, then sync or download. */}
       <div className="beatport-nav-buttons-section">
         <div className="beatport-nav-buttons-container">
           <button
@@ -97,7 +128,7 @@ export function BeatportTab() {
             type="button"
             className="beatport-nav-button"
             id="beatport-top100-btn"
-            onClick={() => void openBeatportTop100('beatport', env)}
+            onClick={() => env.openList?.({ ref: 'top-100', label: 'Beatport Top 100' })}
           >
             <span className="beatport-nav-icon top100-icon" />
             <span className="beatport-nav-text">Beatport Top 100</span>
@@ -106,7 +137,7 @@ export function BeatportTab() {
             type="button"
             className="beatport-nav-button"
             id="hype-top100-btn"
-            onClick={() => void openBeatportTop100('hype', env)}
+            onClick={() => env.openList?.({ ref: 'hype-100', label: 'Hype Top 100' })}
           >
             <span className="beatport-nav-icon hype-icon" />
             <span className="beatport-nav-text">Hype Top 100</span>

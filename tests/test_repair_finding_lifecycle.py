@@ -126,7 +126,9 @@ def test_pending_rescan_refreshes_the_snapshot_instead_of_skipping(worker):
     rows = _rows(worker)
     assert len(rows) == 1, "a rescan must not duplicate the row"
     assert rows[0][2] == 'still gone, now 3 days'
-    assert json.loads(rows[0][3]) == {'v': 2}
+    refreshed = json.loads(rows[0][3])
+    assert refreshed['v'] == 2
+    assert refreshed['_dedup_fingerprint']
 
 
 def test_dismissed_suppresses_forever(worker):
@@ -502,7 +504,7 @@ def test_bulk_progress_tallies_per_type(worker):
                              'errors': [], 'error': None, 'per_type': {}}
     worker._bulk_fix_stop_event = type('E', (), {'is_set': lambda self: False})()
     worker.should_stop = False
-    worker.fix_finding = lambda fid, fix_action=None: {'success': fid == ids[0]}
+    worker.fix_finding = lambda fid, fix_action=None, **kwargs: {'success': fid == ids[0]}
 
     worker._run_bulk_fix(ids)
     per_type = worker._bulk_fix_state['per_type']

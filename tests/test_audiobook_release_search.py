@@ -468,6 +468,41 @@ def test_a_failing_indexer_does_not_raise():
     assert search_releases(BOOK, prowlarr_client=Boom()) == []
 
 
+def test_an_indexer_outage_is_not_an_empty_shelf_for_the_wishlist():
+    """Prowlarr answers HTTP 400 to every search while it holds an indexer back.
+    search_all_sources must raise, or the wishlist logs 'No releases found' and
+    counts an attempt for a book nobody looked for."""
+    from core.audiobook_release_search import search_all_sources
+
+    class Boom(_StubProwlarr):
+        async def search(self, query, categories=None, limit=None, **kwargs):
+            raise RuntimeError("Prowlarr returned HTTP 400")
+
+    with patch("core.audiobook_release_search.configured_chain", return_value=["usenet"]):
+        with pytest.raises(RuntimeError, match="HTTP 400"):
+            search_all_sources(BOOK, prowlarr_client=Boom())
+
+
+def test_a_real_empty_answer_is_still_an_empty_shelf():
+    from core.audiobook_release_search import search_all_sources
+
+    with patch("core.audiobook_release_search.configured_chain", return_value=["usenet"]):
+        assert search_all_sources(BOOK, prowlarr_client=_StubProwlarr([[]])) == []
+
+
+def test_one_answered_query_is_enough_to_not_raise():
+    class Flaky(_StubProwlarr):
+        calls = 0
+
+        async def search(self, query, categories=None, limit=None, **kwargs):
+            Flaky.calls += 1
+            if Flaky.calls == 1:
+                raise RuntimeError("blip")
+            return []
+
+    assert search_releases(BOOK, prowlarr_client=Flaky(), raise_on_outage=True) == []
+
+
 def test_a_book_with_no_title_never_searches():
     stub = _StubProwlarr()
     assert search_releases({"title": ""}, prowlarr_client=stub) == []
@@ -1530,3 +1565,42 @@ def test_single_word_title_without_author_penalized():
     assert len(ranked) == 1
     assert ranked[0].title == real_book.title
 
+
+# a book SOLD in parts (graphicaudio's "The Reckoning (Part 1 of 2)") is its
+# own catalogue entry with its own runtime. the posting of that part is the
+# whole thing, not a fragment, and the other part is a different product.
+RECKONING_PART_1 = {
+    "asin": "B0RECKON01",
+    "title": "The Reckoning (Part 1 of 2) (Dramatized Adaptation)",
+    "author_names": ["Caroline Peckham", "Susanne Valenti"],
+    "narrator_names": [],
+    "runtime_minutes": 398,
+    "series": [],
+}
+
+
+def test_the_books_own_part_is_not_a_fragment():
+    release = _release(
+        "The Reckoning (Part 1 of 2) by Caroline Peckham, Susanne Valenti [ENG / M4B] [VIP]")
+    ranked = rank_releases([release], RECKONING_PART_1, 0.0, "any")
+    assert len(ranked) == 1
+    assert ranked[0].part_verdict == "match"
+    assert "will not import" not in ranked[0].short_warning
+
+
+def test_the_other_part_is_dropped_not_grabbed():
+    # the automatic wishlist grabs whatever ranks first, so a part 2 posting
+    # must never stand in for the part 1 book
+    part_1 = _release(
+        "The Reckoning (Part 1 of 2) by Caroline Peckham, Susanne Valenti [ENG / M4B] [VIP]")
+    part_2 = _release(
+        "The Reckoning (Part 2 of 2) by Caroline Peckham, Susanne Valenti [ENG / M4B] [VIP]",
+        guid="guid-2")
+    ranked = rank_releases([part_2, part_1], RECKONING_PART_1, 0.0, "any")
+    assert [r.guid for r in ranked] == ["guid-1"]
+
+
+def test_a_whole_book_still_warns_about_a_part_posting():
+    warning = rank_releases([_release("The Way of Kings (1 of 5)")], BOOK, 0.0, "any")[0]
+    assert warning.part_verdict == "unknown"
+    assert "will not import" in warning.short_warning

@@ -7,11 +7,32 @@ from core.library.navidrome_identity import read_inventory, resolve_tracks, repa
 
 
 def _old_db(path='/song'):
+    """One Navidrome-mapped catalogue track, as the scan leaves it.
+
+    The song id is not the row id here: it lives in lib2_media_server_mappings,
+    with lib2_tracks.server_source/server_id as the compatibility projection.
+    """
     import sqlite3
     conn = sqlite3.connect(':memory:')
     conn.row_factory = sqlite3.Row
-    conn.execute('CREATE TABLE tracks(id TEXT, file_path TEXT, title TEXT, duration INTEGER, server_source TEXT)')
-    conn.execute("INSERT INTO tracks VALUES ('old', ?, 'Song', 180000, 'navidrome')", (path,))
+    conn.executescript("""
+        CREATE TABLE lib2_tracks(id INTEGER PRIMARY KEY, title TEXT, duration INTEGER,
+                                 server_source TEXT, server_id TEXT, updated_at TEXT);
+        CREATE TABLE lib2_track_files(id INTEGER PRIMARY KEY, track_id INTEGER, path TEXT,
+                                      is_primary INTEGER DEFAULT 1,
+                                      file_state TEXT DEFAULT 'active');
+        CREATE TABLE lib2_media_server_mappings(
+            id INTEGER PRIMARY KEY, entity_type TEXT NOT NULL, entity_id INTEGER NOT NULL,
+            server_source TEXT NOT NULL, server_id TEXT NOT NULL, last_seen_at TEXT,
+            UNIQUE(entity_type, entity_id, server_source),
+            UNIQUE(entity_type, server_source, server_id));
+    """)
+    conn.execute("INSERT INTO lib2_tracks(id,title,duration,server_source,server_id)"
+                 " VALUES(1,'Song',180000,'navidrome','old')")
+    conn.execute("INSERT INTO lib2_track_files(track_id,path) VALUES(1,?)", (path,))
+    conn.execute("INSERT INTO lib2_media_server_mappings"
+                 "(entity_type,entity_id,server_source,server_id)"
+                 " VALUES('track',1,'navidrome','old')")
     conn.commit()
     return SimpleNamespace(_get_connection=lambda: conn)
 
@@ -33,6 +54,23 @@ def test_inventory_rejects_scanning():
     assert client._make_request.call_count == 1
 
 
+def test_playlist_write_waits_out_a_running_scan(monkeypatch):
+    """A scan running when the write starts (downloads trigger them) is waited
+    out, not a refusal that throws the whole sync away."""
+    import core.library.navidrome_identity as identity
+    monkeypatch.setattr(identity.time, 'sleep', lambda s: None)
+    client, current, writes = _server(monkeypatch)
+    request = client._make_request
+    scans = iter([True, True])
+    def scanning_at_first(endpoint, params=None, timeout=None):
+        if endpoint == 'getScanStatus' and next(scans, False):
+            return {'scanStatus': {'scanning': True, 'count': 1}}
+        return request(endpoint, params, timeout)
+    client._make_request = scanning_at_first
+    assert client.create_playlist(name='P', tracks=[SimpleNamespace(ratingKey='old')], playlist_id='pl')
+    assert current == ['new']
+
+
 def test_resolve_stale_id_by_unique_exact_path():
     db = _old_db('/music/song.opus')
     result = resolve_tracks([SimpleNamespace(ratingKey='old')], {'new': {'id': 'new', 'title': 'Song', 'path': '/music/song.opus'}}, db)
@@ -46,22 +84,75 @@ def test_unresolved_or_ambiguous_aborts(songs):
         resolve_tracks([SimpleNamespace(ratingKey='old')], songs, db)
 
 
-def test_repair_preserves_enrichment_and_manual_match(tmp_path):
+def test_repair_repoints_the_mapping_and_the_manual_match(tmp_path):
+    """A reissued id moves the MAPPING; the catalogue row never moves.
+
+    Upstream merges two legacy `tracks` rows here and copies every enrichment
+    column across. On the v2 catalogue the track keeps its identity, so nothing
+    has to be preserved by hand -- the stale Navidrome id is re-pointed, the
+    compatibility projection follows it, and the manual match (which stores the
+    SERVER's id, see services/sync_service.py) is healed with it.
+    """
     from database.music_database import MusicDatabase
+    from tests.support.catalogue_seed import seed_library_track
+
     db = MusicDatabase(tmp_path / 'test.db')
     with db._get_connection() as c:
-        c.execute("INSERT INTO artists(id,name,server_source) VALUES('artist','Artist','navidrome')")
-        c.execute("INSERT INTO albums(id,artist_id,title,server_source) VALUES('album','artist','Album','navidrome')")
-        for tid in ('old', 'new'):
-            c.execute("INSERT INTO tracks(id,album_id,artist_id,title,file_path,server_source) VALUES(?, 'album','artist','Song','/song','navidrome')", (tid,))
-        c.execute("UPDATE tracks SET spotify_track_id='source' WHERE id='old'")
+        track_id = seed_library_track(
+            c, artist='Artist', album='Album', title='Song',
+            track_server_id='old', file_path='/song', duration=180000,
+            server_source='navidrome')
+        c.execute("INSERT INTO lib2_media_server_mappings"
+                  "(entity_type,entity_id,server_source,server_id)"
+                  " VALUES('track',?,'navidrome','old')", (track_id,))
         c.commit()
     db.save_manual_library_match(1, 'spotify', 'source', 'old', server_source='navidrome')
+
+    songs = {'new': {'id': 'new', 'title': 'Song', 'path': '/song'}}
+    assert repair_rekeyed_tracks(db, songs) == 1
+    with db._get_connection() as c:
+        assert c.execute(
+            "SELECT server_id FROM lib2_media_server_mappings"
+            " WHERE entity_type='track' AND server_source='navidrome'").fetchone()[0] == 'new'
+        assert c.execute("SELECT id, server_id FROM lib2_tracks").fetchone()[:] == (track_id, 'new')
+        assert str(c.execute(
+            "SELECT library_track_id FROM manual_library_track_matches").fetchone()[0]) == 'new'
+    # idempotent: the id is live now, so there is nothing left to repair
+    assert repair_rekeyed_tracks(db, songs) == 0
+
+
+def test_repair_drops_a_stale_mapping_when_the_live_id_is_already_filed(tmp_path):
+    """The sync can file the reissued id on a twin row before this runs.
+
+    UNIQUE(entity_type, server_source, server_id) forbids a second claim on it,
+    and folding two catalogue rows is core/library2/dedup_repair.py's job. The
+    obsolete mapping goes; both catalogue rows stay exactly where they are.
+    """
+    from database.music_database import MusicDatabase
+    from tests.support.catalogue_seed import seed_library_track
+
+    db = MusicDatabase(tmp_path / 'test.db')
+    with db._get_connection() as c:
+        stale = seed_library_track(
+            c, artist='Artist', album='Album', title='Song', artist_server_id='ar1',
+            album_server_id='al1', track_server_id='old', file_path='/song',
+            duration=180000, server_source='navidrome')
+        twin = seed_library_track(
+            c, artist='Artist', album='Album', title='Song', artist_server_id='ar1',
+            album_server_id='al1', track_server_id='new', file_path='/song',
+            duration=180000, server_source='navidrome')
+        for track_id, server_id in ((stale, 'old'), (twin, 'new')):
+            c.execute("INSERT INTO lib2_media_server_mappings"
+                      "(entity_type,entity_id,server_source,server_id)"
+                      " VALUES('track',?,'navidrome',?)", (track_id, server_id))
+        c.commit()
+
     assert repair_rekeyed_tracks(db, {'new': {'id': 'new', 'title': 'Song', 'path': '/song'}}) == 1
     with db._get_connection() as c:
-        assert c.execute("SELECT id,spotify_track_id FROM tracks").fetchall()[0][:] == ('new', 'source')
-        assert str(c.execute("SELECT library_track_id FROM manual_library_track_matches").fetchone()[0]) == 'new'
-    assert repair_rekeyed_tracks(db, {'new': {'id': 'new', 'title': 'Song', 'path': '/song'}}) == 0
+        assert [r[0] for r in c.execute(
+            "SELECT server_id FROM lib2_media_server_mappings"
+            " WHERE entity_type='track' AND server_source='navidrome'")] == ['new']
+        assert c.execute("SELECT COUNT(*) FROM lib2_tracks").fetchone()[0] == 2
 
 
 def _server(monkeypatch, *, drop=False, inventory_failure=False):
@@ -136,6 +227,120 @@ def test_append_keeps_existing_tracks_and_deduplicates_recovered_id(monkeypatch)
     assert not writes
 
 
+# #1715: one song navidrome no longer has (deleted from review) blocked every
+# other track on the playlist, sync after sync.
+def test_a_dead_id_is_skipped_not_fatal():
+    skipped = []
+    songs = {'live': {'id': 'live', 'title': 'Song', 'path': '/live'}}
+    result = resolve_tracks([SimpleNamespace(ratingKey='live'), SimpleNamespace(ratingKey='gone')],
+                            songs, _old_db(), skipped)
+    assert [t.ratingKey for t in result] == ['live']
+    assert skipped == ['gone']
+
+
+def test_append_writes_the_good_tracks_past_a_dead_one(monkeypatch):
+    client, current, writes = _server(monkeypatch)
+    current[:] = ['extra']
+    assert client.append_to_playlist('P', [SimpleNamespace(ratingKey='new'), SimpleNamespace(ratingKey='gone')])
+    assert current == ['extra', 'new']
+    assert len(writes) == 1
+
+
+# #1754: the guard's drops used to exist only in this log line, so the sync
+# counted a deleted song as synced forever. The write now records them on
+# the client for the sync layer to read.
+def test_a_guarded_write_records_the_ids_it_skipped(monkeypatch):
+    client, current, writes = _server(monkeypatch)
+    current[:] = ['extra']
+    assert client.append_to_playlist('P', [SimpleNamespace(ratingKey='new'), SimpleNamespace(ratingKey='gone')])
+    assert client._last_validated_write_skipped == ['gone']
+    # a later clean write resets the record instead of leaking the old drops
+    assert client.append_to_playlist('P', [SimpleNamespace(ratingKey='new')])
+    assert client._last_validated_write_skipped == []
+
+
+def test_a_fresh_client_has_no_recorded_skips():
+    assert NavidromeClient()._last_validated_write_skipped == []
+
+
+def test_an_all_dead_write_still_records_its_drops(monkeypatch):
+    # every offered track is gone: resolve raises before the guard can
+    # hand the drops over inline, so the guard's failure path must —
+    # otherwise those tracks stay "matched" forever (#1754 review)
+    client, current, writes = _server(monkeypatch)
+    assert not client.append_to_playlist(
+        'P', [SimpleNamespace(ratingKey='gone1'), SimpleNamespace(ratingKey='gone2')])
+    assert sorted(client._last_validated_write_skipped) == ['gone1', 'gone2']
+    assert not writes
+
+
+def test_resolve_splits_proven_dead_from_ambiguous():
+    # 'gone' has no live candidate at all: proven dead. 'old' has TWO
+    # live songs at its stored path: a rekey might explain it, but
+    # nothing proves which — uncertainty must not read as deletion.
+    skipped, ambiguous = [], []
+    songs = {'live': {'id': 'live', 'title': 'Song', 'path': '/live'},
+             'a': {'id': 'a', 'title': 'Song', 'path': '/song'},
+             'b': {'id': 'b', 'title': 'Song', 'path': '/song'}}
+    result = resolve_tracks(
+        [SimpleNamespace(ratingKey='live'), SimpleNamespace(ratingKey='gone'),
+         SimpleNamespace(ratingKey='old')],
+        songs, _old_db(), skipped, ambiguous)
+    assert [t.ratingKey for t in result] == ['live']
+    assert skipped == ['gone']
+    assert ambiguous == ['old']
+
+
+def test_an_ambiguous_id_is_not_recorded_as_server_dead(monkeypatch):
+    import core.library.navidrome_identity as identity
+    songs = {'new': {'id': 'new', 'title': 'Song', 'path': '/new'},
+             'a': {'id': 'a', 'title': 'Song', 'path': '/song'},
+             'b': {'id': 'b', 'title': 'Song', 'path': '/song'}}
+    monkeypatch.setattr(identity, 'read_inventory',
+                        lambda client, scan_wait=0: songs)
+    client, current, writes = _server(monkeypatch)
+    current[:] = ['extra']
+    # 'old' (db row at /song) has two live candidates: left out of the
+    # write, but NOT recorded as dead — the sync layer must not wishlist
+    # or unmatch it on a guess (#1754)
+    assert client.append_to_playlist(
+        'P', [SimpleNamespace(ratingKey='new'), SimpleNamespace(ratingKey='old')])
+    assert current == ['extra', 'new']
+    assert client._last_validated_write_skipped == []
+
+
+def test_a_write_failing_before_resolution_clears_the_previous_record(monkeypatch):
+    client, current, writes = _server(monkeypatch)
+    current[:] = ['extra']
+    assert client.append_to_playlist('P', [SimpleNamespace(ratingKey='new'), SimpleNamespace(ratingKey='gone')])
+    assert client._last_validated_write_skipped == ['gone']
+    # the next write cannot even read the inventory: it must not leak the
+    # previous write's drops into a later sync's readback
+    request = client._make_request
+    def broken(endpoint, params=None, timeout=None):
+        if endpoint == 'search3':
+            return None
+        return request(endpoint, params, timeout)
+    client._make_request = broken
+    assert not client.append_to_playlist('P', [SimpleNamespace(ratingKey='other')])
+    assert client._last_validated_write_skipped == []
+
+
+def test_reconcile_with_a_dead_id_never_drops_what_is_there(monkeypatch):
+    # 'extra' could be the dead song under a new key, so nothing gets removed
+    client, current, writes = _server(monkeypatch)
+    assert not client.reconcile_playlist('P', [SimpleNamespace(ratingKey='new'), SimpleNamespace(ratingKey='gone')])
+    assert not writes
+    assert current == ['new', 'extra']
+
+
+def test_reconcile_with_a_dead_id_goes_ahead_when_nothing_would_drop(monkeypatch):
+    client, current, writes = _server(monkeypatch)
+    current[:] = ['new']
+    assert client.reconcile_playlist('P', [SimpleNamespace(ratingKey='new'), SimpleNamespace(ratingKey='gone')])
+    assert current == ['new']
+
+
 def test_no_matches_cannot_empty_a_playlist(monkeypatch):
     client, current, writes = _server(monkeypatch)
     assert not client.reconcile_playlist('P', [])
@@ -193,3 +398,101 @@ def test_reconcile_exception_does_not_trigger_replace():
     service = PlaylistSyncService.__new__(PlaylistSyncService)
     assert not service._reconcile_or_replace(client, 'P', [])
     client.update_playlist.assert_not_called()
+
+
+# #1571: soulsync stores its own mount (/Media/Media/Music/...), navidrome
+# reports its own (/music/...). Same file, different prefix.
+_LOCAL = '/Media/Media/Music/The Killers/The Killers - Hot Fuss (Limited Edition)/11 - Everything Will Be Alright.flac'
+_SERVER = '/music/The Killers/The Killers - Hot Fuss (Limited Edition)/11 - Everything Will Be Alright.flac'
+
+
+def test_resolve_stale_id_across_mount_prefixes():
+    db = _old_db(_LOCAL)
+    songs = {'live': {'id': 'live', 'title': 'Song', 'duration': 180, 'path': _SERVER}}
+    result = resolve_tracks([SimpleNamespace(ratingKey='old')], songs, db)
+    assert result[0].ratingKey == 'live'
+
+
+def test_shared_tail_across_mounts_still_aborts():
+    db = _old_db(_LOCAL)
+    songs = {
+        'a': {'id': 'a', 'title': 'Song', 'path': _SERVER},
+        'b': {'id': 'b', 'title': 'Song', 'path': '/other' + _SERVER},
+    }
+    with pytest.raises(IdentityError):
+        resolve_tracks([SimpleNamespace(ratingKey='old')], songs, db)
+
+
+def test_tail_match_still_needs_the_same_recording():
+    db = _old_db(_LOCAL)
+    songs = {'live': {'id': 'live', 'title': 'Other Song', 'path': _SERVER}}
+    with pytest.raises(IdentityError):
+        resolve_tracks([SimpleNamespace(ratingKey='old')], songs, db)
+
+
+def test_repair_repoints_a_mapping_whose_file_sits_in_the_local_mount(tmp_path):
+    """#1571 on Library v2: the catalogue file is in SoulSync's mount, Navidrome
+    reports its own; the artist/album/file tail still finds the reissued id."""
+    from database.music_database import MusicDatabase
+    from tests.support.catalogue_seed import seed_library_track
+
+    db = MusicDatabase(tmp_path / 'test.db')
+    with db._get_connection() as c:
+        track_id = seed_library_track(
+            c, artist='Artist', album='Album', title='Song',
+            track_server_id='old', file_path=_LOCAL, server_source='navidrome')
+        c.execute("INSERT INTO lib2_media_server_mappings"
+                  "(entity_type,entity_id,server_source,server_id)"
+                  " VALUES('track',?,'navidrome','old')", (track_id,))
+        c.commit()
+    assert repair_rekeyed_tracks(db, {'live': {'id': 'live', 'title': 'Song', 'path': _SERVER}}) == 1
+    with db._get_connection() as c:
+        assert c.execute(
+            "SELECT server_id FROM lib2_media_server_mappings"
+            " WHERE entity_type='track' AND server_source='navidrome'").fetchone()[0] == 'live'
+
+
+def test_resolve_follows_a_live_id_filed_for_the_same_local_file(tmp_path):
+    """#1573 on Library v2: the scan already filed the reissued id on another
+    catalogue row of the same local file -- that is the song, whatever path
+    the server reports for it."""
+    from database.music_database import MusicDatabase
+    from tests.support.catalogue_seed import seed_library_track
+
+    db = MusicDatabase(tmp_path / 'test.db')
+    with db._get_connection() as c:
+        for server_id in ('old', 'live'):
+            track_id = seed_library_track(
+                c, artist='Artist', album='Album', title='Song', artist_server_id='ar1',
+                album_server_id='al1', track_server_id=server_id,
+                file_path='/Media/Music/song.flac', server_source='navidrome')
+            c.execute("INSERT INTO lib2_media_server_mappings"
+                      "(entity_type,entity_id,server_source,server_id)"
+                      " VALUES('track',?,'navidrome',?)", (track_id, server_id))
+        c.commit()
+    songs = {'live': {'id': 'live', 'title': 'Song', 'path': '/srv/x/y/z.flac'}}
+    assert resolve_tracks([SimpleNamespace(ratingKey='old')], songs, db)[0].ratingKey == 'live'
+
+
+@pytest.mark.parametrize('second,expected', [
+    (None, False),          # one mapped row for the file: nothing to repair
+    ('active', True),       # the sync filed the reissued id beside the old one
+    ('deleted', False),     # a retired file row is not a second copy
+])
+def test_the_post_scan_precheck_reads_the_catalogue(second, expected):
+    """The repair runs only when two Navidrome-mapped catalogue tracks share one
+    live file. Upstream's pre-check reads the legacy `tracks` table, which a
+    fresh Library v2 install does not have, so it lives on the mappings here."""
+    from core.library.navidrome_identity import has_same_path_duplicates
+
+    db = _old_db()
+    conn = db._get_connection()
+    if second:
+        conn.execute("INSERT INTO lib2_tracks(id,title,duration,server_source,server_id)"
+                     " VALUES(2,'Song',180000,'navidrome','new')")
+        conn.execute("INSERT INTO lib2_track_files(track_id,path,file_state) VALUES(2,'/song',?)",
+                     (second,))
+        conn.execute("INSERT INTO lib2_media_server_mappings"
+                     "(entity_type,entity_id,server_source,server_id)"
+                     " VALUES('track',2,'navidrome','new')")
+    assert has_same_path_duplicates(db) is expected

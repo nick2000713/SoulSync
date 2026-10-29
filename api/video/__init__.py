@@ -38,7 +38,21 @@ def get_video_db():
                 # yield to an install that beat us to it.
                 if _video_db is None:
                     _video_db = db
+                    _seed_folder_defaults(db)
     return db
+
+
+def _seed_folder_defaults(db):
+    """docker: start unset video folders on the compose file's mounts"""
+    try:
+        from core.onboarding.environment import is_docker
+        from core.onboarding.paths import mount_points
+        from core.video.library_roots import seed_docker_defaults
+        seeded = seed_docker_defaults(db, docker=is_docker(), mounts=mount_points())
+        if seeded:
+            logger.info("video folders started on the compose defaults: %s", seeded)
+    except Exception as exc:   # noqa: BLE001 - a nicety, the folders can be set by hand
+        logger.debug("video folder defaults skipped: %s", exc)
 
 
 def create_video_blueprint() -> Blueprint:
@@ -61,6 +75,13 @@ def create_video_blueprint() -> Blueprint:
         from flask import request, g, jsonify
         path = request.path or ""
         writing = request.method in ("POST", "PUT", "PATCH", "DELETE")
+
+        # the iCal feed is fetched by calendar apps with no session at all. its
+        # token is the credential, and the route checks that token's profile
+        # (video access, kids rating cap) itself.
+        from core.video.calendar_feed import is_feed_path
+        if is_feed_path(path, request.method):
+            return None
 
         def _p(*prefixes):
             return any(path.startswith(x) for x in prefixes)
@@ -104,7 +125,18 @@ def create_video_blueprint() -> Blueprint:
                                  # manual "I have this" links — library matching
                                  # management, same as the overrides below. The
                                  # GETs (search/status) stay open.
-                                 "/api/video/manual-match") \
+                                 "/api/video/manual-match",
+                                 # the library tab's file actions: rename to the
+                                 # template, delete to the recycle bin
+                                 "/api/video/files",
+                                 # per-movie/per-show subtitle language overrides
+                                 # (Phase 3) — per-title management, same as the
+                                 # acquisition overrides. The GET stays open.
+                                 "/api/video/subtitles/overrides",
+                                 # whisper model download (Phase 4): writes to
+                                 # server disk + pulls ~500MB from the net —
+                                 # admin-only. The status GET stays open.
+                                 "/api/video/subtitles/whisper/download") \
                 or path.endswith(("/metadata", "/lock", "/refresh-art",
                                   # season-wide monitor flip — same library
                                   # management as /api/video/monitor above
@@ -116,17 +148,26 @@ def create_video_blueprint() -> Blueprint:
                                   # release groups, season packs)
                                   "/overrides",
                                   # per-show Synchronize — mutates library rows
-                                  "/sync"))
+                                  "/sync",
+                                  # fix match + its undo — library identity
+                                  "/identify", "/identify/release"))
         if admin and not is_admin:
             return jsonify({"error": "Admin only."}), 403
 
         if writing and not getattr(g, "can_download", True) and _p(
                 "/api/video/downloads/grab", "/api/video/downloads/retry",
+                # clients-tab match & import: following a download is a grab
+                "/api/video/downloads/adopt",
                 "/api/video/youtube/download",
+                # manual subtitle download (Phase 3): an explicit user download
+                # action, same permission as a grab
+                "/api/video/subtitles/manual-download",
                 # the tab's bulk action — spends the same disk and bandwidth as
                 # the per-row grab above, so it takes the same permission
                 "/api/video/wishlist/youtube/download-all",
                 "/api/video/wishlist/add",
+                # the calendar's "wishlist the missing ones" is a bulk add
+                "/api/video/calendar/wishlist-missing",
                 "/api/video/watchlist/add", "/api/video/youtube/wishlist/add",
                 "/api/video/watch/grab",
                 # the wishlist and watchlist are shared by the household: a
@@ -165,6 +206,8 @@ def create_video_blueprint() -> Blueprint:
     from .backups import register_routes as reg_backups
     from .watch import register_routes as reg_watch
     from .manual_match import register_routes as reg_manual_match
+    from .subtitles import register_routes as reg_subtitles
+    from .library_manage import register_routes as reg_library_manage
     reg_dashboard(bp)
     reg_scan(bp)
     reg_library(bp)
@@ -191,5 +234,7 @@ def create_video_blueprint() -> Blueprint:
     reg_backups(bp)
     reg_watch(bp)
     reg_manual_match(bp)
+    reg_subtitles(bp)
+    reg_library_manage(bp)
 
     return bp

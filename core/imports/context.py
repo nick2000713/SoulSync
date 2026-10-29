@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+from core.context_sentinels import CONTEXT_SENTINEL_IDS
 from utils.logging_config import get_logger
 
 logger = get_logger("imports.context")
@@ -15,6 +16,44 @@ logger = get_logger("imports.context")
 
 def _as_dict(value: Any) -> Dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+# Album values that mean "no album known", not an album name. Sources that
+# cannot supply an album (Spotify public-embed paste-link playlists store
+# album_name=None, discovery-pool rows ingested without one, TXT playlist
+# imports whose lines carry only artist/title) end up with this literal in
+# the track's stored album slot. Everywhere downstream it must be treated
+# as the ABSENCE of an album: before this, album detection accepted it as
+# an identified album, smart grouping grouped under it, and the tagger
+# stamped it over the downloaded file's own (correct) album tag.
+PLACEHOLDER_ALBUM_NAMES = frozenset({"unknown album"})
+
+
+def is_placeholder_album(value: Any) -> bool:
+    """Whether ``value`` is the 'no album known' placeholder literal.
+
+    Tradeoff, consciously taken: an album genuinely titled "Unknown Album"
+    is indistinguishable from the placeholder in stored data and is treated
+    as album-less. The codebase already made this call elsewhere
+    (tag_writer's placeholder set, the candidates.py sentinel compare);
+    the reverse error — stamping the placeholder over real albums — is
+    the one that destroyed user tags.
+    """
+    if not isinstance(value, str):
+        return False
+    normalized = " ".join(value.strip().lower().split())
+    if normalized in PLACEHOLDER_ALBUM_NAMES:
+        return True
+    # Media servers render untagged albums bracketed ('[Unknown Album]') —
+    # the same placeholder wearing brackets (cf. tag_writer.is_placeholder_meta).
+    if normalized.startswith("[") and normalized.endswith("]"):
+        return normalized[1:-1].strip() in PLACEHOLDER_ALBUM_NAMES
+    return False
+
+
+def has_real_album_name(value: Any) -> bool:
+    """Whether ``value`` is a usable album name (present and not a placeholder)."""
+    return isinstance(value, str) and bool(value.strip()) and not is_placeholder_album(value)
 
 
 def _first_value(mapping: Dict[str, Any], *keys: str, default: Any = "") -> Any:
@@ -48,6 +87,34 @@ def _first_source_aware_id(source: str, *values: Any) -> str:
             continue
         return text
     return ""
+
+
+# Album-id values the pipeline itself invents when it has no real provider id.
+# Built from the canonical sentinel set (core/context_sentinels.py) plus the
+# album-flow-only 'wishlist_album' placeholder — they must never be treated
+# as a genuine shared album identity (e.g. by the #1567 poisoned-batch
+# guards). R3F1: a local copy here drifted from CONTEXT_SENTINEL_IDS, so
+# 'auto_import'/'explicit_artist' counted as REAL ids and silently bypassed
+# every distrust wire.
+_PLACEHOLDER_ALBUM_IDS = frozenset(CONTEXT_SENTINEL_IDS) | {"wishlist_album"}
+_NAME_FALLBACK_ALBUM_ID_PREFIX = "_name_"
+
+
+def is_real_provider_album_id(value: Any) -> bool:
+    """True when ``value`` looks like a real provider album id, not one of the
+    placeholder ids the download/import pipeline invents (the
+    ``CONTEXT_SENTINEL_IDS`` sentinels — ``auto_import``, ``explicit_album``,
+    ``explicit_artist``, ``from_sync_modal`` — plus ``wishlist_album`` and the
+    ``_name_<album>`` fallbacks)."""
+    text = str(value or "").strip()
+    if not text:
+        return False
+    lowered = text.casefold()
+    if lowered in _PLACEHOLDER_ALBUM_IDS:
+        return False
+    if lowered.startswith(_NAME_FALLBACK_ALBUM_ID_PREFIX):
+        return False
+    return True
 
 
 def extract_artist_name(artist: Any) -> str:
@@ -203,11 +270,24 @@ def get_import_clean_album(
         "album",
         default="",
     )
+    # A stored placeholder ('Unknown Album') is the absence of an album, not
+    # a name — it must not shadow a real album carried by the other sources.
+    if not has_real_album_name(album):
+        album = ""
     if not album and album_info:
         album = _first_value(album_info, "album_name", "clean_album_name", default="")
+        if not has_real_album_name(album):
+            album = ""
     if not album:
         album_ctx = get_import_context_album(context)
         album = _first_value(album_ctx, "name", default="")
+        if not has_real_album_name(album):
+            album = ""
+    if not album and is_placeholder_album(default):
+        # A placeholder default (one caller builds it from the album
+        # context's name, which may itself be the placeholder) is not a
+        # fallback name — it is the same absence wearing a default's clothes.
+        return ""
     return str(album or default)
 
 
@@ -343,6 +423,11 @@ def build_import_album_info(
 
     clean_track_name = get_import_clean_title(context, album_info=album_info, default=original_search.get("title", "Unknown Track"))
     album_name = get_import_clean_album(context, album_info=album_info, default=original_search.get("album", "Unknown Album"))
+    # The placeholder is not a name: blank it so it can't satisfy the
+    # is_album evidence check below (which would skip album detection and
+    # file/tag the track under a literal 'Unknown Album').
+    if is_placeholder_album(album_name):
+        album_name = ""
     album_image_url = (
         (album_info or {}).get("album_image_url")
         or album_ctx.get("image_url")
@@ -452,11 +537,21 @@ def detect_album_info_web(context, artist_context=None):
     track_info = get_import_track_info(context)
     original_search = get_import_original_search(context)
 
-    album_name = (
-        album_ctx.get("name")
-        or track_info.get("album")
-        or original_search.get("album")
-        or ""
+    # First REAL album name wins. A placeholder in an earlier slot is the
+    # absence of an album, not an identified one — accepting it here made
+    # detection "succeed" with 'Unknown Album' as a genuine album and the
+    # track was grouped, filed and tagged under the placeholder.
+    album_name = next(
+        (
+            candidate
+            for candidate in (
+                album_ctx.get("name"),
+                track_info.get("album"),
+                original_search.get("album"),
+            )
+            if has_real_album_name(candidate)
+        ),
+        "",
     )
     track_name = (
         track_info.get("name")

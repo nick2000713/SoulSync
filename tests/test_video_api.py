@@ -532,11 +532,14 @@ def test_libraries_endpoint_lists_and_saves(tmp_path, monkeypatch):
         data = client.get("/api/video/libraries").get_json()
         assert data["server"] == "plex"
         assert [m["title"] for m in data["movies"]] == ["Movies"]
-        assert data["selected"]["movies"] is None
+        # one library of each kind and nothing ever picked: they're picked
+        # for you, so a fresh install's first scan reads something
+        assert data["selected"] == {"movies": "Movies", "tv": "TV", "tv_more": [], "anime": []}
 
-        assert client.post("/api/video/libraries", json={"movies": "Movies", "tv": "TV"}).status_code == 200
+        # "— None —" for tv is a choice and stays one on the next load
+        assert client.post("/api/video/libraries", json={"movies": "Movies", "tv": ""}).status_code == 200
         data2 = client.get("/api/video/libraries").get_json()
-        assert data2["selected"] == {"movies": "Movies", "tv": "TV"}
+        assert data2["selected"] == {"movies": "Movies", "tv": "", "tv_more": [], "anime": []}
     finally:
         videoapi._video_db = None
 
@@ -594,6 +597,46 @@ def test_enrichment_endpoints(tmp_path):
         eng_mod._engine = None
 
 
+def test_enrichment_test_endpoint_backfill_workers(tmp_path, monkeypatch):
+    # backfill workers (fanart, opensubtitles) have no .client; the test button
+    # used to 500 with AttributeError for them.
+    import api.video as videoapi
+    from database.video_database import VideoDatabase
+    import core.video.enrichment.engine as eng_mod
+    import core.video.enrichment.backfill as bf
+    from core.video.enrichment.engine import VideoEnrichmentEngine
+
+    class FakeClient:
+        enabled = True
+        def match(self, *a, **k): return None
+        def test(self): return (True, "ok")
+
+    calls = []
+    def fake_get(url, params=None, headers=None, **k):
+        calls.append(url)
+        return {"data": []}
+    monkeypatch.setattr(bf, "_http_get_json", fake_get)
+
+    db = VideoDatabase(database_path=str(tmp_path / "video_library.db"))
+    db.set_setting("fanart_api_key", "fk")
+    db.set_setting("opensubtitles_api_key", "ok")
+    videoapi._video_db = db
+    eng_mod._engine = VideoEnrichmentEngine(db, {"tmdb": FakeClient()})
+    app = Flask(__name__)
+    app.register_blueprint(videoapi.create_video_blueprint(), url_prefix="/api/video")
+    client = app.test_client()
+    try:
+        for svc in ("fanart", "opensubtitles"):
+            res = client.post("/api/video/enrichment/%s/test" % svc).get_json()
+            assert res["success"] is True, (svc, res)
+        assert any("fanart.tv" in u for u in calls)
+        assert any("opensubtitles.com" in u for u in calls)
+        assert client.post("/api/video/enrichment/tmdb/test").get_json()["success"] is True
+    finally:
+        videoapi._video_db = None
+        eng_mod._engine = None
+
+
 def test_enrichment_config_save_load(tmp_path, monkeypatch):
     import api.video as videoapi
     from database.video_database import VideoDatabase
@@ -611,24 +654,27 @@ def test_enrichment_config_save_load(tmp_path, monkeypatch):
             "tmdb_api_key": "", "tvdb_api_key": "", "omdb_api_key": "",
             "fanart_api_key": "", "opensubtitles_api_key": "", "trakt_api_key": "",
             "mdblist_api_key": "",
+            "subdl_api_key": "", "subsource_api_key": "",
             "ryd_enabled": True, "sponsorblock_enabled": True, "dearrow_enabled": True,
             "tvmaze_enabled": True, "anilist_enabled": False, "wikidata_enabled": True,
             "billboard_autoplay": True, "watch_region": "US"}
         client.post("/api/video/enrichment/config",
                     json={"tmdb_api_key": "abc", "tvdb_api_key": "xyz", "omdb_api_key": "om",
                           "fanart_api_key": "fa", "opensubtitles_api_key": "os",
+                          "subdl_api_key": "sdl", "subsource_api_key": "sso",
                           "ryd_enabled": False, "sponsorblock_enabled": True,
                           "billboard_autoplay": False, "watch_region": "gb"})
         assert client.get("/api/video/enrichment/config").get_json() == {
             "tmdb_api_key": "abc", "tvdb_api_key": "xyz", "omdb_api_key": "om",
             "fanart_api_key": "fa", "opensubtitles_api_key": "os", "trakt_api_key": "",
             "mdblist_api_key": "",
+            "subdl_api_key": "sdl", "subsource_api_key": "sso",
             "ryd_enabled": False, "sponsorblock_enabled": True, "dearrow_enabled": True,
             "tvmaze_enabled": True, "anilist_enabled": False, "wikidata_enabled": True,
             "billboard_autoplay": False, "watch_region": "GB"}
         assert db.get_setting("tmdb_api_key") == "abc" and db.get_setting("omdb_api_key") == "om"
         assert client.get("/api/video/prefs").get_json() == {
-            "billboard_autoplay": False, "watch_region": "GB"}
+            "billboard_autoplay": False, "watch_region": "GB", "subtitle_langs": ["en"]}
     finally:
         videoapi._video_db = None
 
@@ -659,12 +705,16 @@ def test_downloads_config_save_load(tmp_path, monkeypatch):
     try:
         # Defaults: empty folders, soulseek mode. Shared input + per-type libraries.
         assert client.get("/api/video/downloads/config").get_json() == {
-            "download_path": "", "movies_path": "", "tv_path": "", "youtube_path": "",
+            "download_path": "", "movies_path": "", "tv_path": "", "anime_path": "",
+            "youtube_path": "",
             "download_mode": "soulseek", "hybrid_order": ["soulseek"],
             # seeding lifecycle (arr-parity P5) rides the same config payload
             "seed_ratio_goal": 0.0, "seed_time_goal_hours": 0, "seed_remove_data": True,
             "seed_mode": "soulsync", "seed_overrides": {},
-            "movies_additional_paths": [], "tv_additional_paths": []}
+            "movies_additional_paths": [], "tv_additional_paths": [],
+            # the optional 4K libraries, off until switched on
+            "movies_4k_enabled": False, "movies_4k_path": "",
+            "tv_4k_enabled": False, "tv_4k_path": ""}
         # Round-trips: libraries → video.db, the INPUT folder → the SHARED music key.
         client.post("/api/video/downloads/config",
                     json={"download_path": " /mnt/v/dl ", "movies_path": "/media/movies",
@@ -672,11 +722,14 @@ def test_downloads_config_save_load(tmp_path, monkeypatch):
                           "download_mode": "hybrid", "hybrid_order": ["torrent", "usenet"]})
         assert client.get("/api/video/downloads/config").get_json() == {
             "download_path": "/mnt/v/dl", "movies_path": "/media/movies",   # trimmed
-            "tv_path": "/media/tv", "youtube_path": "/media/yt",
+            "tv_path": "/media/tv", "anime_path": "", "youtube_path": "/media/yt",
             "download_mode": "hybrid", "hybrid_order": ["torrent", "usenet"],
             "seed_ratio_goal": 0.0, "seed_time_goal_hours": 0, "seed_remove_data": True,
             "seed_mode": "soulsync", "seed_overrides": {},
-            "movies_additional_paths": [], "tv_additional_paths": []}
+            "movies_additional_paths": [], "tv_additional_paths": [],
+            # the optional 4K libraries, off until switched on
+            "movies_4k_enabled": False, "movies_4k_path": "",
+            "tv_4k_enabled": False, "tv_4k_path": ""}
         # The input folder is the SHARED soulseek.download_path (so music sees it too);
         # it is NOT stored in video.db.
         assert fake.get("soulseek.download_path") == "/mnt/v/dl"
@@ -1940,3 +1993,126 @@ def test_additional_library_paths_roundtrip_validate_and_preserve(tmp_path):
     assert client.get(url).get_json()["movies_path"] == "/new"
     client.post(url, json={"movies_additional_paths": []})
     assert client.get(url).get_json()["movies_additional_paths"] == []
+
+
+def _adopt_client(tmp_path, monkeypatch):
+    import api.video as videoapi
+    import core.video.download_monitor as mon
+    from database.video_database import VideoDatabase
+    monkeypatch.setattr(mon, "ensure_started", lambda *a, **k: None)   # no monitor thread
+    db = VideoDatabase(database_path=str(tmp_path / "video_library.db"))
+    db.set_setting("movies_path", "/media/movies")
+    db.set_setting("tv_path", "/media/tv")
+    videoapi._video_db = db
+    app = Flask(__name__)
+    app.register_blueprint(videoapi.create_video_blueprint(), url_prefix="/api/video")
+    return app.test_client()
+
+
+def test_adopting_a_client_download_writes_the_row_a_grab_would(tmp_path, monkeypatch):
+    """match & import from the clients tab: the torrent is already in the client,
+    so nothing is sent to it; the same row a torrent grab writes is recorded and
+    the monitor imports it like any other."""
+    import api.video as videoapi
+    client = _adopt_client(tmp_path, monkeypatch)
+    try:
+        r = client.post("/api/video/downloads/adopt", json={
+            "source": "torrent", "client_ref": "abc123", "kind": "show",
+            "title": "Ted Lasso", "media_id": 97546, "media_source": "tmdb",
+            "release_title": "Ted Lasso S04E10 1080p WEB H264-CAKES", "size_bytes": 1400,
+            "search_ctx": {"scope": "episode", "title": "Ted Lasso", "season": 4, "episode": 10}})
+        assert r.get_json()["ok"] is True
+        [row] = client.get("/api/video/downloads/active").get_json()["downloads"]
+        assert row["source"] == "torrent" and row["client_ref"] == "abc123"
+        assert row["kind"] == "show" and row["target_dir"] == "/media/tv"
+        assert row["status"] == "downloading"
+        # a second match of the same download would import the files twice
+        again = client.post("/api/video/downloads/adopt", json={
+            "source": "torrent", "client_ref": "ABC123", "kind": "show", "title": "Ted Lasso"})
+        assert again.status_code == 409
+    finally:
+        videoapi._video_db = None
+
+
+def test_adopting_needs_a_download_and_a_match(tmp_path, monkeypatch):
+    import api.video as videoapi
+    client = _adopt_client(tmp_path, monkeypatch)
+    try:
+        for body in ({"source": "soulseek", "client_ref": "x", "kind": "movie", "title": "T"},
+                     {"source": "torrent", "kind": "movie", "title": "T"},
+                     {"source": "torrent", "client_ref": "x", "kind": "music", "title": "T"},
+                     {"source": "torrent", "client_ref": "x", "kind": "movie"}):
+            assert client.post("/api/video/downloads/adopt", json=body).status_code == 400
+        assert client.get("/api/video/downloads/active").get_json()["downloads"] == []
+    finally:
+        videoapi._video_db = None
+
+
+def test_adopting_takes_the_download_permission(tmp_path):
+    c = _client_as(tmp_path, is_admin=True, can_download=False)
+    assert c.post("/api/video/downloads/adopt", json={}).status_code == 403
+
+
+def test_adopting_a_soulseek_movie_follows_its_biggest_video_file(tmp_path, monkeypatch):
+    import api.video as videoapi
+    client = _adopt_client(tmp_path, monkeypatch)
+    try:
+        files = [{"filename": "Movies\\Heat (1995)\\Heat.1995.1080p.mkv", "size": 9000},
+                 {"filename": "Movies\\Heat (1995)\\Sample\\heat-sample.mkv", "size": 50},
+                 {"filename": "Movies\\Heat (1995)\\Heat.nfo", "size": 1}]
+        r = client.post("/api/video/downloads/adopt", json={
+            "source": "soulseek", "username": "peer", "files": files, "kind": "movie",
+            "title": "Heat", "media_id": 949, "media_source": "tmdb",
+            "search_ctx": {"scope": "movie", "title": "Heat"}})
+        assert r.get_json()["ok"] is True
+        [row] = client.get("/api/video/downloads/active").get_json()["downloads"]
+        assert row["source"] == "soulseek" and row["username"] == "peer"
+        assert row["filename"] == "Movies\\Heat (1995)\\Heat.1995.1080p.mkv"
+        assert client.post("/api/video/downloads/adopt", json={
+            "source": "soulseek", "username": "peer", "files": files[:1], "kind": "movie",
+            "title": "Heat"}).status_code == 409
+    finally:
+        videoapi._video_db = None
+
+
+def test_adopting_a_soulseek_season_makes_one_row_per_episode(tmp_path, monkeypatch):
+    import json as _json
+    import api.video as videoapi
+    client = _adopt_client(tmp_path, monkeypatch)
+    try:
+        files = [{"filename": f"TV\\Ted Lasso\\S04\\Ted.Lasso.S04E0{n}.1080p.mkv", "size": 100}
+                 for n in (1, 2)] + [{"filename": "TV\\Ted Lasso\\S04\\extras.mkv", "size": 5}]
+        r = client.post("/api/video/downloads/adopt", json={
+            "source": "soulseek", "username": "peer", "files": files, "kind": "show",
+            "title": "Ted Lasso", "media_id": 97546, "media_source": "tmdb",
+            "search_ctx": {"scope": "season", "title": "Ted Lasso", "season": 4}})
+        assert len(r.get_json()["ids"]) == 2
+        rows = client.get("/api/video/downloads/active").get_json()["downloads"]
+        episodes = sorted(_json.loads(d["search_ctx"])["episode"] for d in rows)
+        assert episodes == [1, 2]
+    finally:
+        videoapi._video_db = None
+
+
+def test_acquisition_state_does_not_count_specials_or_unaired_as_missing(tmp_path):
+    """Breaking Bad read '22 missing' with every aired episode on disk: the 22
+    were specials. Unowned specials and episodes that haven't aired are not
+    gaps; a special you do own still counts as owned."""
+    client, videoapi = _make_client(tmp_path)
+    try:
+        db = videoapi._video_db
+        sid = db.upsert_show_tree("plex", {
+            "server_id": "s1", "title": "Show", "tmdb_id": 1396, "seasons": [
+                {"season_number": 0, "server_id": "se0", "episodes": [
+                    {"episode_number": 1, "title": "Sp1", "server_id": "sp1"},
+                    {"episode_number": 2, "title": "Sp2", "server_id": "sp2",
+                     "file": {"relative_path": "sp2.mkv", "size_bytes": 10}}]},
+                {"season_number": 1, "server_id": "se1", "episodes": [
+                    {"episode_number": 1, "title": "E1", "server_id": "ep1",
+                     "file": {"relative_path": "e1.mkv", "size_bytes": 10}},
+                    {"episode_number": 2, "title": "E2", "server_id": "ep2", "air_date": "2999-01-01"}]}]})
+        body = client.get("/api/video/detail/show/%d/acquisition" % sid).get_json()
+        assert body["total"] == 2 and body["counts"]["owned"] == 2
+        assert body["specials_missing"] == 1 and body["upcoming"] == 1
+    finally:
+        videoapi._video_db = None

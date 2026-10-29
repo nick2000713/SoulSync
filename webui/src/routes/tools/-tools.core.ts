@@ -102,6 +102,15 @@ const SETTING_FULL_KEY_LABELS: Record<string, string> = {
   deep_audio_verify: 'Deep Audio Verify (ffmpeg decode — CPU heavy)',
 };
 
+/** Preserve structured setting values as JSON instead of "[object Object]". */
+export function repairSettingText(value: unknown): string {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'object') return JSON.stringify(value);
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  return '';
+}
+
 const SETTING_ACRONYMS: Record<string, string> = {
   eps: 'EPs',
   id: 'ID',
@@ -210,6 +219,8 @@ export const FINDING_TYPE_LABELS: Record<string, string> = {
   acoustid_no_match: 'No Match',
   fake_lossless: 'Fake Lossless',
   duplicate_tracks: 'Duplicate',
+  native_duplicate_tracks: 'Duplicate',
+  native_duplicate_releases: 'Duplicate Release',
   incomplete_album: 'Incomplete',
   path_mismatch: 'Path Mismatch',
   metadata_gap: 'Missing Metadata',
@@ -219,10 +230,14 @@ export const FINDING_TYPE_LABELS: Record<string, string> = {
   expired_download: 'Expired',
   missing_replaygain: 'No ReplayGain',
   replaygain_retag: 'RG Re-analyze',
+  untagged_download: 'Untagged',
   empty_folder: 'Empty Folder',
   missing_lossy_copy: 'No Lossy Copy',
   library_retag: 'Re-tag',
   quality_upgrade: 'Low Quality',
+  quality_upgrade_review: 'Quality Upgrade Review',
+  quality_format_not_targeted: 'Format Not in Profile',
+  quality_unknown: 'Quality Unknown',
   short_preview_track: 'Preview Clip',
   genre_cleanup: 'Genres',
   genre_enrichment: 'Genre Enrichment',
@@ -246,25 +261,78 @@ export const FINDING_FIXABLE_TYPES: Record<string, string> = {
   missing_lyrics: 'Apply Lyrics',
   missing_replaygain: 'Apply RG',
   replaygain_retag: 'Re-analyze',
+  untagged_download: 'Write Tags',
   empty_folder: 'Delete Folder',
   expired_download: 'Delete',
   metadata_gap: 'Apply',
   duplicate_tracks: 'Keep Best',
+  native_duplicate_tracks: 'Keep Best',
+  native_duplicate_releases: 'Review Merge',
   incomplete_album: 'Auto-Fill',
   missing_lossy_copy: 'Convert',
   acoustid_mismatch: 'Fix',
   quality_upgrade: 'Upgrade',
+  quality_upgrade_review: 'Monitor & Upgrade',
+  quality_format_not_targeted: 'Leave As-is',
+  quality_unknown: 'Leave As-is',
   missing_discography_track: 'Add to Wishlist',
   library_retag: 'Apply Tags',
   short_preview_track: 'Re-download',
+  fake_lossless: 'Re-download',
   genre_cleanup: 'Clean Genres',
   genre_enrichment: 'Apply Genres',
   comma_artist_split: 'Split Artists',
   suspect_album_tag: 'Re-identify',
 };
 
-export function findingFixLabel(findingType: string): string | null {
+export function findingFixLabel(findingType: string, entityType?: string | null): string | null {
+  // a poisoned album is fixed one track at a time, so its finding opens the
+  // album instead of the single-track re-identify (#1567)
+  if (findingType === 'suspect_album_tag' && entityType === 'album') return 'Open album';
   return FINDING_FIXABLE_TYPES[findingType] ?? null;
+}
+
+/** Types whose fix ends in a re-download — but only while the finding names a
+ *  catalogue track. The corruption detector also walks the library folders, so
+ *  it raises rows with `entity_type: 'file'` and no id for audio no lib2 row
+ *  points at. Nothing can be re-requested for those, so the fix is a plain
+ *  delete; saying "Re-download" was a promise the backend answered with
+ *  "No track ID associated with this finding". */
+const SUBJECTLESS_DELETE_ONLY_TYPES = new Set([
+  'corrupt_audio',
+  'short_preview_track',
+  'fake_lossless',
+]);
+
+/** The button label for ONE finding row — `findingFixLabel` by type, unless the
+ *  row has no track behind it and the type's verb only makes sense with one. */
+export function findingRowFixLabel(finding: {
+  finding_type: string;
+  entity_type?: string | null;
+  entity_id?: string | number | null;
+}): string | null {
+  if (!finding.entity_id && SUBJECTLESS_DELETE_ONLY_TYPES.has(finding.finding_type)) {
+    return 'Delete File';
+  }
+  return findingFixLabel(finding.finding_type, finding.entity_type);
+}
+
+/** The `lib2:<track id>` the redownload modal searches for, or null when the
+ *  finding names no catalogue track. A file-subject finding (fake lossless)
+ *  carries the FILE's id as `entity_id`; handing that to the modal would
+ *  search for, and replace, whichever track happens to share the number. */
+export function findingRedownloadTrackId(finding: {
+  entity_type?: string | null;
+  entity_id?: string | number | null;
+  details?: Record<string, unknown> | null;
+}): string | null {
+  if (!finding.entity_id) return null;
+  if (finding.entity_type !== 'file') return String(finding.entity_id);
+  const linked = finding.details?.library_v2 as { track_id?: unknown } | undefined;
+  const trackId = linked?.track_id;
+  return typeof trackId === 'number' || (typeof trackId === 'string' && trackId !== '')
+    ? `lib2:${trackId}`
+    : null;
 }
 
 export const FINDING_ACTION_LABELS: Record<string, string> = {
@@ -278,10 +346,27 @@ export const FINDING_ACTION_LABELS: Record<string, string> = {
   applied_cover_art: 'Art Applied',
   applied_metadata: 'Metadata Applied',
   applied_lyrics: 'Lyrics Applied',
+  wrote_tags: 'Tags Written',
+  already_tagged: 'Already Tagged',
   deleted_expired: 'Deleted',
   removed_duplicates: 'Duplicates Removed',
   genres_applied: 'Genres Applied',
   ignored: 'Ignored',
+  // the file a finding was about vanished before it was fixed (#1143)
+  obsolete: 'File Gone',
+  // the video side's fix actions
+  wishlisted: 'Wishlisted',
+  grabbed: 'Grabbed',
+  refreshed: 'Refreshed',
+  removed: 'Removed',
+  marked_deleted: 'Marked Deleted',
+  forgotten: 'Forgotten',
+  flagged: 'Flagged',
+  cleaned: 'Cleaned',
+  renamed: 'Renamed',
+  queued: 'Queued',
+  // retired by a later scan that no longer saw the problem
+  'superseded by a newer scan': 'Gone on rescan',
 };
 
 /** The badge shown on a non-pending finding: the user action if we have a label
@@ -856,17 +941,32 @@ export function findingsBulkBarState(
  * even when nothing actually failed.
  */
 export function bulkFixRunMessage(
-  status: Pick<BulkFixStatus, 'fixed' | 'failed' | 'total' | 'stopped' | 'errors'>,
+  status: Pick<
+    BulkFixStatus,
+    'fixed' | 'failed' | 'skipped' | 'total' | 'stopped' | 'error' | 'note' | 'errors'
+  >,
 ): { message: string; type: 'success' | 'error' } {
   const fixed = status.fixed || 0;
   const failed = status.failed || 0;
-  let message = `Fixed ${fixed}${failed ? `, ${failed} failed` : ''} of ${status.total || 0}`;
+  const skipped = status.skipped || 0;
+  let message = `Fixed ${fixed}${failed ? `, ${failed} failed` : ''}${skipped ? `, ${skipped} skipped` : ''} of ${status.total || 0}`;
   if (status.stopped) {
     message = `Bulk fix stopped — ${message.charAt(0).toLowerCase()}${message.slice(1)}`;
   }
-  const errors = status.errors;
-  if (errors && errors.length > 0) message += `: ${errors[0].error}`;
-  return { message, type: fixed > 0 ? 'success' : 'error' };
+  // A run-level error (e.g. the LRCLib circuit breaker stopping the
+  // run, #1879) explains WHY the run stopped — prefer it over the
+  // first per-finding error. A run-level note (the breaker skipping
+  // the remaining lyrics findings in a mixed run that otherwise
+  // completed) takes the same slot.
+  if (status.stopped && status.error) {
+    message += `: ${status.error}`;
+  } else if (status.note) {
+    message += `: ${status.note}`;
+  } else {
+    const errors = status.errors;
+    if (errors && errors.length > 0) message += `: ${errors[0].error}`;
+  }
+  return { message, type: fixed > 0 || (skipped > 0 && failed === 0) ? 'success' : 'error' };
 }
 
 /** From the tail of `bulkFixFindings` — the per-id loop's own summary. Note it
@@ -875,10 +975,18 @@ export function bulkFixLoopMessage(
   fixed: number,
   failed: number,
   lastError: string,
+  skipped = 0,
+  otherArtistSkipped = 0,
 ): { message: string; type: 'success' | 'error' } {
-  let message = `Fixed ${fixed}${failed ? `, ${failed} failed` : ''}`;
+  let message = `Fixed ${fixed}${failed ? `, ${failed} failed` : ''}${skipped ? `, ${skipped} skipped` : ''}`;
   if (failed && lastError) message += `: ${lastError}`;
-  return { message, type: fixed > 0 ? 'success' : 'error' };
+  // A failed gated finding's own error already carries this sentence.
+  if (otherArtistSkipped && !lastError.includes('other artists were not added')) {
+    message += `: ${otherArtistSkipped} track(s) by other artists were not added to the wishlist. To add them, fix the album on its own (reopen its finding first if it resolved)`;
+  }
+  // Same rule as bulkFixRunMessage: skipped-by-design softens the type
+  // only when nothing actually failed.
+  return { message, type: fixed > 0 || (skipped > 0 && failed === 0) ? 'success' : 'error' };
 }
 
 /**

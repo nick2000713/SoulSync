@@ -192,7 +192,7 @@ class WishlistService:
             logger.error("No track data provided for wishlist add")
             return self.database._wishlist_outcome("rejected", reason="no track data")
 
-        return self.database.add_to_wishlist_detailed(
+        outcome = self.database.add_to_wishlist_detailed(
             track_data=track_data,
             failure_reason=failure_reason,
             source_type=source_type,
@@ -201,6 +201,7 @@ class WishlistService:
             user_initiated=user_initiated,
             quality_profile_id=quality_profile_id,
         )
+        return outcome
 
     def add_spotify_track_to_wishlist(
         self,
@@ -212,6 +213,7 @@ class WishlistService:
         profile_id: int = 1,
         quality_profile_id: Optional[int] = None,
         detailed: bool = False,
+        user_initiated: bool = False,
     ):
         """Backward-compatible wrapper for `add_track_to_wishlist`.
 
@@ -228,6 +230,7 @@ class WishlistService:
             source_context=source_context,
             profile_id=profile_id,
             quality_profile_id=quality_profile_id,
+            user_initiated=user_initiated,
         )
         return outcome if detailed else outcome["created"]
 
@@ -317,6 +320,46 @@ class WishlistService:
         }
         return formatted_track
 
+    @staticmethod
+    def apply_search_override(track: Dict[str, Any], name: Any = None, artist: Any = None) -> Dict[str, Any]:
+        """the formatted track with the title/artist someone typed into the
+        interactive search instead of what the row says (a playlist that
+        tagged a song as "Various Artists"). blank or unchanged leaves it be.
+
+        the source ids go: they point at the song the row was wrong about,
+        and the import would pull its metadata back over what was typed.
+        wishlist_id stays, so a finished download still clears the row.
+        a new title drops the length (a different song), a new artist drops
+        the album and its track number (that artist's album, or a comp).
+        """
+        name = str(name or "").strip()
+        artist = str(artist or "").strip()
+        new_name = bool(name) and name != (track.get("name") or "")
+        new_artist = bool(artist) and artist != (track.get("artist_name") or "")
+        if not new_name and not new_artist:
+            return track
+        out = dict(track)
+        if new_name:
+            out["name"] = out["track_name"] = name
+            out["duration_ms"] = 0
+        if new_artist:
+            out["artists"] = [{"name": artist}]
+            out["artist_name"] = artist
+            out["album"] = {}
+            out["album_name"] = ""
+            out["track_number"] = 0
+        for key in ("id", "track_id", "spotify_track_id"):
+            out[key] = ""
+        out["provider"] = out["_source"] = None
+        data = {
+            "name": out["name"],
+            "artists": out["artists"],
+            "album": out["album"],
+            "duration_ms": out["duration_ms"],
+        }
+        out["track_data"] = out["spotify_data"] = data
+        return out
+
     def get_wishlist_tracks_for_download(
         self,
         limit: Optional[int] = None,
@@ -346,6 +389,11 @@ class WishlistService:
                 formatted_track.setdefault("profile_id", profile_id)
                 formatted_tracks.append(formatted_track)
 
+            try:
+                from core.library2.wishlist_mirror import fill_catalogue_durations
+                fill_catalogue_durations(self.database, formatted_tracks)
+            except Exception as e:  # noqa: BLE001 - a length is a check, not the queue
+                logger.warning("Wishlist: catalogue lengths not filled in: %s", e)
             return formatted_tracks
 
         except Exception as e:

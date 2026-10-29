@@ -12,11 +12,12 @@ SoulSync needs credentials for the services it queries for metadata and enrichme
 
 ## Service list
 
-- **Spotify** — Client ID, Client Secret, and Redirect URI (from the Spotify Developer Dashboard). Powers metadata, discovery, and playlist sync.
+- **Spotify** — Client ID, Client Secret, and Redirect URI (from the Spotify Developer Dashboard). Powers metadata, discovery, and playlist sync. Redirect URIs must be **HTTPS** for anything that isn't a loopback address (NAS, Docker, remote host) — see [Connecting services](#gs-connecting).
 - **slskd** — slskd URL and API key, entered on the Soulseek source panel (Downloads / Sources tabs). Powers Soulseek downloading.
 - **Tidal** — Client ID, Client Secret, and Redirect URI. Log in with the Authenticate button — it opens Tidal's authorization page in the browser, and the callback is just a success page: close the window and you're connected.
 - **Last.fm** — API key, API secret, and your username. Powers scrobbling, similar artists, and listening-history import.
 - **Genius** — Client access token for lyrics.
+- **Pollinations** — Optional API key for playlist cover art. Works without one (one image every 45 seconds, with their mark).
 - **Qobuz** — Email and password, or a pasted auth token when login hits a CAPTCHA. Powers metadata enrichment and Qobuz downloads.
 - **HiFi** — no credentials at all. Free lossless downloads from community-run hifi-api instances, which you add and health-check on the Sources tab.
 - **Deezer** — App ID, App Secret, and Redirect URI (OAuth), or an ARL token for playlist access and downloads. Powers favorites, playlists, and Deezer downloads.
@@ -88,6 +89,17 @@ The chain editor lives on the Downloads tab: drag sources from **Available** int
 > [!WARNING]
 > In Docker, all three must be **container paths** — the compose defaults are \`/app/downloads\`, \`/app/Transfer\`, and \`/app/Staging\`. Map your host folders to those in the compose file.
 
+Every folder on the Folders card is checked as you type, with one line under it:
+
+- **Ready**, with the free space left on that drive.
+- **Doesn't exist yet**: SoulSync creates it on first use.
+- **Can't write here**: check the folder's owner, or \`PUID\` / \`PGID\` in Docker.
+- **A Windows path in Docker**, or **the same folder as another row**.
+- **Inside your download folder** (or the other way round): keep downloads and libraries side by side, not nested, or half-finished files get scanned.
+- **Not on a mapped volume** (Docker): files there live inside the container and are lost when it's recreated.
+
+The Video tab adds optional **4K libraries** (see [Video: 4K libraries](#vid-sources)) and, in Docker, the compose volume lines for every folder you've set, ready to copy.
+
 ## Behavior
 
 These live on other tabs, not Downloads:
@@ -109,11 +121,14 @@ These live on other tabs, not Downloads:
 ## Verification & enhancement
 
 - **AcoustID verification** — fingerprints each download and quarantines files that don't match the expected track
+- **Duration tolerance** (Post-Processing > Core Features): how far a file's length can drift from the expected length before it's quarantined. **0 = auto**: 3s short (5s for tracks over 10 minutes) or 15s long. Raise it if good files keep landing in quarantine for being a few seconds off, which is common with CD rips (pregaps, trimmed silence) and alternate masters. A set value applies both ways, so anything under 15 also tightens the long side. Max 60
 
 ## Organization
 
-- **Path templates** — customize how artists, albums, and tracks are named and nested (e.g. \`$albumartist/$album/$track - $title\`). Variables use \`$name\` syntax: \`$albumartist\`, \`$artist\`, \`$album\`, \`$track\`, \`$title\`, \`$year\`, \`$discnum\`, and more
+- **Path templates** — customize how artists, albums, and tracks are named and nested (e.g. \`$albumartist/$album/$track - $title\`). Variables use \`$name\` syntax: \`$albumartist\`, \`$artist\`, \`$album\`, \`$track\`, \`$title\`, \`$year\`, \`$discnum\`, \`$explicit\` (\`[E]\` on explicit tracks), \`$contentrating\` (\`[E]\` or \`[C]\`), \`$albumartistinfo\` / \`$albumartistcomposite\` / \`$albumartistclash\` (MusicBrainz's note, country or genre, to keep same-named artists apart), and more
+- **Live preview** — under each template is the path it makes for an example release, updated as you type and before you save. Switch the example between **Standard**, **Explicit**, **Multi-disc** and **Shared artist name** to see the content rating badges, the disc folder and the artist notes come out. It runs through the same code a real download does, so what it shows is what you get
 - **Multi-disc labels** — the **Multi-Disc Folder Label** setting controls the subfolder added automatically on multi-disc albums; put a disc variable in your template instead to take over
+- **Lookalike characters** — Windows doesn't allow \`: ? / \\ " * | < >\` in names, so by default they become \`_\` (\`AC_DC\`). Turn on **Keep symbols in names with lookalike characters** and they become lookalikes that work on every system instead (\`AC∕DC\`, \`What's Going On？\`), and a trailing dot is kept (\`DAMN․\`). New downloads use it right away; run Reorganize to rename what's already in your library
 - **Detect multi-artist compilations** — file soundtracks and compilations under Various Artists instead of whichever contributor happened to be first
 
 ## Performance
@@ -135,7 +150,7 @@ Quality profiles define which formats are acceptable for downloads, and when a f
 
 ![Quality profiles](dl-quality-profiles.jpg)
 
-Quality profiles are checked during downloads and auto-import, and by the **Quality Upgrade Finder** repair job, which finds files that fall below your standards and proposes replacements.
+Quality profiles are checked during downloads and auto-import. Library v2 evaluates monitored tracks against their upgrade cutoff and sends missing or upgrade-eligible tracks to the Wishlist through **Monitoring List Reconcile**. The retired Quality Upgrade Finder is not a separate repair job.
 `
         },
         {
@@ -149,7 +164,12 @@ Accent color, theme, visualizer effects, and interface controls. Changes apply i
 
 ## REST API keys
 
-Generate API keys for external integrations. Keys are **not** scoped — every key carries full admin rights, so guard them like passwords and revoke any you no longer use. Keys are shown once at creation. See the API docs for endpoint details.
+Generate API keys for external integrations. A key is either **admin** (full rights, the default) or **read** (can look, can't change anything). Guard admin keys like passwords and revoke any you no longer use. Keys are shown once at creation. See the API docs for endpoint details.
+
+The same section has two switches, both off by default:
+
+- **MCP for AI Clients** answers at \`/mcp\`, so Claude and other AI apps can drive SoulSync with one of these keys. See [MCP for AI clients](#api-mcp).
+- **Lidarr Compatible API** answers at \`/lidarr\`, so request apps that only speak Lidarr can use SoulSync. Pick which profile's wishlist their requests land on. See [Lidarr compatible API](#api-lidarr).
 
 ## Log level
 

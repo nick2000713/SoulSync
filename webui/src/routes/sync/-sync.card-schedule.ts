@@ -38,7 +38,11 @@ import {
   autoSyncIsPipelineAutomation,
   autoSyncIsScheduleOwned,
   autoSyncNextRunLabel,
+  autoSyncIsPersonalizedAutomation,
+  autoSyncPersonalizedEntry,
   autoSyncSchedulePayload,
+  autoSyncSsdId,
+  autoSyncSsdTarget,
   autoSyncTriggerForHours,
   autoSyncWeeklyLabel,
   autoSyncWeeklyTrigger,
@@ -58,6 +62,8 @@ export interface CardSchedule {
   weeklyConfig?: { days: string[]; time: string; tz: string };
   /** When it next runs, as the automation reports it. */
   nextRun?: string | null;
+  /** The row's own action config, carried through a reschedule (#1704). */
+  actionConfig?: Record<string, unknown>;
 }
 
 export type CardScheduleMap = Readonly<Record<string, CardSchedule>>;
@@ -106,17 +112,45 @@ export function hasAllPlaylistPipeline(automations: unknown[]): boolean {
  * it (ownership, trigger shape, id extraction) and two copies would drift.
  */
 export function cardSchedulesFrom(automations: unknown[]): CardScheduleMap {
-  const state = buildAutoSyncScheduleState([], (automations || []) as never[]);
+  // a personalized schedule names its playlist by kind and variant, not by a
+  // mirrored id, and the builder can only place it on a row it is handed. so
+  // it gets one stand-in row per scheduled kind, keyed `ssd:<ssd id>`: a
+  // "refresh & mirror" copy of daily mix 1 read "not scheduled" while its
+  // daily automation ran fine
+  const standIns: MirroredRow[] = [];
+  const standInKey = new Map<string, string>();
+  for (const auto of (automations || []) as never[]) {
+    if (!autoSyncIsPersonalizedAutomation(auto)) continue;
+    const entry = autoSyncPersonalizedEntry(auto);
+    if (!entry) continue;
+    const ssdId = autoSyncSsdId(entry);
+    if (standIns.some((r) => r.source_playlist_id === ssdId)) continue;
+    const id = -(standIns.length + 1);
+    standIns.push({
+      id,
+      source: 'soulsync_discovery',
+      source_playlist_id: ssdId,
+      kind: entry.kind,
+      variant: entry.variant,
+      _personalized: true,
+    });
+    standInKey.set(String(id), `ssd:${ssdId}`);
+  }
+  const state = buildAutoSyncScheduleState(standIns, (automations || []) as never[]);
   const out: Record<string, CardSchedule> = {};
-  for (const [playlistId, entry] of Object.entries(state.playlistSchedules)) {
+  const keyOf = (playlistId: string) => standInKey.get(playlistId) ?? playlistId;
+  for (const [rawId, entry] of Object.entries(state.playlistSchedules)) {
+    const playlistId = keyOf(rawId);
     out[playlistId] = {
       hours: entry.hours,
       automationId: entry.automation_id,
       weekly: false,
       nextRun: entry.next_run ?? null,
+      actionConfig: entry.action_config,
     };
   }
-  for (const [playlistId, entry] of Object.entries(state.weeklySchedules)) {
+  for (const [rawId, entry] of Object.entries(state.weeklySchedules)) {
+    const playlistId = keyOf(rawId);
     // A weekly schedule has no interval to show. The card says so rather than
     // pretending it is unscheduled, which would invite someone to overwrite a
     // weekly plan by picking an hourly one without realising.
@@ -125,6 +159,7 @@ export function cardSchedulesFrom(automations: unknown[]): CardScheduleMap {
       automationId: entry.automation_id,
       weekly: true,
       nextRun: entry.next_run ?? null,
+      actionConfig: entry.action_config,
       weeklyConfig: {
         days: Array.isArray(entry.days) ? [...entry.days] : [],
         // autoSyncWeeklyTrigger's own fallback, kept in step with it.
@@ -134,6 +169,21 @@ export function cardSchedulesFrom(automations: unknown[]): CardScheduleMap {
     };
   }
   return out;
+}
+
+/**
+ * A row's schedule: its own (by mirrored id), or for a discovery mirror the
+ * schedule its personalized playlist runs on.
+ */
+export function cardScheduleFor(
+  schedules: CardScheduleMap,
+  row: MirroredRow | null | undefined,
+): CardSchedule | undefined {
+  if (!row) return undefined;
+  const own = row.id !== undefined ? schedules[String(row.id)] : undefined;
+  if (own) return own;
+  const target = autoSyncSsdTarget(row);
+  return target ? schedules[`ssd:${autoSyncSsdId(target)}`] : undefined;
 }
 
 /**
@@ -164,6 +214,8 @@ export function cardScheduleLabel(
 
 export interface CardScheduleController {
   schedules: CardScheduleMap;
+  /** This row's schedule, wherever it is keyed (see cardScheduleFor). */
+  scheduleFor: (row: MirroredRow | null | undefined) => CardSchedule | undefined;
   /** True when an enabled, owned Playlist Pipeline covers all mirrored playlists (#1289). */
   hasAllPipeline: boolean;
   /**
@@ -250,17 +302,22 @@ export function useCardSchedules(options: UseCardSchedulesOptions = {}): CardSch
 
       setBusy((prev) => new Set(prev).add(playlistId));
       try {
-        const existing = schedules[playlistId];
+        const existing = cardScheduleFor(schedules, row);
         if (hours === null) {
           if (!existing) return;
           const res = await deleteAutomation(existing.automationId);
           if (!res.ok) throw new Error('Failed to unschedule');
           toast(`${row.name || 'Playlist'} is no longer scheduled`, 'success');
         } else {
-          const payload = autoSyncSchedulePayload(row, row.id, {
-            trigger_type: 'schedule',
-            trigger_config: autoSyncTriggerForHours(hours),
-          });
+          const payload = autoSyncSchedulePayload(
+            row,
+            row.id,
+            {
+              trigger_type: 'schedule',
+              trigger_config: autoSyncTriggerForHours(hours),
+            },
+            existing?.actionConfig,
+          );
           // A weekly schedule is REPLACED rather than updated in place: the two
           // are different trigger shapes, and updating one into the other is
           // how you end up with a row that claims both.
@@ -307,11 +364,16 @@ export function useCardSchedules(options: UseCardSchedulesOptions = {}): CardSch
 
       setBusy((prev) => new Set(prev).add(playlistId));
       try {
-        const existing = schedules[playlistId];
-        const payload = autoSyncSchedulePayload(row, row.id, {
-          trigger_type: 'weekly_time',
-          trigger_config: config,
-        });
+        const existing = cardScheduleFor(schedules, row);
+        const payload = autoSyncSchedulePayload(
+          row,
+          row.id,
+          {
+            trigger_type: 'weekly_time',
+            trigger_config: config,
+          },
+          existing?.actionConfig,
+        );
         // An HOURLY row is a different trigger shape, so it is replaced rather
         // than updated into a weekly one — updating across shapes is how you
         // end up with a row that claims both.
@@ -336,5 +398,20 @@ export function useCardSchedules(options: UseCardSchedulesOptions = {}): CardSch
     [schedules, load, options.toast],
   );
 
-  return { schedules, hasAllPipeline, history, loaded, set, setWeekly, busy, reload: load };
+  const scheduleFor = useCallback(
+    (row: MirroredRow | null | undefined) => cardScheduleFor(schedules, row),
+    [schedules],
+  );
+
+  return {
+    schedules,
+    scheduleFor,
+    hasAllPipeline,
+    history,
+    loaded,
+    set,
+    setWeekly,
+    busy,
+    reload: load,
+  };
 }

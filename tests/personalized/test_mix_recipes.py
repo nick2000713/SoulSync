@@ -150,13 +150,16 @@ def db(tmp_path):
            (2, 'Deftones', 'sp-def', '["alternative metal"]', 2020),
            (3, 'Adele', 'sp-ad', '["pop"]', 2015)]
     for aid, name, sp, genres, year in lib:
-        cur.execute("INSERT INTO artists (id, name, spotify_artist_id, genres) VALUES (?,?,?,?)",
-                    (aid, name, sp, genres))
-        cur.execute("INSERT INTO albums (id, title, artist_id, year) VALUES (?,?,?,?)",
-                    (aid * 10, f'{name} LP', aid, year))
+        # Library v2 catalogue: a track is owned when it has a file row
+        cur.execute("INSERT INTO lib2_artists (id, name, name_key, spotify_id, genres) VALUES (?,?,?,?,?)",
+                    (aid, name, name.lower(), sp, genres))
+        cur.execute("INSERT INTO lib2_albums (id, title, primary_artist_id, year, origin) "
+                    "VALUES (?,?,?,?,'library')", (aid * 10, f'{name} LP', aid, year))
         for t in range(3):
-            cur.execute("INSERT INTO tracks (title, artist_id, album_id, file_path) VALUES (?,?,?,?)",
-                        (f'{name} {t}', aid, aid * 10, f'/m/{aid}-{t}.flac'))
+            track_id = cur.execute("INSERT INTO lib2_tracks (title, album_id) VALUES (?,?)",
+                                   (f'{name} {t}', aid * 10)).lastrowid
+            cur.execute("INSERT INTO lib2_track_files (track_id, path, is_primary) VALUES (?,?,1)",
+                        (track_id, f'/m/{aid}-{t}.flac'))
     cur.execute("INSERT INTO similar_artists (source_artist_id, similar_artist_name, "
                 "similarity_rank, profile_id) VALUES ('sp-tool', 'Soen', 1, 1)")
     for i, (artist, pop, genres, rel) in enumerate([
@@ -292,13 +295,27 @@ def test_it_renews_on_schedule_and_when_the_recipe_changes(db):
     row = R.get_recipe(db, 1, rid)
     fp = R._fingerprints(db, 1)
     assert not R.is_stale(first, row, fp)
-    later = datetime.fromisoformat(first['generated_at']) + timedelta(hours=21)
+    later = datetime.fromisoformat(first['generated_at']) + timedelta(days=1)
     assert R.is_stale(first, row, fp, now=later)
     manual = dict(row, recipe=dict(row['recipe'], schedule='manual'))
     assert not R.is_stale(dict(first, recipe=manual['recipe']), manual, fp,
                           now=later + timedelta(days=90))
     R.save_recipe(db, 1, Recipe.from_dict(dict(row['recipe'], length=12)), rid)
     assert R.get_or_build(db, 1, rid)['recipe']['length'] == 12
+
+
+def test_a_daily_mix_renews_when_the_day_turns_not_on_age(db):
+    """built at 11pm it used to stay yesterday's mix until 7pm the next day"""
+    rid = _make(db, genres=['metal'], schedule='daily')
+    first = R.get_or_build(db, 1, rid)
+    row = R.get_recipe(db, 1, rid)
+    fp = R._fingerprints(db, 1)
+    late = datetime(2026, 10, 27, 23, 0).astimezone()
+    built_late = dict(first, generated_at=late.isoformat())
+    assert R.is_stale(built_late, row, fp, now=late + timedelta(hours=2))
+    early = datetime(2026, 10, 27, 1, 0).astimezone()
+    built_early = dict(first, generated_at=early.isoformat())
+    assert not R.is_stale(built_early, row, fp, now=early + timedelta(hours=21))
 
 
 def test_a_track_the_wishlist_gave_up_on_is_replaced(db):

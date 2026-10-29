@@ -14,7 +14,8 @@ from core.runtime_state import (
 
 
 @pytest.fixture(autouse=True)
-def reset_state():
+def reset_state(monkeypatch):
+    monkeypatch.setattr(lc, '_scan_owed', False)
     download_tasks.clear()
     download_batches.clear()
     yield
@@ -264,6 +265,34 @@ def test_on_complete_failed_task_appended_to_permanently_failed_tracks():
     assert download_batches['b1']['permanently_failed_tracks'][0]['spotify_track'] == {'name': 'Money'}
 
 
+def _failed_reason(status, error_message=None):
+    download_tasks['t1'] = {
+        'status': status, 'track_info': {'name': 'Þú ert sólin'},
+        'track_index': 0, 'retry_count': 0,
+    }
+    if error_message is not None:
+        download_tasks['t1']['error_message'] = error_message
+    download_batches['b1'] = {
+        'queue': ['t1'], 'queue_index': 1, 'active_count': 1,
+        'max_concurrent': 1, 'permanently_failed_tracks': [],
+        'cancelled_tracks': set(),
+    }
+    deps, _ = _build_deps()
+    lc.on_download_completed('b1', 't1', False, deps)
+    return download_batches['b1']['permanently_failed_tracks'][0]['failure_reason']
+
+
+def test_on_complete_failed_task_hands_the_wishlist_its_real_reason():
+    # the wishlist showed "download keeps failing" with nothing behind it,
+    # because every failure was flattened to a bare 'Download failed'
+    why = 'tidal download failed (engine state: errored)'
+    assert _failed_reason('failed', why) == why
+    assert _failed_reason('failed') == 'Download failed'
+    assert _failed_reason('failed', '') == 'Download failed'
+    # not_found keeps the fixed text the wishlist page reads as "no match"
+    assert _failed_reason('not_found', 'No match found for "x" after 3 queries') == 'No matching track found'
+
+
 def test_on_complete_cancelled_task_added_to_cancelled_tracks():
     download_tasks['t1'] = {
         'status': 'cancelled', 'track_info': {'name': 'X'},
@@ -338,6 +367,7 @@ def test_batch_completion_emits_batch_complete_when_all_done():
         'max_concurrent': 2, 'permanently_failed_tracks': [],
         'cancelled_tracks': set(),
         'playlist_name': 'PL',
+        'artist_context': {'name': 'Bobby & Max'},
     }
     auto = _FakeAutoEngine()
     monitor = _FakeMonitor()
@@ -345,8 +375,49 @@ def test_batch_completion_emits_batch_complete_when_all_done():
     # Final task completes
     lc.on_download_completed('b1', 't2', True, deps)
     assert download_batches['b1']['phase'] == 'complete'
-    assert ('batch_complete', {'playlist_name': 'PL', 'total_tracks': '2', 'completed_tracks': '2', 'failed_tracks': '0'}) in auto.events
+    assert ('batch_complete', {'playlist_name': 'PL', 'artist': 'Bobby & Max', 'title': '', 'album': '', 'total_tracks': '2', 'completed_tracks': '2', 'failed_tracks': '0', 'more_batches_pending': 'false'}) in auto.events
     assert 'b1' in monitor.stopped
+
+
+def _finish_single_batch(tasks, batch_extra=None):
+    ids = []
+    for i, info in enumerate(tasks):
+        download_tasks[f't{i}'] = {'status': 'completed', 'track_info': info}
+        ids.append(f't{i}')
+    download_batches['b1'] = {
+        'queue': ids, 'queue_index': len(ids), 'active_count': 1,
+        'max_concurrent': 2, 'permanently_failed_tracks': [],
+        'cancelled_tracks': set(), 'playlist_name': 'Wishlist (Auto - Albums)',
+        **(batch_extra or {}),
+    }
+    auto = _FakeAutoEngine()
+    deps, _ = _build_deps(automation=auto, monitor=_FakeMonitor())
+    lc.on_download_completed('b1', ids[-1], True, deps)
+    return [d for t, d in auto.events if t == 'batch_complete'][0]
+
+
+def test_batch_complete_names_the_track_of_a_contextless_wishlist_batch():
+    """the catch-all wishlist batch has no artist_context, so the notification
+    used to say only 'Wishlist (Auto - Albums)'."""
+    ev = _finish_single_batch([{'name': 'Folge 1', 'artists': [{'name': 'Bobby & Max'}],
+                                'album': {'name': 'Das Abenteuer'}}])
+    assert (ev['artist'], ev['title'], ev['album']) == ('Bobby & Max', 'Folge 1', 'Das Abenteuer')
+
+
+def test_batch_complete_summarises_several_artists_without_a_title():
+    ev = _finish_single_batch([
+        {'name': 'a', 'artists': ['A']}, {'name': 'b', 'artists': ['B']},
+        {'name': 'c', 'artists': ['A']}, {'name': 'd', 'artists': ['C']},
+    ])
+    assert ev['artist'] == 'A, B +1'
+    assert ev['title'] == ''
+
+
+def test_batch_complete_keeps_the_album_batch_context():
+    ev = _finish_single_batch(
+        [{'name': 'x', 'artists': ['Other']}],
+        {'artist_context': {'name': 'Bobby & Max'}, 'album_context': {'name': 'Album'}})
+    assert (ev['artist'], ev['album']) == ('Bobby & Max', 'Album')
 
 
 def test_batch_completion_cleans_private_album_bundle_staging(tmp_path):
@@ -1012,6 +1083,9 @@ def _completion_recorder(monkeypatch, rec):
     import core.playlists.materialize_service as ms
     monkeypatch.setattr(ms, 'reconcile_batch_playlists',
                         lambda db, batch, tasks, cfg, **kw: (rec.append(('materialize', dict(tasks), _held())) or [('p', _Mat())]))
+    import core.sync.post_download_sync as pds
+    monkeypatch.setattr(pds, 'register_completed_playlist_batch',
+                        lambda batch, tasks_snapshot=None, database=None: rec.append(('register', dict(tasks_snapshot or {}), _held())) or [])
     import core.album_consistency as ac
     monkeypatch.setattr(ac, 'run_album_consistency',
                         lambda **kw: (rec.append(('consistency', kw['file_infos'], _held())) or {'success': True, 'tags_written': 2, 'total_files': 2, 'release_mbid': 'x'}))
@@ -1075,6 +1149,9 @@ def test_the_slow_half_runs_with_the_lock_released(monkeypatch, path):
     assert by_kind['history'][2] is True, "history is bookkeeping, it stays under the lock"
     assert by_kind['consistency'][2] is False, f"{path}: album consistency ran under tasks_lock"
     assert by_kind['materialize'][2] is False, f"{path}: playlist materialize ran under tasks_lock"
+    # the post-download playlist sync lookup is db work too
+    assert by_kind['register'][2] is False, f"{path}: playlist sync registration ran under tasks_lock"
+    assert set(by_kind['register'][1]) == {'t1', 't2'}
     assert by_kind['consistency'][1] == [{'path': '/a/1.flac'}, {'path': '/a/2.flac'}]
     # the materialize reads a snapshot of this batch's tasks, not the live dict
     assert set(by_kind['materialize'][1]) == {'t1', 't2'}
@@ -1191,3 +1268,57 @@ def test_auto_cleanup_preserves_failed_publish_files(tmp_path, real_batch_healer
     real_batch_healer['validate_and_heal_batch_states']()
     assert 'b1' not in download_batches
     assert audio.exists() is failed_publish
+
+
+# ---------------------------------------------------------------------------
+# #1615: one library scan per download run, not one per batch
+# ---------------------------------------------------------------------------
+
+def _finish(batch_id, task_id, ok, deps, other_phase=None):
+    download_tasks[task_id] = {'status': 'completed' if ok else 'failed',
+                               'track_info': {'name': task_id}, 'track_index': 0}
+    download_batches[batch_id] = {
+        'queue': [task_id], 'queue_index': 1, 'active_count': 1,
+        'max_concurrent': 1, 'cancelled_tracks': set(),
+        'permanently_failed_tracks': [] if ok else [{'track_name': task_id}],
+        'playlist_name': batch_id,
+    }
+    lc.on_download_completed(batch_id, task_id, ok, deps)
+
+
+def _pending_flags(auto):
+    return [e[1]['more_batches_pending'] for e in auto.events if e[0] == 'batch_complete']
+
+
+def test_a_batch_with_others_still_queued_says_so():
+    download_batches['later'] = {'queue': ['x'], 'queue_index': 0, 'phase': 'queued'}
+    auto = _FakeAutoEngine()
+    deps, _ = _build_deps(automation=auto)
+    _finish('first', 't1', True, deps)
+    assert _pending_flags(auto) == ['true']
+
+
+def test_finished_and_non_music_batches_do_not_hold_the_scan():
+    download_batches['old'] = {'queue': [], 'phase': 'complete'}
+    download_batches['podcasts'] = {'queue': [], 'phase': 'downloading'}
+    auto = _FakeAutoEngine()
+    deps, _ = _build_deps(automation=auto)
+    _finish('only', 't1', True, deps)
+    assert _pending_flags(auto) == ['false']
+
+
+def test_the_last_batch_scans_for_an_earlier_one_even_if_it_got_nothing():
+    download_batches['later'] = {'queue': ['x'], 'queue_index': 0, 'phase': 'queued'}
+    auto = _FakeAutoEngine()
+    deps, _ = _build_deps(automation=auto)
+    _finish('first', 't1', True, deps)
+    del download_batches['later']
+    _finish('last', 't2', False, deps)
+    assert _pending_flags(auto) == ['true', 'false']
+
+
+def test_nothing_downloaded_and_nothing_owed_still_emits_nothing():
+    auto = _FakeAutoEngine()
+    deps, _ = _build_deps(automation=auto)
+    _finish('only', 't1', False, deps)
+    assert _pending_flags(auto) == []

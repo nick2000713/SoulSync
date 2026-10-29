@@ -11,8 +11,10 @@
 import type { ExportJob, ExportMode, ExportStartResponse } from './-sync.export';
 import type { SyncHistoryEntry, SyncHistoryResyncTrack } from './-sync.history';
 import type { MirrorPayload } from './-sync.import';
+import type { MirroredPlaylistRow, MirroredTrackStatus } from './-sync.mirrored';
 import type { MirroredPipelineState } from './-sync.pipeline';
 import type { SourceVerticalConfig } from './-sync.sources';
+import type { SourceSkipped } from './-sync.state';
 import type { RawDiscoveryResult } from './-sync.transform';
 
 import { isServiceExport } from './-sync.export';
@@ -165,9 +167,20 @@ export async function fetchActiveProcesses(): Promise<{
 }
 
 /** GET /api/spotify/playlists (loadSpotifyPlaylists, sync-spotify.js 1598). */
+/**
+ * An account list's rows. A list the server couldn't load ({error}, e.g. a 401
+ * when the account isn't connected) throws, so the tab says why instead of
+ * "No playlists found".
+ */
+function accountListRows(data: unknown): unknown[] {
+  if (Array.isArray(data)) return data;
+  const body = data as { playlists?: unknown[]; error?: unknown } | null;
+  if (typeof body?.error === 'string' && body.error) throw new Error(body.error);
+  return body?.playlists ?? [];
+}
+
 export async function fetchSpotifyPlaylists(): Promise<unknown[]> {
-  const data = await readJson<unknown>(await fetch('/api/spotify/playlists'));
-  return Array.isArray(data) ? data : ((data as { playlists?: unknown[] })?.playlists ?? []);
+  return accountListRows(await readJson<unknown>(await fetch('/api/spotify/playlists')));
 }
 
 /** GET /api/deezer/arl-status (initializeSyncPage deezer tab, 3698). */
@@ -177,8 +190,7 @@ export async function fetchDeezerArlStatus(): Promise<{ authenticated?: boolean 
 
 /** GET /api/deezer/arl-playlists (loadDeezerArlPlaylists, sync-services.js 2437). */
 export async function fetchDeezerArlPlaylists(): Promise<unknown[]> {
-  const data = await readJson<unknown>(await fetch('/api/deezer/arl-playlists'));
-  return Array.isArray(data) ? data : ((data as { playlists?: unknown[] })?.playlists ?? []);
+  return accountListRows(await readJson<unknown>(await fetch('/api/deezer/arl-playlists')));
 }
 
 /** A playlist's tracks, as both account tabs' details modals read them. */
@@ -270,8 +282,11 @@ async function pollDeezerPlaylistLoad<T>(
 /** GET /api/sync/status/<id> — the ACCOUNT sync engine's status, not a vertical's. */
 export async function fetchAccountSyncStatus(
   playlistId: string,
+  { probe = false }: { probe?: boolean } = {},
 ): Promise<SourceSyncStatusResponse> {
-  return readJson(await fetch(`/api/sync/status/${playlistId}`));
+  // probe: idle answers 200 instead of 404, for load-time checks (#1763)
+  const query = probe ? '?probe=1' : '';
+  return readJson(await fetch(`/api/sync/status/${playlistId}${query}`));
 }
 
 /** POST /api/mirror-playlist — the payload comes from buildMirrorPayload. */
@@ -481,18 +496,40 @@ export async function clearMirroredDiscovery(
   );
 }
 
+/**
+ * POST .../check-library (#1910): check the tracks nothing has checked against
+ * the library yet. a slice per call; `remaining` says how many are left.
+ */
+export async function checkMirroredLibrary(playlistId: number | string): Promise<{
+  success?: boolean;
+  checked?: number;
+  found?: number;
+  remaining?: number;
+  error?: string;
+}> {
+  return readJson(
+    await fetch(`/api/mirrored-playlists/${playlistId}/check-library`, { method: 'POST' }),
+  );
+}
+
 /** One mirrored playlist with its tracks (openMirroredPlaylistModal, 1069). */
 export interface MirroredPlaylistDetail {
   error?: string;
   name?: string;
+  /** the rename when there is one, else name */
+  display_name?: string;
   source?: string;
   source_playlist_id?: string;
   source_ref?: string;
   description?: string;
   owner?: string;
   image_url?: string;
+  /** the cover is one the user generated: refreshes keep it, and it can be undone */
+  custom_cover?: boolean;
   updated_at?: string;
   mirrored_at?: string;
+  /** what the source never handed over when it was mirrored (#1613). */
+  source_skipped?: SourceSkipped | null;
   tracks?: {
     id?: number;
     position?: number;
@@ -502,7 +539,18 @@ export interface MirroredPlaylistDetail {
     duration_ms?: number;
     image_url?: string;
     source_track_id?: string;
+    /** when it joined the playlist; null for rows from before that was kept */
+    added_at?: string | null;
+    status?: MirroredTrackStatus;
   }[];
+  /** how many tracks sit in each status (#1721) */
+  status_counts?: Partial<Record<MirroredTrackStatus, number>>;
+  /** tracks the detail's library check should look at: unchecked, plus its
+      own misses old enough to ask again (#1910) */
+  library_check_due?: number;
+  is_request_list?: boolean;
+  auto_remove_fulfilled?: boolean;
+  upstream_playlist_id?: string | null;
 }
 
 /** GET /api/mirrored-playlists/<id> (1069). */
@@ -578,6 +626,45 @@ export async function patchMirroredCustomName(
   return data;
 }
 
+/** POST .../copy-to-request-list */
+export async function postCopyToRequestList(
+  playlistId: number | string,
+  customName?: string,
+): Promise<{ success: boolean; new_playlist_id?: number; playlist?: MirroredPlaylistRow }> {
+  const response = await fetch(`/api/mirrored-playlists/${playlistId}/copy-to-request-list`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ custom_name: customName }),
+  });
+  const data = await readJson<{
+    success: boolean;
+    new_playlist_id?: number;
+    playlist?: MirroredPlaylistRow;
+    error?: string;
+  }>(response);
+  if (!response.ok || data.error)
+    throw new Error(data.error || 'Failed to copy playlist to request list');
+  return data;
+}
+
+/** PATCH .../request-list-settings */
+export async function patchRequestListSettings(
+  playlistId: number | string,
+  autoRemoveFulfilled: boolean,
+): Promise<{ success: boolean; playlist?: MirroredPlaylistRow }> {
+  const response = await fetch(`/api/mirrored-playlists/${playlistId}/request-list-settings`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ auto_remove_fulfilled: autoRemoveFulfilled }),
+  });
+  const data = await readJson<{ success: boolean; playlist?: MirroredPlaylistRow; error?: string }>(
+    response,
+  );
+  if (!response.ok || data.error)
+    throw new Error(data.error || 'Failed to update request list settings');
+  return data;
+}
+
 /* ── Auto-Sync pipeline + source ref (auto-sync.js 2358-2525) ─────────────── */
 
 /**
@@ -619,20 +706,26 @@ export function recordServerLink(
   }).catch(() => undefined);
 }
 
-/**
- * POST .../pipeline/run — an empty JSON body, as the vanilla sends (2468-2472).
- * `refreshOnly` pulls the source and discovers the new tracks, nothing pushed
- * or downloaded (#1413).
- */
+export interface PipelineRunOptions {
+  /** Pull and identify source tracks without pushing or downloading (#1413). */
+  refreshOnly?: boolean;
+  /** Explicit legacy per-click choice: sync without queuing missing tracks. */
+  skipWishlist?: boolean;
+}
+
+/** POST .../pipeline/run, preserving omitted options and explicit false values. */
 export async function runMirroredPipeline(
   playlistId: number | string,
-  opts: { refreshOnly?: boolean } = {},
+  opts: PipelineRunOptions = {},
 ): Promise<{ state?: MirroredPipelineState }> {
   return readPipelineResponse(
     await fetch(`/api/mirrored-playlists/${playlistId}/pipeline/run`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(opts.refreshOnly ? { refresh_only: true } : {}),
+      body: JSON.stringify({
+        ...(opts.refreshOnly ? { refresh_only: true } : {}),
+        ...(opts.skipWishlist !== undefined ? { skip_wishlist: opts.skipWishlist } : {}),
+      }),
     }),
     PIPELINE_RUN_FAILED,
   );
@@ -828,22 +921,6 @@ export async function patchMirroredPreferences(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(preferences),
   });
-}
-
-/**
- * GET /api/logs — the sidebar log area's HTTP half (`loadLogs`, api-monitor.js
- * 1114-1127). Returns null on any failure so the caller keeps the text it has,
- * matching the vanilla, which only overwrites the textarea on error when it is
- * still showing its own placeholder.
- */
-export async function fetchSyncLogs(): Promise<{ logs?: unknown } | null> {
-  try {
-    const response = await fetch('/api/logs');
-    if (!response.ok) return null;
-    return (await response.json()) as { logs?: unknown };
-  } catch {
-    return null;
-  }
 }
 
 /**

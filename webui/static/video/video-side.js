@@ -20,6 +20,7 @@
     // DOMContentLoaded) and may rewrite an unknown /video-detail/... URL to
     // /dashboard. This is the real path the user reloaded/deep-linked.
     var BOOT_PATH = (window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname);
+    var BOOT_SEARCH = window.location.search;
 
     var SIDE_KEY = 'soulsync_side';
     var MUSIC_SUBTITLE = 'Music Sync & Manager';
@@ -95,6 +96,9 @@
             return s ? (s.textContent || '').trim() : '';
         }
         var host = pageId === 'video-movie-detail' ? '[data-video-detail="movie"]' : '[data-video-detail="show"]';
+        // a page that failed to load isn't somewhere to go back to by name
+        var hostEl = document.querySelector(host);
+        if (hostEl && hostEl.classList.contains('vd-page--error')) return '';
         var t = document.querySelector(host + ' [data-vd-title]');
         return t ? (t.textContent || '').trim() : '';
     }
@@ -141,6 +145,18 @@
             // the page; the URL is already correct so don't re-push it.
             if (readSide() !== 'video') { persistSide('video'); applySide('video'); }
             navigate(pg, 'restore');
+            _backStack = [];
+            updateBackLabels();
+            return;
+        }
+        // Back/Forward onto a shared React page's video view (/wishlist?media=tv):
+        // stay on the video side and mark the page. The React router already
+        // shows it for this URL, so nothing is navigated or re-pushed.
+        var shared = parseSharedPath(path, window.location.search);
+        if (shared) {
+            if (readSide() !== 'video') { persistSide('video'); applySide('video'); }
+            setActiveNav(shared);
+            document.body.setAttribute('data-video-page', shared);
             _backStack = [];
             updateBackLabels();
             return;
@@ -305,14 +321,188 @@
         if (!cp || cp.is_admin || cp.id === 1) return true;
         if (pageId === 'video-help' || pageId === 'video-issues' || DETAIL_PAGES[pageId]) return true;
         if (['video-import', 'video-settings', 'video-automations'].indexOf(pageId) > -1) return false;
+        // requests: profiles without download rights make them (admins passed
+        // above). same rule as the sidebar, not a page toggle
+        if (pageId === 'video-requests') return typeof canDownload === 'function' && !canDownload();
         var ap = cp.allowed_pages;
         return !ap || ap.indexOf(pageId) > -1;
     }
-    function navigate(pageId, mode) {
+    // Hand off to the unified React downloads page with its video view
+    // preselected. Downloads is a shared page: the shell stays on the
+    // video side and only the page's media tab is set — no side flip.
+    // Routes in-app, no full reload. mode 'replace' (boot / deep link)
+    // must not leave /video-downloads in history, or Back would bounce
+    // straight back into this redirect.
+    function gotoUnifiedDownloads(mode) {
+        _backStack = [];
+        setActiveNav('video-downloads');
+        // Reveal wiring, same mechanism showPage() drives for the legacy
+        // shared pages: the attribute keys the video-side.css rules that
+        // show #webui-react-root and hide the video host. Without it the
+        // blanket video-side rule keeps the React root display:none and
+        // the routed page renders invisibly under the stale video page.
+        document.body.setAttribute('data-video-page', 'video-downloads');
+        var replace = mode === 'replace' || mode === 'restore';
+        try {
+            var wsr = window.SoulSyncWebRouter;
+            if (wsr && typeof wsr.navigateToPage === 'function') {
+                wsr.navigateToPage('active-downloads', { query: { media: 'video' }, replace: replace });
+                // No side flip here (there was one, in #1651): flipping is
+                // what stranded the side toggle — the toggle resumes the
+                // active-marked page, which is this hand-off, so every
+                // Video click re-ran it and bounced straight back to music
+                // with no way out.
+                return;
+            }
+        } catch (e) { /* fall through to a real redirect */ }
+        try { window.location.assign('/active-downloads?media=video'); }
+        catch (e2) { window.location.href = '/active-downloads?media=video'; }
+    }
+
+    // The video wishlist is the React /wishlist page on its video tabs (movies,
+    // tv, youtube): the same shared-page hand-off as Downloads. The shell stays
+    // on the video side, data-video-page keys the reveal css, no side flip. It
+    // reopens on the tab you last had (the page remembers it for the session).
+    var VIDEO_WISHLIST_TABS = { movies: 1, tv: 1, youtube: 1 };
+    // video pages that are really a React route on a video tab: navigate()
+    // hands them off, so their /video-<page> url never stays in the bar.
+    var HANDED_OFF = { 'video-wishlist': 1, 'video-tools': 1, 'video-calendar': 1, 'video-dashboard': 1 };
+    function lastVideoWishlistTab() {
+        try {
+            var t = sessionStorage.getItem('soulsync.videoWishlistTab');
+            return VIDEO_WISHLIST_TABS[t] ? t : 'movies';
+        } catch (e) { return 'movies'; }
+    }
+    // A reload or deep link onto a shared React page's video view (the
+    // wishlist's /wishlist?media=tv) belongs on the video side, on that page.
+    // Not a bootPage: those re-assert their /video-<page> URL for 700ms, which
+    // would overwrite the React URL the page lives at.
+    function parseSharedPath(pathname, search) {
+        var path = String(pathname || '').replace(/\/+$/, '');
+        var media = null;
+        try { media = new URLSearchParams(search || '').get('media'); } catch (e) { media = null; }
+        // /tools?media=video is the video tools page (the music tools page on
+        // its video media)
+        if (path === '/tools') return media === 'video' ? 'video-tools' : null;
+        // the calendar only exists on the video side
+        if (path === '/calendar') return 'video-calendar';
+        // /dashboard?media=video is the video dashboard (the music dashboard's
+        // layout on video's data)
+        if (path === '/dashboard') return media === 'video' ? 'video-dashboard' : null;
+        if (path !== '/wishlist') return null;
+        if (!VIDEO_WISHLIST_TABS[media]) return null;
+        try { sessionStorage.setItem('soulsync.videoWishlistTab', media); } catch (e2) { /* ignore */ }
+        return 'video-wishlist';
+    }
+
+    function gotoUnifiedWishlist(mode) {
+        _backStack = [];
+        setActiveNav('video-wishlist');
+        document.body.setAttribute('data-video-page', 'video-wishlist');
+        var replace = mode === 'replace' || mode === 'restore';
+        var media = lastVideoWishlistTab();
+        try {
+            var wsr = window.SoulSyncWebRouter;
+            if (wsr && typeof wsr.navigateToPage === 'function') {
+                wsr.navigateToPage('wishlist', { query: { media: media }, replace: replace });
+                return;
+            }
+        } catch (e) { /* fall through to a real redirect */ }
+        try { window.location.assign('/wishlist?media=' + media); }
+        catch (e2) { window.location.href = '/wishlist?media=' + media; }
+    }
+
+    // the video tools page is the React /tools page on ?media=video: same
+    // hand-off as the wishlist. the side stays video, data-video-page keys the
+    // reveal css, and nothing re-asserts /video-tools over the react url.
+    // job (optional) lands on that job's card: /tools?media=video&job=<id>
+    function gotoUnifiedTools(mode, job) {
+        _backStack = [];
+        setActiveNav('video-tools');
+        document.body.setAttribute('data-video-page', 'video-tools');
+        var replace = mode === 'replace' || mode === 'restore';
+        try {
+            var wsr = window.SoulSyncWebRouter;
+            if (wsr && typeof wsr.navigateToPage === 'function') {
+                var query = { media: 'video' };
+                if (job) query.job = job;
+                wsr.navigateToPage('tools', { query: query, replace: replace });
+                return;
+            }
+        } catch (e) { /* fall through to a real redirect */ }
+        var href = '/tools?media=video' + (job ? '&job=' + encodeURIComponent(job) : '');
+        try { window.location.assign(href); }
+        catch (e2) { window.location.href = href; }
+    }
+
+    // the video calendar is the React /calendar page: the same hand-off as tools.
+    // opts.date lands on that week, opts.ep opens that episode on arrival.
+    function gotoUnifiedCalendar(mode, opts) {
+        _backStack = [];
+        setActiveNav('video-calendar');
+        document.body.setAttribute('data-video-page', 'video-calendar');
+        var replace = mode === 'replace' || mode === 'restore';
+        // a reload or Back already on /calendar: the React route has the url,
+        // with its view/date/ep. re-navigating would drop them.
+        var here = (window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname).replace(/\/+$/, '');
+        if (mode === 'restore' && here === '/calendar') return;
+        var query = { media: 'video' };
+        if (opts && opts.date) query.date = opts.date;
+        if (opts && opts.ep != null) query.ep = String(opts.ep);
+        try {
+            var wsr = window.SoulSyncWebRouter;
+            if (wsr && typeof wsr.navigateToPage === 'function') {
+                wsr.navigateToPage('calendar', { query: query, replace: replace });
+                return;
+            }
+        } catch (e) { /* fall through to a real redirect */ }
+        var href = '/calendar?' + new URLSearchParams(query).toString();
+        try { window.location.assign(href); }
+        catch (e2) { window.location.href = href; }
+    }
+    window.videoOpenCalendar = function (opts) { gotoUnifiedCalendar('push', opts); };
+
+    // the video dashboard is the React /dashboard page on ?media=video: the
+    // same hand-off as tools and the calendar.
+    function gotoUnifiedDashboard(mode) {
+        _backStack = [];
+        setActiveNav('video-dashboard');
+        document.body.setAttribute('data-video-page', 'video-dashboard');
+        var replace = mode === 'replace' || mode === 'restore';
+        try {
+            var wsr = window.SoulSyncWebRouter;
+            if (wsr && typeof wsr.navigateToPage === 'function') {
+                wsr.navigateToPage('dashboard', { query: { media: 'video' }, replace: replace });
+                return;
+            }
+        } catch (e) { /* fall through to a real redirect */ }
+        try { window.location.assign('/dashboard?media=video'); }
+        catch (e2) { window.location.href = '/dashboard?media=video'; }
+    }
+
+    // a React page on its video view (/tools?media=video, /active-downloads?media=video...)
+    function onSharedVideoUrl() {
+        var path = (window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname).replace(/\/+$/, '');
+        if (parseSharedPath(path, window.location.search)) return true;
+        var media = null;
+        try { media = new URLSearchParams(window.location.search).get('media'); } catch (e) { media = null; }
+        return path === '/active-downloads' && media === 'video';
+    }
+
+    function navigate(pageId, mode, job) {
         // Music-only profile: there is no video page to fall back to — punt the
         // whole navigation back to the music side instead.
         if (!sideAllowed('video')) { switchSide('music', { force: true }); return; }
         if (!videoPageAllowed(pageId)) { pageId = DEFAULT_VIDEO_PAGE; mode = 'replace'; }
+        // The music + video downloads pages are unified into the React
+        // /active-downloads page — the old video shell subpage is gone, so
+        // every in-shell navigation (sidebar, goto links) and every
+        // /video-downloads deep link lands on the unified page's video view.
+        if (pageId === 'video-downloads') { gotoUnifiedDownloads(mode); return; }
+        if (pageId === 'video-wishlist') { gotoUnifiedWishlist(mode); return; }
+        if (pageId === 'video-tools') { gotoUnifiedTools(mode, job); return; }
+        if (pageId === 'video-calendar') { gotoUnifiedCalendar(mode); return; }
+        if (pageId === 'video-dashboard') { gotoUnifiedDashboard(mode); return; }
         setActiveNav(pageId);
         showPage(pageId);
         if (DETAIL_PAGES[pageId] || mode === 'restore') return;
@@ -354,6 +544,16 @@
             // Land on the last-active video page and give it a real URL.
             var active = document.querySelector('.video-nav .nav-button.active');
             navigate(active ? active.getAttribute('data-video-page') : DEFAULT_VIDEO_PAGE);
+        } else if (onSharedVideoUrl()) {
+            // a React page on its video view stays mounted when the side flips,
+            // so music would show the video page under its own sidebar. take
+            // music home instead.
+            var home = typeof getProfileHomePage === 'function' ? getProfileHomePage() : 'dashboard';
+            try {
+                var wsr = window.SoulSyncWebRouter;
+                if (wsr && typeof wsr.navigateToPage === 'function') { wsr.navigateToPage(home); return; }
+            } catch (e) { /* fall through to a real redirect */ }
+            try { window.location.assign('/'); } catch (e2) { window.location.href = '/'; }
         } else if (parseDetailPath((window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname)) || parsePagePath((window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname))) {
             // Back to music from a video URL → drop it so a reload stays on music.
             try { history.replaceState(null, '', '/'); } catch (e) { /* ignore */ }
@@ -367,6 +567,7 @@
         // have rewritten window.location to /dashboard by now).
         var bootDetail = parseDetailPath(BOOT_PATH);
         var bootPage = bootDetail ? null : parsePagePath(BOOT_PATH);
+        var bootShared = (bootDetail || bootPage) ? null : parseSharedPath(BOOT_PATH, BOOT_SEARCH);
 
         var toggleButtons = document.querySelectorAll('.side-toggle-btn');
         for (var i = 0; i < toggleButtons.length; i++) {
@@ -408,7 +609,28 @@
         // button in the download modal / a detail page's live-progress chip).
         document.addEventListener('soulsync:video-navigate', function (e) {
             var pageId = e && e.detail && (e.detail.page || e.detail);
-            if (typeof pageId === 'string') navigate(pageId);
+            var job = e && e.detail && typeof e.detail === 'object' ? e.detail.job : null;
+            if (typeof pageId === 'string') navigate(pageId, undefined, job || undefined);
+        });
+
+        // the studio launchers: any [data-video-overlay-studio] /
+        // [data-video-collection-studio] / [data-video-poster-manager] opens its
+        // editor (the tools page's studio cards carry them). the editors are
+        // admin-only, so a non-admin click does nothing even if one shows.
+        document.addEventListener('click', function (e) {
+            var t = e.target && e.target.closest ? e.target : null;
+            if (!t) return;
+            var admin = !(typeof currentProfile !== 'undefined' && currentProfile && !currentProfile.is_admin);
+            if (t.closest('[data-video-poster-manager]')) {
+                e.preventDefault();
+                if (window.VideoPoster) window.VideoPoster.openSearch();
+            } else if (t.closest('[data-video-overlay-studio]')) {
+                e.preventDefault();
+                if (admin && window.VideoOverlayEditor) window.VideoOverlayEditor.open();
+            } else if (t.closest('[data-video-collection-studio]')) {
+                e.preventDefault();
+                if (admin && window.VideoCollectionEditor) window.VideoCollectionEditor.open();
+            }
         });
 
         // Drill-in: a card fires soulsync:video-open-detail {kind, id, source}. We
@@ -463,7 +685,7 @@
             '.video-nav .nav-button[data-video-page="' + DEFAULT_VIDEO_PAGE + '"]');
         if (defaultNav) defaultNav.classList.add('active');
 
-        var bootSide = (bootDetail || bootPage) ? 'video' : readSide();
+        var bootSide = (bootDetail || bootPage || bootShared) ? 'video' : readSide();
         // Side access: if the profile is already known at boot (fast path),
         // land straight on the allowed side. When the profile loads later, the
         // profile-apply in init.js force-switches — this just avoids the flash.
@@ -477,11 +699,14 @@
         // the plain last-side-was-video case leaves the URL untouched (as before).
         if (bootSide === 'video' && !bootDetail) {
             var activeBtn = document.querySelector('.video-nav .nav-button.active');
-            var initialPage = bootPage || (activeBtn && activeBtn.getAttribute('data-video-page')) || DEFAULT_VIDEO_PAGE;
+            var initialPage = bootPage || bootShared || (activeBtn && activeBtn.getAttribute('data-video-page')) || DEFAULT_VIDEO_PAGE;
             setActiveNav(initialPage);
             var pagePath = buildPagePath(initialPage);
+            // A page handed off to a React route (the wishlist) lives at the
+            // React url once it lands; re-asserting /video-wishlist over it sent
+            // the router to an unknown path and the shell bounced the profile home.
             var reassertPage = function () {
-                if (bootPage && document.body.getAttribute('data-side') === 'video' &&
+                if (bootPage && !HANDED_OFF[initialPage] && document.body.getAttribute('data-side') === 'video' &&
                     !DETAIL_PAGES[document.body.getAttribute('data-video-page')] &&
                     (window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname) !== pagePath) {
                     try { history.replaceState({ videoPage: initialPage }, '', pagePath); } catch (e) { /* ignore */ }

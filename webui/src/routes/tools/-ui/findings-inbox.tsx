@@ -29,6 +29,7 @@ export interface FindingsInboxProps {
   onToggleOpen: (findingType: string) => void;
   onFixGroup: (group: FindingGroup, info: FindingTypeInfo | undefined) => void;
   onDismissGroup: (group: FindingGroup, info: FindingTypeInfo | undefined) => void;
+  onReopenGroup: (group: FindingGroup, info: FindingTypeInfo | undefined) => void;
   /** True while a background bulk run owns the fix buttons. */
   busy: boolean;
   /** The scoped finding list, rendered inside whichever group is open. */
@@ -43,6 +44,7 @@ export function FindingsInbox({
   onToggleOpen,
   onFixGroup,
   onDismissGroup,
+  onReopenGroup,
   busy,
   children,
 }: FindingsInboxProps) {
@@ -110,9 +112,17 @@ export function FindingsInbox({
                       touches files
                     </span>
                   ) : null}
+                  {info?.acquires ? (
+                    <span
+                      className="repair-inbox-risk acquires"
+                      title="Fixing this starts downloads, so fix all safe leaves it alone"
+                    >
+                      downloads
+                    </span>
+                  ) : null}
                 </span>
                 <span className="repair-inbox-blurb">
-                  {findingTypeBlurb(group.finding_type) ||
+                  {findingTypeBlurb(group.finding_type, info) ||
                     (info?.fixable ? '' : 'Review only — no automatic fix for this one.')}
                 </span>
               </span>
@@ -142,6 +152,17 @@ export function FindingsInbox({
                     onClick={() => onDismissGroup(group, info)}
                   >
                     Dismiss all
+                  </button>
+                ) : null}
+                {group.dismissed > 0 ? (
+                  <button
+                    type="button"
+                    className="repair-inbox-btn ghost"
+                    disabled={busy}
+                    title="Reopen all dismissed findings of this type"
+                    onClick={() => onReopenGroup(group, info)}
+                  >
+                    Reopen all
                   </button>
                 ) : null}
                 <button

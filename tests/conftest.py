@@ -45,6 +45,10 @@ if _XDIST_WORKER and 'soulsync-test-imagecache-' in _os.environ.get('SOULSYNC_IM
     _os.environ.pop('SOULSYNC_IMAGE_CACHE_DIR', None)
 if _XDIST_WORKER and 'soulsync-test-audiobooks-' in _os.environ.get('AUDIOBOOK_DATABASE_PATH', ''):
     _os.environ.pop('AUDIOBOOK_DATABASE_PATH', None)
+for _var, _mark in (('SOULSYNC_PLAYLIST_COVER_DIR', 'soulsync-test-covers-'),
+                    ('SOULSYNC_AVATAR_DIR', 'soulsync-test-avatars-')):
+    if _XDIST_WORKER and _mark in _os.environ.get(_var, ''):
+        _os.environ.pop(_var, None)
 
 if not _os.environ.get('SOULSYNC_TEST_DB_READY'):
     _TEST_DB_DIR = _tempfile.mkdtemp(prefix='soulsync-testdb-')
@@ -83,6 +87,22 @@ if not _os.environ.get('AUDIOBOOK_DATABASE_PATH'):
     _TEST_AUDIOBOOK_DIR = _tempfile.mkdtemp(prefix='soulsync-test-audiobooks-')
     _os.environ['AUDIOBOOK_DATABASE_PATH'] = _os.path.join(_TEST_AUDIOBOOK_DIR, 'test_audiobooks.db')
     _atexit.register(lambda: _shutil.rmtree(_TEST_AUDIOBOOK_DIR, ignore_errors=True))
+
+# covers and avatars default to ./storage under the checkout. the nightly docker
+# build runs right after the suite in the same checkout, so a test that made a
+# cover shipped storage/playlist_covers in the image, owned by uid 1000, and it
+# stayed unwritable for anyone running another PUID (SeadogsBooty, PUID 1026).
+# covers get their own folder per test (see _isolated_cover_dir below):
+# cover_dir() reads the env before a test's own base_dir, so one shared folder
+# would let one test's preview-1.webp leak into the next.
+for _var, _prefix in (('SOULSYNC_PLAYLIST_COVER_DIR', 'soulsync-test-covers-'),
+                      ('SOULSYNC_AVATAR_DIR', 'soulsync-test-avatars-')):
+    if not _os.environ.get(_var):
+        _dir = _tempfile.mkdtemp(prefix=_prefix)
+        _os.environ[_var] = _dir
+        _atexit.register(lambda d=_dir: _shutil.rmtree(d, ignore_errors=True))
+_COVER_ROOT = _os.environ['SOULSYNC_PLAYLIST_COVER_DIR']
+_cover_seq = iter(range(1, 10 ** 9))
 
 import copy
 import os as _os
@@ -585,7 +605,7 @@ def add_activity_item(icon, title, subtitle, time_ago="Now", show_toast=True):
 # Fixtures
 # ---------------------------------------------------------------------------
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def test_app():
     """Create a minimal Flask + SocketIO app that mirrors Phase 1+2 endpoints."""
     global _test_socketio
@@ -1142,6 +1162,21 @@ def _inert_video_download_monitor():
 
 
 @pytest.fixture(scope="session", autouse=True)
+def _soulseek_ownership_in_memory():
+    """keep the soulseek ownership registry in memory for the suite.
+
+    production saves it in the metadata table so a restart remembers which
+    slskd transfers are ours. every test client shares one session temp db, so
+    saving would leak one test's "owned" ids into the next. tests of the
+    saved registry turn it back on with their own store.
+    """
+    from core.soulseek_client import SoulseekClient
+    SoulseekClient.PERSIST_OWNERSHIP = False
+    yield
+    SoulseekClient.PERSIST_OWNERSHIP = True
+
+
+@pytest.fixture(scope="session", autouse=True)
 def _inert_music_disk_guard():
     """Pin the music min-free-disk guard OFF for the whole suite.
 
@@ -1153,6 +1188,22 @@ def _inert_music_disk_guard():
     dg._floor_override = 0.0
     yield
     dg._floor_override = None
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _inert_spotify_second_pass_fetch():
+    """no real spotify fetch from the #1721 second pass, anywhere in the suite.
+
+    a mirrored spotify track that misses its metadata source gets fetched by
+    id through SpotipyFree, which is the network. tests of the second pass
+    monkeypatch _free_track with a fake; everything else gets nothing back and
+    the track stays wing it, same as before the second pass existed.
+    """
+    import core.discovery.spotify_second_pass as ssp
+    original = ssp._free_track
+    ssp._free_track = lambda track_id: None
+    yield
+    ssp._free_track = original
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -1386,6 +1437,12 @@ def reset_state(_inert_video_enrichment_engine, _inert_video_download_monitor):
     # every bit of it a previous test's reservation.
     from core.prowlarr_throttle import _reset_for_tests as _reset_prowlarr_throttle
     _reset_prowlarr_throttle()
+    # LRCLib throttle (core.lrclib_throttle, #1879): fourth of this shape, plus
+    # a shared cooldown. A test that feeds the real client a 429 leaves up to
+    # 300s of cooldown behind, and the next test through the shared
+    # lyrics_client would sleep it out for real.
+    from core.lrclib_throttle import _reset_for_tests as _reset_lrclib_throttle
+    _reset_lrclib_throttle()
     # Video download-source cooldowns (core.automation.handlers.
     # video_process_wishlist): two process-wide dicts keyed by (item, transport).
     # Two client refusals put that pair on a SIX HOUR cooldown, and the test
@@ -1549,3 +1606,41 @@ def _web_server_clients_start_as_the_admin():
         yield
     finally:
         ws.app.test_client_class = saved
+
+
+@pytest.fixture
+def server_tz(monkeypatch):
+    """set the server's local timezone for one test. played_at is stored
+    utc and hour-of-day charts read it in local time, so a test that seeds
+    hours picks the zone it means. call with a tz name, e.g. server_tz('UTC')"""
+    def _set(name):
+        monkeypatch.setenv('TZ', name)
+        time.tzset()
+    yield _set
+    monkeypatch.undo()
+    time.tzset()
+
+
+@pytest.fixture
+def utc_server(server_tz):
+    """the server's local time is utc: a stored hour is the hour shown"""
+    server_tz('UTC')
+
+
+@pytest.fixture(autouse=True)
+def _no_background_playlist_identify(monkeypatch):
+    """an edit to a user playlist queues a background identify. importing
+    web_server wires that to the real discovery worker, so any test that
+    touches the user-playlist routes afterwards would start real discovery
+    threads. unhooked here; the auto_identify tests hook their own runner."""
+    from core.playlists import auto_identify
+    monkeypatch.setattr(auto_identify, "_runner", None)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_cover_dir(monkeypatch):
+    """a fresh playlist-cover folder per test, under the session's temp root.
+    cover_dir() makes it on first use, so tests that never touch covers pay
+    nothing."""
+    monkeypatch.setenv('SOULSYNC_PLAYLIST_COVER_DIR',
+                       _os.path.join(_COVER_ROOT, str(next(_cover_seq))))

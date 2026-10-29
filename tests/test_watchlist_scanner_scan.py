@@ -1,6 +1,7 @@
 import sys
 import types
 from datetime import datetime, timedelta
+from pathlib import Path
 
 _RECENT_RELEASE_DATE = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d")
 
@@ -128,7 +129,9 @@ class _FakeDB:
         self.discovery_pool_calls = []
         self.discovery_pool_timestamp_calls = []
         self.discovery_recent_calls = []
-        self.db_albums = []
+        self._db_albums = []
+        self._real_db = None
+        self._tmp = None
 
     def get_watchlist_artists(self, profile_id=None):
         return list(self.artists)
@@ -161,34 +164,47 @@ class _FakeDB:
         self.discovery_pool_timestamp_calls.append((track_count, profile_id))
         return True
 
-    class _Cursor:
-        def __init__(self, parent):
-            self.parent = parent
+    # A REAL database, built on demand: the scanner's own SQL runs against it,
+    # so a column or join that does not exist fails here instead of being
+    # answered by a stub that never looked at the query (§50.4.4.20).
+    @property
+    def db_albums(self):
+        return list(self._db_albums)
 
-        def execute(self, *args, **kwargs):
-            return None
+    @db_albums.setter
+    def db_albums(self, rows):
+        self._db_albums = list(rows)
+        from core.library2.importer import normalize_name
+        conn = self._library()._get_connection()
+        try:
+            for row in self._db_albums:
+                artist = conn.execute(
+                    "INSERT INTO lib2_artists(name, name_key) VALUES(?,?)",
+                    (row["artist_name"], normalize_name(row["artist_name"]))
+                ).lastrowid
+                album = conn.execute(
+                    "INSERT INTO lib2_albums(primary_artist_id, title, origin)"
+                    " VALUES(?,?,'library')", (artist, row["title"])).lastrowid
+                track = conn.execute(
+                    "INSERT INTO lib2_tracks(album_id, title) VALUES(?,?)",
+                    (album, f'{row["title"]} Track')).lastrowid
+                conn.execute(
+                    "INSERT INTO lib2_track_files(track_id,path) VALUES(?,?)",
+                    (track, f'/music/{track}.flac'))
+            conn.commit()
+        finally:
+            conn.close()
 
-        def fetchall(self):
-            return list(self.parent.db_albums)
-
-        def fetchone(self):
-            return {"count": 0}
-
-    class _Conn:
-        def __init__(self, cursor):
-            self._cursor = cursor
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def cursor(self):
-            return self._cursor
+    def _library(self):
+        if self._real_db is None:
+            import tempfile
+            from database.music_database import MusicDatabase
+            self._tmp = tempfile.TemporaryDirectory()
+            self._real_db = MusicDatabase(str(Path(self._tmp.name) / "scan.db"))
+        return self._real_db
 
     def _get_connection(self):
-        return self._Conn(self._Cursor(self))
+        return self._library()._get_connection()
 
 
 def _build_artist(name="Artist One", profile_id=11):
@@ -1110,6 +1126,71 @@ def test_update_discovery_pool_incremental_uses_source_priority(monkeypatch):
     assert deezer_client.album_calls
     assert spotify_client.search_calls == []
     assert spotify_client.album_calls == []
+
+
+def test_update_discovery_pool_incremental_skips_within_cooldown_by_default():
+    # #1719: the 6-hour cooldown still gates ordinary (scheduled) runs.
+    scanner = _build_scanner({"tracks": {"items": []}}, [_build_artist("Cooldown Artist")])
+    gate_args = []
+    scanner.database.should_populate_discovery_pool = (
+        lambda hours_threshold=6, profile_id=1: gate_args.append((hours_threshold, profile_id)) or False)
+    fetched = []
+    scanner.database.get_watchlist_artists = lambda profile_id=1: fetched.append(profile_id) or []
+
+    scanner.update_discovery_pool_incremental(profile_id=1)
+
+    assert gate_args == [(6, 1)]  # gate consulted with the 6-hour threshold
+    assert fetched == []  # returned at the gate, before any artist work
+    assert scanner.database.discovery_pool_calls == []
+
+
+def test_update_discovery_pool_incremental_force_bypasses_cooldown(monkeypatch):
+    # #1719: force=True (a manual Run Now press) runs even when the pool
+    # was updated < 6 hours ago — end to end, tracks still land.
+    monkeypatch.setattr(watchlist_scanner_module, "DELAY_BETWEEN_ARTISTS", 0)
+    monkeypatch.setattr(watchlist_scanner_module, "time", types.SimpleNamespace(sleep=lambda *_args, **_kwargs: None))
+    monkeypatch.setattr(watchlist_scanner_module, "get_primary_source", lambda: "deezer")
+    monkeypatch.setattr(watchlist_scanner_module, "get_source_priority", lambda primary: [primary, "spotify", "itunes"])
+
+    artist = _build_artist("Forced Artist")
+    artist.spotify_artist_id = None
+    artist.deezer_artist_id = None
+
+    release = types.SimpleNamespace(
+        id="dz-release-9",
+        name="Forced Release",
+        release_date=_RECENT_RELEASE_DATE,
+        album_type="album",
+        image_url="https://example.com/forced-release.jpg",
+    )
+    deezer_client = _FakeSourceClient(
+        artist_id="dz-artist",
+        albums=[release],
+        image_url="https://example.com/forced-artist.jpg",
+        album_payload={
+            "id": "dz-release-9",
+            "name": "Forced Release",
+            "images": [{"url": "https://example.com/forced-release.jpg"}],
+            "release_date": _RECENT_RELEASE_DATE,
+            "popularity": 10,
+            "tracks": {"items": [{"id": "dz-track-9", "name": "Forced Track", "artists": [{"name": "Forced Artist"}], "duration_ms": 180000}]},
+            "artists": [{"id": "dz-artist"}],
+        },
+    )
+    monkeypatch.setattr(watchlist_scanner_module, "get_client_for_source",
+                        lambda source: {"deezer": deezer_client}.get(source))
+
+    scanner = _build_scanner({"tracks": {"items": []}}, [artist])
+    gate_calls = []
+    scanner.database.should_populate_discovery_pool = (
+        lambda hours_threshold=6, profile_id=1: gate_calls.append(hours_threshold) or False)
+
+    scanner.update_discovery_pool_incremental(profile_id=1, force=True)
+
+    assert gate_calls == []  # forced: the cooldown gate is never consulted
+    assert scanner.database.discovery_pool_calls
+    assert scanner.database.discovery_pool_calls[0][0]["deezer_track_id"] == "dz-track-9"
+    assert deezer_client.album_calls
 
 
 def test_curate_discovery_playlists_uses_source_priority_for_recent_albums(monkeypatch):

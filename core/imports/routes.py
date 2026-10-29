@@ -15,7 +15,7 @@ from typing import Any, Callable, Dict, Optional
 from core.imports.album import build_album_import_context, build_album_import_match_payload, resolve_album_artist_context
 from core.imports.context import get_import_context_artist, get_import_track_info, normalize_import_context
 from core.imports.filename import parse_filename_metadata
-from core.imports.pipeline import import_rejection_reason
+from core.imports.pipeline import import_rejection_reason, kept_existing_library_file
 from core.imports.staging import (
     AUDIO_EXTENSIONS,
     available_import_sources as _available_import_sources,
@@ -202,6 +202,9 @@ def _validate_import_file(runtime: ImportRouteRuntime, raw_path: Any) -> tuple[O
 _STAGING_SCAN_LOCK = threading.Lock()
 _STAGING_SCAN_TTL = 6.0  # seconds — covers the page-open burst; re-scans after
 _staging_scan_cache: Dict[str, Any] = {"path": None, "ts": 0.0, "records": None}
+# full_path -> ((rel_path, mtime_ns, size), meta), for the reader that read them.
+# survives invalidation on purpose: a moved or edited file changes its stamp.
+_staging_meta_cache: Dict[str, Any] = {"reader": None, "entries": {}}
 # Directories the last scan could not list, {path, error}. os.walk swallows
 # these by default, so an unreadable staging folder answered "0 files" with
 # nothing to say why (truenas apps uid vs the container's PUID).
@@ -210,11 +213,30 @@ _staging_scan_problems: list = []
 # import doesn't re-commit stale (pre-import) records (see the generation guard above).
 _staging_scan_generation: Dict[str, int] = {"value": 0}
 
+# The inbox-summary slot's lock and build counter live up here, next to
+# the generation they guard: invalidate_staging_scan_cache() (below)
+# bumps the generation under this lock, and a name resolved at call time
+# from 100 lines down is a trap for the next refactor. The slot itself is
+# defined with its rationale further down (see _last_inbox_summary).
+_last_inbox_summary_lock = threading.RLock()
+
+
+def _initial_build_seq() -> int:
+    return int(time.time() * 1000)
+
+
+_inbox_build_counter: Dict[str, int] = {"value": _initial_build_seq()}
+# Complete builds whose counts never reached the slot (generation guard,
+# remember failure): adopting a remembered seq is only sound while no
+# such build intervenes (see _remember_inbox_summary).
+_inbox_remember_skips: Dict[str, int] = {"value": 0}
+
 # Background-scan plumbing: a large staging folder (whole-library migration, #947) makes
 # the synchronous scan exceed gunicorn's 120s request timeout. The runner moves the SAME
 # scan off the request thread; the endpoints report progress instead of blocking.
 _staging_scan_status: Dict[str, Any] = {
     "status": "idle", "scanned": 0, "total": 0, "path": None, "error": None,
+    "started_at": None,
 }
 _staging_scan_status_lock = threading.Lock()
 
@@ -238,7 +260,8 @@ def ensure_background_staging_scan(runtime: ImportRouteRuntime, staging_path: st
                 and _staging_scan_status["path"] == staging_path):
             return
         _staging_scan_status.update({"status": "scanning", "scanned": 0, "total": 0,
-                                     "path": staging_path, "error": None})
+                                     "path": staging_path, "error": None,
+                                     "started_at": time.time()})
 
     def _run() -> None:
         try:
@@ -263,6 +286,14 @@ def get_staging_records_or_status(runtime: ImportRouteRuntime, staging_path: str
     if records is not None:
         return ("ready", records)
     ensure_background_staging_scan(runtime, staging_path)
+    # #1889: past the ttl but never invalidated, the last scan is still the
+    # folder as far as anyone moved it. serve it while the rescan runs instead
+    # of making every poll wait out the grace and then drop the page to the
+    # scanning stub. an import invalidates (records None), so this never
+    # serves files an import just moved.
+    c = _staging_scan_cache
+    if c["records"] is not None and c["path"] == staging_path:
+        return ("ready", c["records"])
     deadline = time.time() + max(0.0, grace_seconds)
     while True:
         records = _staging_cache_hit(staging_path)
@@ -288,7 +319,11 @@ def _records_or_scanning_payload(runtime: ImportRouteRuntime, staging_path: str)
     if state == "error":
         raise RuntimeError(val.get("error") or "staging scan failed")
     if state == "scanning":
+        # #1671: the stub must still say WHICH folder is being read. Without
+        # staging_path the page rendered "Import folder not configured" for a
+        # folder that is configured — it was only mid-scan.
         return None, {"success": True, "scanning": True,
+                      "staging_path": staging_path,
                       "progress": {"scanned": val.get("scanned", 0),
                                    "total": val.get("total", 0)}}
     return val, None
@@ -339,6 +374,15 @@ def _scan_staging_records(runtime: ImportRouteRuntime, staging_path: str,
 
         start_generation = _staging_scan_generation["value"]
 
+        # #1889: tags are kept per file between scans and only re-read when the
+        # file changed. a full-library staging folder took minutes to re-read,
+        # so the 6s ttl meant the page kept the folder in a scan forever.
+        reader = runtime.read_staging_file_metadata
+        if _staging_meta_cache["reader"] is not reader:
+            _staging_meta_cache.update({"reader": reader, "entries": {}})
+        old_entries = _staging_meta_cache["entries"]
+        new_entries: Dict[str, tuple] = {}
+
         # Pass 1 (fast): collect the audio-file list — no tag I/O — so we know the total.
         audio_files: list[tuple[str, str, Optional[str]]] = []
         problems: list[Dict[str, str]] = []
@@ -370,7 +414,18 @@ def _scan_staging_records(runtime: ImportRouteRuntime, staging_path: str,
         for root, fname, top_folder in audio_files:
             full_path = os.path.join(root, fname)
             rel_path = os.path.relpath(full_path, staging_path)
-            meta = runtime.read_staging_file_metadata(full_path, rel_path)
+            try:
+                st = os.stat(full_path)
+                stamp = (rel_path, st.st_mtime_ns, st.st_size)
+            except OSError:
+                stamp = None
+            hit = old_entries.get(full_path)
+            if stamp is not None and hit is not None and hit[0] == stamp:
+                meta = hit[1]
+            else:
+                meta = reader(full_path, rel_path)
+            if stamp is not None:
+                new_entries[full_path] = (stamp, meta)
             records.append({
                 "filename": fname, "rel_path": rel_path, "full_path": full_path,
                 "extension": os.path.splitext(fname)[1].lower(),
@@ -384,6 +439,9 @@ def _scan_staging_records(runtime: ImportRouteRuntime, staging_path: str,
             if progress is not None:
                 progress["scanned"] += 1
 
+        # files that left staging drop out here, so the cache never outgrows the folder
+        _staging_meta_cache["entries"] = new_entries
+
         # Generation guard: if an import invalidated the cache mid-scan, these records are
         # stale — return them to this caller but do NOT commit them as the shared cache.
         if _staging_scan_generation["value"] == start_generation:
@@ -396,9 +454,19 @@ def invalidate_staging_scan_cache() -> None:
     """Drop the cached staging scan (call after an import moves/removes files so the
     next files/groups/hints request reflects the new state immediately). Also bumps the
     scan generation so an in-flight background scan won't re-commit pre-import records."""
-    _staging_scan_generation["value"] += 1
+    # The bump takes the inbox-summary lock (defined further down; resolved
+    # at call time) so it is atomic against _remember_inbox_summary's
+    # check-then-write: a remember either sees the new generation and
+    # skips, or completes before the bump — never slips stale counts in
+    # between the check and the write.
+    with _last_inbox_summary_lock:
+        _staging_scan_generation["value"] += 1
     _staging_scan_cache.update({"path": None, "ts": 0.0, "records": None})
     _staging_scan_problems.clear()
+    # the scanning payload's history cache is an invalidation target too:
+    # an action that moves files must not leave stale history rows behind
+    # for the rest of its TTL.
+    _scanning_history_cache.update({"path": None, "ts": 0.0, "rows": None, "problems": None})
 
 
 def staging_files(runtime: ImportRouteRuntime) -> tuple[Dict[str, Any], int]:
@@ -434,6 +502,393 @@ def staging_files(runtime: ImportRouteRuntime) -> tuple[Dict[str, Any], int]:
         return {"success": False, "error": str(exc)}, 500
 
 
+def _inbox_worker_payload(worker: Any, status: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(status, dict):
+        status = {}
+    return {
+        "available": worker is not None,
+        "running": bool(status.get("running")),
+        "paused": bool(status.get("paused")),
+        "current_status": status.get("current_status", "idle"),
+        "last_scan_time": status.get("last_scan_time"),
+        "stats": status.get("stats") or {},
+    }
+
+
+# While a scan runs the page polls every ~1.5s; re-reading 200 history rows
+# and re-parsing their match JSON on every poll is waste on exactly the slow
+# installs #1671 is about. The history view may lag a few seconds during a
+# scan — the scan's own completion brings the exact rows.
+_SCANNING_HISTORY_TTL = 5.0
+_scanning_history_cache: Dict[str, Any] = {"path": None, "ts": 0.0, "rows": None, "problems": None}
+
+# The header strip's numbers from the last COMPLETE inbox build (#1874).
+# A scanning reply cannot recount the folder yet, but dropping the strip's
+# stats for the whole scan is the reported bug — a cold page open mid-scan
+# (or a return from the matcher) has no client-side snapshot to fall back
+# on, so the server carries the last counts it actually counted. Never
+# fabricated: with no complete build for the folder on record the scanning
+# reply still carries no summary at all, exactly as #1671 requires.
+# Bounds, so last-known never becomes long-stale: a SINGLE slot (only the
+# most recently built folder's summary is kept — the path check means a
+# different folder never inherits it, it just gets none), a one-hour TTL,
+# and an empty-folder build CLEARS the slot instead of remembering zeroes —
+# serving a remembered "0 items" for a batch nobody has counted is the
+# fabrication #1671 forbids, in older clothes. A complete build is
+# authoritative for the folder's readable staged content even when it also
+# reports problems (unreadable subdirectories are surfaced separately in
+# the reply's problems list): an empty build with problems still clears.
+# The TTL bounds cross-session staleness, not intra-batch staleness: while
+# a client polls, every complete build between scans refreshes the entry,
+# but the auto-import worker moves files without ever building an inbox,
+# so a cold open late in a worker-only batch can show counts up to the TTL
+# old while its first scan runs. That is the same last-known tradeoff the
+# page's own snapshot makes; the scan banner's live progress total is the
+# current file count in that window, and the scan landing replaces the
+# numbers. Age is judged at the scan's start, so an entry that was fresh
+# enough when a scan began is served for that scan's whole duration, even
+# past the TTL — expiring mid-scan would be the original bug returning.
+# Deliberately NOT cleared by invalidate_staging_scan_cache(): that is
+# called after imports and uploads move files, and the re-scan that
+# follows is precisely when the strip must keep showing the batch's
+# numbers until the scan lands and a fresh complete build replaces them
+# (the same lifetime the page's own in-memory snapshot has). One known
+# corollary: after an upload, the post-upload scan can show pre-upload
+# counts (without the just-uploaded files) until that scan lands.
+# The entry is one immutable tuple swapped under a lock in a single
+# assignment — (path, summary|None, ts, wire_seq, start_seq, cleared) —
+# so a reader can never tear a path from another folder's summary across
+# a concurrent complete build, and writers are serialised. Ordering is by
+# START sequence: every complete build takes the next sequence number
+# when its counting begins, and a build whose start is older than the
+# remembered build's start never overwrites it, however late it finishes.
+# The generation guard is the second check (a build whose records
+# predate an invalidation never remembers — the same discipline
+# _scan_staging_records follows). The WIRE sequence a summary carries
+# ("seq") is the start sequence of the build that first counted those
+# numbers: a build whose numbers are unchanged from the remembered ones
+# ADOPTS the remembered wire sequence instead of minting a new one, so
+# identical polls stay deeply equal (the page's structural sharing
+# survives) and sequence comparisons are only ever asked to order
+# summaries whose numbers differ. Clearing writes a tombstone that keeps
+# the folder path, both sequences, and the cleared build's counted
+# numbers, so a late older build cannot resurrect cleared counts and an
+# identical later build can adopt the tombstone's wire sequence instead
+# of churning a new one per poll. Like the neighbouring caches, the slot
+# and its sequences are per-process state: coherent with the shipped
+# single-worker gunicorn config; a multi-worker deployment would need
+# both in shared storage before seq comparisons meant anything across
+# processes.
+_LAST_INBOX_SUMMARY_TTL = 3600.0
+_LAST_INBOX_SUMMARY_HARD_TTL = 4 * _LAST_INBOX_SUMMARY_TTL
+_RECENT_SCAN_DONE_SECONDS = 120.0
+# The slot, and below it the "skips at write" marker adoption checks.
+# Entry: (path, summary|None, ts, wire_seq, start_seq, cleared|None).
+_last_inbox_summary: Dict[str, Any] = {"entry": None, "skips": 0}
+# The build counter is seeded from the wall clock rather than 0: a tab
+# that stays open across a server restart keeps its snapshot's seq, and
+# a restarted counter starting near 0 would lose every comparison
+# against it until the scan lands. Clock-seeded, a later process always
+# starts ahead of any earlier process's increments (a process would need
+# millions of builds in its lifetime to catch up with the clock).
+# MILLISECONDS, not nanoseconds: the seq is compared in the browser, and
+# a ns value (~1.8e18) exceeds JavaScript's safe-integer range (~9e15) —
+# JSON parsing would round adjacent seqs to equal and silently break the
+# ordering. A ms seed (~1.7e12) stays exact, with headroom for ~9e12
+# builds. (A wall clock stepping BACKWARDS across a restart could still
+# seed below an open tab's snapshot seq; that tab then keeps its
+# snapshot until the scan lands and replaces both — one scan, accepted.)
+# (The counter and the lock are defined by _staging_scan_generation:
+# invalidate_staging_scan_cache() bumps the generation under the lock.)
+
+
+def _copy_inbox_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
+    copied = dict(summary)
+    if isinstance(copied.get("by_status"), dict):
+        copied["by_status"] = dict(copied["by_status"])
+    return copied
+
+
+def _next_build_seq() -> int:
+    with _last_inbox_summary_lock:
+        _inbox_build_counter["value"] += 1
+        return _inbox_build_counter["value"]
+
+
+def _inbox_summary_cleared_seq(staging_path: str) -> Optional[int]:
+    """The wire sequence of the slot's tombstone, if the slot is cleared
+    FOR THIS FOLDER: a scanning reply carries it so a tab whose snapshot
+    predates the clear (an empty complete build) drops that snapshot
+    instead of showing counts a later build already superseded with
+    zero. Folder-scoped like the summary itself — the single slot may
+    hold another folder's tombstone after a path switch."""
+    with _last_inbox_summary_lock:
+        entry = _last_inbox_summary["entry"]
+        if entry is not None and entry[1] is None and entry[0] == staging_path:
+            return entry[3]
+        return None
+
+
+def _remember_inbox_summary(staging_path: str, summary: Dict[str, Any], *,
+                            generation: Optional[int] = None,
+                            build_seq: Optional[int] = None) -> Optional[int]:
+    """Remember a complete build's counted summary (without its "seq").
+
+    ``build_seq`` is the build's START sequence. Returns the wire sequence
+    the build's reply should carry, or None when the build was skipped by
+    an ordering guard (its reply then carries its own start sequence,
+    which still orders it correctly against the remembered entry for any
+    tab that received it)."""
+    with _last_inbox_summary_lock:
+        if generation is not None and generation != _staging_scan_generation["value"]:
+            # Its counts reached a tab but never the slot: adoption must
+            # not reuse an older sequence past it (see the skips check).
+            _inbox_remember_skips["value"] += 1
+            return None
+        entry = _last_inbox_summary["entry"]
+        start = build_seq if build_seq is not None else _next_build_seq()
+        if entry is not None and entry[4] > start:
+            return None
+        counted_zero = not summary.get("items") and not summary.get("files")
+
+        def _store(new_entry) -> None:
+            _last_inbox_summary["entry"] = new_entry
+            _last_inbox_summary["skips"] = _inbox_remember_skips["value"]
+
+        if entry is not None and entry[0] == staging_path:
+            no_skips_since = (
+                _inbox_remember_skips["value"] == _last_inbox_summary.get("skips", 0))
+            if entry[1] is not None:
+                previous = {k: v for k, v in entry[1].items() if k != "seq"}
+                if previous == summary and no_skips_since:
+                    # Unchanged numbers, and no unremembered build in
+                    # between: adopt the wire sequence they were first
+                    # counted under, refresh the timestamp. (With a skip
+                    # in between, a tab may hold the skipped build's
+                    # different counts under a higher sequence — reusing
+                    # the old one would order this fresher count behind
+                    # it, so the build falls through and mints its own.)
+                    _store((staging_path, entry[1], time.time(), entry[3], start, None))
+                    return entry[3]
+            elif entry[5] is not None and entry[5] == summary and no_skips_since:
+                # A tombstone holding exactly these (zero) numbers:
+                # adopt its wire sequence instead of churning a new one.
+                wire = entry[3]
+                _store((staging_path, None, time.time(), wire, start,
+                        _copy_inbox_summary(summary)))
+                return wire
+        if counted_zero:
+            _store((staging_path, None, time.time(), start, start,
+                    _copy_inbox_summary(summary)))
+            return start
+        _store((staging_path, {**_copy_inbox_summary(summary), "seq": start},
+                time.time(), start, start, None))
+        return start
+
+
+def _last_inbox_summary_for(staging_path: str, *,
+                            scan_started_at: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    with _last_inbox_summary_lock:
+        entry = _last_inbox_summary["entry"]
+        if entry is None:
+            return None
+        path, summary, remembered_at, _wire_seq, _start_seq, _cleared = entry
+        if path != staging_path or summary is None:
+            return None
+        # Age is judged at the scan's start when the caller is a scanning
+        # reply: an entry fresh enough when the scan began stays servable
+        # for that scan's whole duration (a >1h scan must not lose the
+        # strip mid-scan — the original bug), while an entry already past
+        # the TTL when the scan began is never served at all. A hard cap
+        # still applies either way: a scan whose thread hangs (a stalled
+        # network walk) must not make last-known immortal.
+        now = time.time()
+        if (now - remembered_at) >= _LAST_INBOX_SUMMARY_HARD_TTL:
+            return None
+        judged_at = now
+        if scan_started_at is not None and scan_started_at < judged_at:
+            judged_at = scan_started_at
+        if (judged_at - remembered_at) >= _LAST_INBOX_SUMMARY_TTL:
+            return None
+        return _copy_inbox_summary(summary)
+
+
+def _scanning_history_rows(worker: Any, staging_path: str,
+                           status: Dict[str, Any]) -> tuple[list, list]:
+    """(rows, problems) the inbox can show while the staging scan runs.
+
+    Terminal history (imported / dismissed) stands as-is. Everything the
+    worker has not finished with — needs review, needs identifying, queued,
+    importing, failed, partial — still has its files in the folder as far as
+    anyone knows mid-scan, so those rows are built through pseudo-candidates
+    (in_staging, carrying the history row's status) instead of being dropped
+    the way ``build_inbox`` drops file-less unfinished rows. A failed row
+    built this way keeps its Retry action during the scan. Briefly cached:
+    the page polls faster than history changes during a scan."""
+    now = time.time()
+    cache = _scanning_history_cache
+    if (cache["rows"] is not None and cache["path"] == staging_path
+            and (now - cache["ts"]) < _SCANNING_HISTORY_TTL):
+        return cache["rows"], cache["problems"]
+
+    from core.imports.inbox import build_inbox
+
+    history = worker.get_results(limit=200)
+    # History is INSERT-per-attempt, so one folder can carry several rows —
+    # and its hash is content-derived, so fixing a file in the folder gives
+    # the next attempt a NEW hash for the same path. Identity here is hash
+    # OR path (the same rule build_inbox claims by); keep only the newest
+    # row per folder, or a folder renders twice during scans — once per
+    # attempt — and a superseded row can swallow the live one.
+    seen_identities = set()
+    deduped = []
+    for hist in history:
+        # normpath only a real path: normpath("") is ".", which would give
+        # every pathless row the same identity and drop all but the newest.
+        keys = {k for k in (hist.get("folder_hash"),
+                            os.path.normpath(hist["folder_path"])
+                            if hist.get("folder_path") else None) if k}
+        if keys & seen_identities:
+            continue
+        seen_identities |= keys
+        deduped.append(hist)
+    history = deduped
+    rows = build_inbox([], [], history, [], staging_root=staging_path)
+
+    staged_statuses = {"pending_review", "needs_identification", "approved",
+                       "processing", "failed", "partial"}
+    by_id = {h.get("id"): h for h in history}
+    kept: list = []
+    staged_rows: list = []
+    for row in rows:
+        hist = by_id.get(row.get("history_id"))
+        if (hist is not None and hist.get("status") in staged_statuses
+                and hist.get("folder_path")):
+            staged_rows.append(hist)
+        else:
+            kept.append(row)
+    seen_ids = {r.get("history_id") for r in rows}
+    staged_rows.extend(
+        h for h in history
+        if h.get("id") not in seen_ids and h.get("status") in staged_statuses
+        and h.get("folder_path"))
+
+    if staged_rows:
+        from types import SimpleNamespace
+
+        candidates = []
+        seen_keys = set()
+        for hist in staged_rows:
+            path = hist.get("folder_path") or ""
+            key = hist.get("folder_hash") or path
+            if not path or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            candidates.append(SimpleNamespace(
+                path=path,
+                name=hist.get("folder_name") or hist.get("album_name") or "",
+                audio_files=[],
+                # legacy rows can carry an empty hash; a synthetic key keeps
+                # two such rows from sharing one identity in the page's list
+                # (the history claim itself falls back to the folder path).
+                folder_hash=hist.get("folder_hash") or f"scan-{hist.get('id')}",
+                is_single=(hist.get("total_files") or 0) <= 1,
+            ))
+        kept.extend(
+            r for r in build_inbox(candidates, [], staged_rows,
+                                   status.get("active_imports") or [],
+                                   staging_root=staging_path)
+            if r["in_staging"])
+
+    problems = list(_staging_scan_problems)
+    seen_problems = {(p["path"], p["error"]) for p in problems}
+    for problem in status.get("scan_problems") or []:
+        entry = {"path": problem.get("path", ""), "error": problem.get("error", "")}
+        if entry["path"] and (entry["path"], entry["error"]) not in seen_problems:
+            problems.append(entry)
+
+    _scanning_history_cache.update(
+        {"path": staging_path, "ts": time.time(), "rows": kept, "problems": problems})
+    return kept, problems
+
+
+def _scanning_inbox_payload(scanning: Dict[str, Any], staging_path: str,
+                            worker: Any) -> Dict[str, Any]:
+    """What the inbox can honestly say while the staging scan is still running (#1671).
+
+    The scan only gates the *staging* rows: history lives in the database and
+    the worker's state is in memory, so both can be served immediately. The
+    page keeps showing them (plus the folder path and the auto-import switch)
+    under a scan-progress banner instead of blanking to zeroes and claiming
+    the folder is not configured. No fabricated ``summary``: the staged
+    counts are exactly what is not known yet, and a fabricated "0 items" is
+    the bug #1671 fixed. The one summary a scanning reply may carry is the
+    last COMPLETE build's, for this same folder (#1874) — real counted
+    numbers the page's header strip keeps showing until the scan lands,
+    instead of vanishing whenever the page was not already open with a
+    client-side snapshot when processing began. (On a cold open the header
+    can therefore disagree with the filter-pill counts for the scan's
+    duration: the pills count the history rows in ``items``, the header
+    shows the last build's staged rows. The scan landing reconciles them.)
+    Enrichment must never break the poll — any failure falls back to the
+    bare scanning payload."""
+    payload = dict(scanning)
+    try:
+        with _staging_scan_status_lock:
+            scan_status = dict(_staging_scan_status)
+        # A just-finished scan counts too: this reply was already
+        # determined to be a scanning reply, and the scan may have
+        # finished in the gap since — its start is still the right moment
+        # to judge the entry's age. started_at is left in place after a
+        # scan for exactly this read, but only a RECENT done is read as
+        # this reply's scan; a stale done belongs to an earlier scan
+        # whose polls have long ended (a new scan re-stamps it anyway).
+        scan_started = scan_status.get("started_at")
+        scan_started_at = (
+            scan_started
+            if scan_status.get("path") == staging_path
+            and scan_started is not None
+            and (
+                scan_status.get("status") == "scanning"
+                or (
+                    scan_status.get("status") == "done"
+                    and (time.time() - scan_started) < _RECENT_SCAN_DONE_SECONDS
+                )
+            )
+            else None
+        )
+        summary = _last_inbox_summary_for(staging_path, scan_started_at=scan_started_at)
+    except Exception:  # noqa: BLE001 — the summary is a nicety during a scan
+        summary = None
+    if summary is not None:
+        payload["summary"] = summary
+    else:
+        try:
+            cleared_seq = _inbox_summary_cleared_seq(staging_path)
+        except Exception:  # noqa: BLE001 — same nicety rule as the summary
+            cleared_seq = None
+        if cleared_seq is not None:
+            payload["summary_cleared_seq"] = cleared_seq
+    status: Dict[str, Any] = {}
+    rows: list = []
+    problems: list = []
+    if worker is not None:
+        try:
+            status = worker.get_status() or {}
+        except Exception:  # noqa: BLE001 — worker state is a nicety during a scan
+            status = {}
+        if not isinstance(status, dict):
+            status = {}
+        try:
+            rows, problems = _scanning_history_rows(worker, staging_path, status)
+        except Exception:  # noqa: BLE001 — history is a nicety during a scan
+            rows, problems = [], []
+    payload["items"] = rows
+    payload["problems"] = problems
+    payload["worker"] = _inbox_worker_payload(worker, status)
+    return payload
+
+
 def inbox(runtime: ImportRouteRuntime, worker: Any) -> tuple[Dict[str, Any], int]:
     """Every staging item with its state: the page's one list.
 
@@ -442,9 +897,27 @@ def inbox(runtime: ImportRouteRuntime, worker: Any) -> tuple[Dict[str, Any], int
     failed to boot; the inbox then lists staging with nothing joined."""
     try:
         staging_path = runtime.get_staging_path()
+        # Captured BEFORE the records are fetched, and re-checked at
+        # remember time: a build that spans an invalidation never
+        # remembers, even in the rare case its records turned out fresh
+        # (the next poll's build, seconds later, remembers instead).
+        # Skipping is the safe direction — the dangerous one is storing
+        # pre-invalidation counts as fresh. One accepted consequence: a
+        # skipped build leaves the PREVIOUS entry in place, so a cold
+        # open during the following scan shows that older entry. A tab
+        # that received the skipped build keeps its own numbers — they
+        # were its complete reply, and its snapshot's sequence (the
+        # skipped build's start) outranks the entry's — which is ordinary
+        # snapshot semantics; the guard's distrust is about what the
+        # SERVER serves to everyone else.
+        build_generation = _staging_scan_generation["value"]
         records, scanning = _records_or_scanning_payload(runtime, staging_path)
         if scanning is not None:
-            return scanning, 200
+            return _scanning_inbox_payload(scanning, staging_path, worker), 200
+        # The build's start sequence: taken now, before the counting work
+        # (enumeration, history, build), so ordering never follows finish
+        # order (see the slot comment above _last_inbox_summary).
+        build_seq = _next_build_seq()
 
         from core.imports.inbox import build_inbox, summarize
 
@@ -472,20 +945,40 @@ def inbox(runtime: ImportRouteRuntime, worker: Any) -> tuple[Dict[str, Any], int
 
         rows = build_inbox(candidates, records, history, status.get("active_imports") or [],
                            staging_root=staging_path)
+        # "seq" rides in the served summary so the page can order a
+        # scanning reply's summary against its own snapshot by build. The
+        # remember call returns the wire sequence (the start sequence, or
+        # the adopted one when the numbers are unchanged); when an
+        # ordering guard skipped the build, the reply still carries the
+        # build's own start sequence.
+        counted = summarize(rows)
+        try:
+            wire_seq = _remember_inbox_summary(
+                staging_path, counted, generation=build_generation,
+                build_seq=build_seq)
+        except Exception as exc:  # noqa: BLE001 — remembering must never fail a built inbox
+            runtime.logger.error("Error remembering import inbox summary: %s", exc)
+            wire_seq = None
+            # No clear needed on failure: the slot still holds an OLDER
+            # entry whose wire sequence is below this build's, so every
+            # tab orders this build's snapshot ahead of it by sequence —
+            # and clearing would only strip stats from OTHER tabs whose
+            # snapshots are older still. What failure must not do is
+            # wedge the slot (a malformed entry would fail every later
+            # remember the same way): reset it to empty so the next
+            # build remembers cleanly. The reset is an RLock take plus a
+            # plain assignment — neither can realistically raise.
+            with _last_inbox_summary_lock:
+                _inbox_remember_skips["value"] += 1
+                _last_inbox_summary["entry"] = None
+        summary = {**counted, "seq": wire_seq if wire_seq is not None else build_seq}
         return {
             "success": True,
             "staging_path": staging_path,
             "items": rows,
-            "summary": summarize(rows),
+            "summary": summary,
             "problems": problems,
-            "worker": {
-                "available": worker is not None,
-                "running": bool(status.get("running")),
-                "paused": bool(status.get("paused")),
-                "current_status": status.get("current_status", "idle"),
-                "last_scan_time": status.get("last_scan_time"),
-                "stats": status.get("stats") or {},
-            },
+            "worker": _inbox_worker_payload(worker, status),
         }, 200
     except Exception as exc:
         runtime.logger.error("Error building import inbox: %s", exc)
@@ -637,6 +1130,90 @@ def search_sources() -> tuple[Dict[str, Any], int]:
         return {"success": False, "error": str(exc), "sources": []}, 500
 
 
+def _get_import_db(runtime) -> Any:
+    """The music database for library lookups, or None when unavailable.
+
+    Every library pre-check fails open without it (proceed, never skip).
+    """
+    try:
+        from database.music_database import get_database
+        return get_database()
+    except Exception as exc:                                # noqa: BLE001
+        runtime.logger.debug("[Library Check] database unavailable: %s", exc)
+        return None
+
+
+def _import_profile_id():
+    """The profile a manual import runs for; its library decides ownership."""
+    try:
+        from core.profile_context import get_current_profile_id
+        return get_current_profile_id()
+    except Exception:  # noqa: BLE001 - outside a request: the shared library
+        return None
+
+
+def _annotate_library_status(runtime: ImportRouteRuntime,
+                             payload: Dict[str, Any], source: str,
+                             album_name: str = "") -> Dict[str, Any]:
+    """Attach per-track existing-library decisions to an album-match payload.
+
+    Runs at the matching stage, so the review UI can show what's already
+    owned BEFORE the user imports. The process endpoint re-checks (never
+    trusts the client's copy) — this is presentation, not enforcement.
+    """
+    from core.imports.library_check import check_track_library_status
+
+    matches = payload.get("matches") or []
+    if not payload.get("success") or not matches:
+        return payload
+    db = _get_import_db(runtime)
+    # album_name is optional on the way in (callers may pass only album_id);
+    # fall back to the metadata source's album title so release scoping
+    # still works and the review UI shows skip badges.
+    resolved_album_name = (
+        album_name
+        or str((payload.get("album") or {}).get("name") or "")
+        or str((payload.get("album") or {}).get("title") or "")
+    )
+    quality_profile = _resolve_gate_profile(runtime)
+    for match in matches:
+        staging_file = match.get("staging_file") or {}
+        track = match.get("track") or {}
+        if not staging_file or not track:
+            match["library_status"] = None
+            continue
+        match["library_status"] = check_track_library_status(
+            db,
+            track=track,
+            staging_file_path=staging_file.get("full_path", ""),
+            match_type=match.get("match_type"),
+            confidence=match.get("confidence", 0) or 0,
+            source_hint=source,
+            album_name=resolved_album_name,
+            quality_profile=quality_profile,
+            quiet=True,  # presentation only; enforcement re-checks and logs
+            profile_id=_import_profile_id(),
+        )
+    return payload
+
+
+def _resolve_gate_profile(runtime: ImportRouteRuntime) -> dict:
+    """Best-effort quality profile for the library-check gate.
+
+    Mirrors what the pipeline will resolve for the replacement arbiter
+    (``load_profile_by_id(runtime.profile_id)``); {} on any failure, in
+    which case the gate falls back to the global ``import.replace_lower_quality``
+    setting — exactly like the pipeline does.
+    """
+    try:
+        from core.quality.selection import load_profile_by_id
+        profile_id = getattr(runtime, "profile_id", None)
+        profile = load_profile_by_id(profile_id)
+        return profile if isinstance(profile, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def album_match(runtime: ImportRouteRuntime, data: Dict[str, Any]) -> tuple[Dict[str, Any], int]:
     """Match staging files to an album's tracklist."""
     try:
@@ -665,6 +1242,9 @@ def album_match(runtime: ImportRouteRuntime, data: Dict[str, Any]) -> tuple[Dict
             file_paths=filter_file_paths,
             source=source or None,
         )
+        # Existing-library pre-check: annotate each pairing so the review UI
+        # shows what's already owned before anything is imported.
+        payload = _annotate_library_status(runtime, payload, source, album_name)
         return payload, 200
     except Exception as exc:
         runtime.logger.error("Error matching album for import: %s", exc)
@@ -1008,10 +1588,21 @@ def album_process(runtime: ImportRouteRuntime, data: Dict[str, Any]) -> tuple[Di
 
         processed = 0
         errors = []
+        dispositions = []
+        finished_paths = []   # staged files this import is done with
+        summary = {"imported": 0, "skipped_owned": 0, "upgraded": 0}
         album_name = album.get("name", album.get("album_name", "Unknown Album"))
         artist_name = album.get("artist", album.get("artist_name", "Unknown Artist"))
         album_id = album.get("id", album.get("album_id", ""))
         source = str(album.get("source") or data.get("source") or "").strip().lower()
+
+        from core.imports.library_check import (
+            DECISION_SKIP_OWNED,
+            DECISION_UPGRADE,
+            check_track_library_status,
+        )
+        db = _get_import_db(runtime)
+        gate_profile = _resolve_gate_profile(runtime)
 
         total_discs = max(
             (
@@ -1023,6 +1614,16 @@ def album_process(runtime: ImportRouteRuntime, data: Dict[str, Any]) -> tuple[Di
         )
         artist_context = runtime.resolve_album_artist_context(album, source=source)
 
+        def _record_disposition(track_name, file_name, decision, reason):
+            dispositions.append({
+                "track_name": track_name,
+                "file_name": file_name,
+                "decision": decision,
+                "reason": reason,
+            })
+            if decision in summary:
+                summary[decision] += 1
+
         for match in matches:
             staging_file = match.get("staging_file")
             track = match.get("track") or {}
@@ -1032,12 +1633,52 @@ def album_process(runtime: ImportRouteRuntime, data: Dict[str, Any]) -> tuple[Di
             file_path, path_error = _validate_import_file(
                 runtime, staging_file.get("full_path", ""),
             )
+            _err_track = (track or {}).get("name", "Unknown Track")
+            _err_file = staging_file.get("filename") or "?"
             if path_error:
-                errors.append(f"{path_error}: {staging_file.get('filename', '?')}")
+                errors.append(f"{path_error}: {_err_file}")
+                _record_disposition(
+                    _err_track, _err_file, "error", f"{path_error}: {_err_file}",
+                )
                 continue
 
             track_name = track.get("name", "Unknown Track")
             track_number = track.get("track_number", 1)
+            file_name = staging_file.get("filename") or os.path.basename(file_path)
+
+            # Existing-library pre-check (enforcement): re-checked here, never
+            # trusting the client's annotated copy. Confident "already owned"
+            # pairings skip the pipeline entirely — no transcoding, tagging or
+            # file moves for tracks the library already has.
+            status = check_track_library_status(
+                db,
+                track=track,
+                staging_file_path=file_path,
+                match_type=match.get("match_type"),
+                confidence=match.get("confidence", 0) or 0,
+                source_hint=source,
+                album_name=album_name,
+                quality_profile=gate_profile,
+                profile_id=_import_profile_id(),
+            )
+            decision = status["decision"]
+            if decision == DECISION_SKIP_OWNED:
+                runtime.logger.info(
+                    "[Library Check] Skipping %s — %s",
+                    track_name, status["reason"],
+                )
+                _record_disposition(track_name, file_name, "skipped_owned", status["reason"])
+                # NOT unlinking the staging file here: on the manual import
+                # page these are the user's own files. they stay in staging
+                # unless the user turned on "clear finished folders" (below).
+                # (Automated client copies are working copies and ARE
+                # discarded — see client_match.)
+                finished_paths.append(file_path)
+                continue
+            # "upgrade" and everything else proceed; the pipeline's existing
+            # upgrade/replacement logic decides what the better file replaces.
+            gate_decision = decision
+
             context_key = f"import_album_{album_id}_{track_number}_{uuid.uuid4().hex[:8]}"
             context = runtime.build_album_import_context(
                 album,
@@ -1065,16 +1706,30 @@ def album_process(runtime: ImportRouteRuntime, data: Dict[str, Any]) -> tuple[Di
                 if reject_reason:
                     errors.append(f"{track_name}: {reject_reason}")
                     runtime.logger.warning("Import rejected: %s — %s", track_name, reject_reason)
+                    _record_disposition(track_name, file_name, "error", reject_reason)
+                elif kept_existing_library_file(context):
+                    # already at its library path and the pipeline kept that
+                    # copy: nothing was imported, so don't call it imported.
+                    _record_disposition(track_name, file_name, "skipped_owned",
+                                        "already in library at the same spot, kept the library copy")
+                    finished_paths.append(file_path)
                 else:
                     processed += 1
+                    # The gate's decision stands: an "upgrade" routing that
+                    # processed cleanly counts as upgraded, the rest imported.
+                    final_decision = "upgraded" if gate_decision == DECISION_UPGRADE else "imported"
+                    _record_disposition(track_name, file_name, final_decision, status["reason"])
+                    finished_paths.append(file_path)
                     runtime.logger.info("Import processed: %s. %s from %s", track_number, track_name, album_name)
             except Exception as proc_err:
                 err_msg = f"{track_name}: {str(proc_err)}"
                 errors.append(err_msg)
                 runtime.logger.error("Import processing error: %s", err_msg)
+                _record_disposition(track_name, file_name, "error", str(proc_err))
 
         if runtime.add_activity_item:
-            runtime.add_activity_item("", "Album Imported", f"{album_name} by {artist_name} ({processed}/{len(matches)} tracks)", "Now")
+            runtime.add_activity_item("", "Album Imported", _import_summary_text(
+                album_name, artist_name, summary, len(matches)), "Now")
 
         if processed > 0:
             _emit_import_completed(
@@ -1089,15 +1744,49 @@ def album_process(runtime: ImportRouteRuntime, data: Dict[str, Any]) -> tuple[Di
             )
             runtime.refresh_import_suggestions_cache()
 
+        # opt-in: every track went in or was already owned, so the folder it
+        # came in is done with. a run with errors keeps everything.
+        cleared = False
+        if finished_paths and not errors and _clear_finished_enabled():
+            from core.imports.file_ops import clear_finished_staging
+            try:
+                cleared = bool(clear_finished_staging(runtime.get_staging_path(), finished_paths))
+            except Exception as exc:                        # noqa: BLE001
+                runtime.logger.warning("[Import] could not clear finished staging files: %s", exc)
+
         # Files just left staging — drop the shared scan so the next files/groups/hints
         # reflects reality immediately instead of waiting out the cache TTL.
-        if processed > 0:
+        if processed > 0 or cleared:
             invalidate_staging_scan_cache()
 
-        return {"success": True, "processed": processed, "total": len(matches), "errors": errors}, 200
+        return {"success": True, "processed": processed, "total": len(matches),
+                "errors": errors, "dispositions": dispositions,
+                "summary": summary}, 200
     except Exception as exc:
         runtime.logger.error("Error processing album import: %s", exc)
         return {"success": False, "error": str(exc)}, 500
+
+
+def _clear_finished_enabled() -> bool:
+    try:
+        from core.settings import config_manager
+        return bool(config_manager.get('import.clear_finished_from_staging', False))
+    except Exception:                                       # noqa: BLE001
+        return False
+
+
+def _import_summary_text(album_name: str, artist_name: str,
+                         summary: Dict[str, int], total: int) -> str:
+    """One-line import result, e.g. "3 imported · 9 already owned · 1 upgraded"."""
+    parts = []
+    if summary.get("imported"):
+        parts.append(f"{summary['imported']} imported")
+    if summary.get("upgraded"):
+        parts.append(f"{summary['upgraded']} upgraded")
+    if summary.get("skipped_owned"):
+        parts.append(f"{summary['skipped_owned']} already owned")
+    detail = " · ".join(parts) if parts else "nothing imported"
+    return f"{album_name} by {artist_name} ({detail})"
 
 
 def search_tracks(runtime: ImportRouteRuntime, query: str, limit: int = 10) -> tuple[Dict[str, Any], int]:
@@ -1128,8 +1817,8 @@ def process_single_import_file(runtime: ImportRouteRuntime, file_info: Dict[str,
     if runtime.post_process_matched_download is None:
         return ("error", "Import post-processing not available")
 
-    title = file_info.get("title", "")
-    artist = file_info.get("artist", "")
+    title = file_info.get("title") if isinstance(file_info.get("title"), str) else ""
+    artist = file_info.get("artist") if isinstance(file_info.get("artist"), str) else ""
     manual_match = file_info.get("manual_match")
     if manual_match is not None and not isinstance(manual_match, dict):
         manual_match = None
@@ -1141,6 +1830,16 @@ def process_single_import_file(runtime: ImportRouteRuntime, file_info: Dict[str,
         manual_match_id = str(manual_match.get("id") or "").strip()
         if not manual_match_id or not manual_match_source:
             return ("error", f"Malformed manual match for file: {file_info.get('filename', '?')}")
+
+    # "No track picked: imported from its own tags" (and the inbox's bulk
+    # "from tags" import): the user declined a catalogue match, so the file
+    # must NOT be run through another automatic lookup — that lookup could
+    # rematch it to an unrelated track (#1772). An explicit manual match is
+    # more specific and wins over the flag if both somehow arrive. Only a
+    # real JSON true sets the flag — the string "false" must not turn it on
+    # for raw API callers. (An empty manual_match dict counts as no match
+    # picked, same as it did before this flag existed.)
+    from_own_tags = file_info.get("from_own_tags") is True and not manual_match
 
     if not title and not manual_match:
         parsed = runtime.parse_filename_metadata(file_info.get("filename", ""))
@@ -1154,6 +1853,13 @@ def process_single_import_file(runtime: ImportRouteRuntime, file_info: Dict[str,
             artist,
             override_id=manual_match_id,
             override_source=manual_match_source,
+            from_own_tags=from_own_tags,
+            album=file_info.get("album") or "",
+            # raw on purpose: the resolver's tag coercion is the one place
+            # that decides what an unusable number becomes
+            track_number=file_info.get("track_number"),
+            disc_number=file_info.get("disc_number"),
+            duration_ms=file_info.get("duration_ms"),
         )
         context = runtime.normalize_import_context(resolved["context"])
         context['is_local_import'] = True  # user's own file, not an slskd transfer (#804)
@@ -1369,6 +2075,7 @@ def _emit_import_completed(
                 "batch_complete",
                 {
                     "playlist_name": playlist_name,
+                    "artist": artist,
                     "total_tracks": str(total_tracks),
                     "completed_tracks": str(track_count),
                     "failed_tracks": str(failed_tracks),

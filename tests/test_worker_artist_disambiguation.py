@@ -11,8 +11,10 @@ from __future__ import annotations
 import types
 
 
-# A query-aware fake DB: owned-albums query → owned titles; the source_id_conflict
-# query (SELECT name FROM artists ...) → no conflict.
+# A query-aware fake DB: owned-albums query → owned titles; the id-conflict query
+# → no conflict. Both table names are served because the workers are being moved to
+# Library v2 one at a time (docs §32.3.1 stage 2) — Spotify/iTunes/MusicBrainz read
+# `lib2_albums` now, Deezer still reads `albums`.
 class _Cur:
     def __init__(self, rows):
         self._rows = rows
@@ -32,7 +34,7 @@ class _Conn:
         return False
 
     def execute(self, sql, params=()):
-        if 'FROM albums' in sql:
+        if 'FROM albums' in sql or 'FROM lib2_albums' in sql:
             return _Cur([(t,) for t in self._owned])
         return _Cur([])  # conflict check → none
 
@@ -70,7 +72,7 @@ def test_spotify_picks_artist_overlapping_owned_catalog():
     w.db = _DB(OWNED)
     w.stats = {'matched': 0, 'not_found': 0, 'errors': 0}
     w.client = types.SimpleNamespace(
-        search_artists=lambda name, limit=5: [WRONG, RIGHT],   # wrong ranked first
+        search_artists=lambda name, limit=5, **k: [WRONG, RIGHT],   # wrong ranked first
         get_artist_albums=lambda aid: ALBUMS.get(aid, []),
     )
     captured = {}

@@ -959,9 +959,11 @@ function generateWishlistTrackList(tracks, trackOwnership) {
     }).join('');
 }
 
-// a profile without download rights sends a request, so the button says so
+// a profile without download rights sends a request, so the button says so.
+// Everyone else monitors: the add marks the tracks wanted in Library v2, and
+// the download starts right away (addModalTracksToWishlist)
 function wishlistAddLabel() {
-    return (typeof canDownload === 'function' && !canDownload()) ? 'Request' : 'Add to Wishlist';
+    return (typeof canDownload === 'function' && !canDownload()) ? 'Request' : 'Monitor';
 }
 
 /**
@@ -995,6 +997,7 @@ async function handleAddToWishlist() {
         let successCount = 0;
         let errorCount = 0;
         let skippedCount = 0;   // already-in-library tracks the backend declined to add (#825)
+        const addedRows = [];   // what "Monitor" downloads (and monitors) right after the adds
 
         // Add each track to wishlist individually
         for (const track of tracks) {
@@ -1076,6 +1079,7 @@ async function handleAddToWishlist() {
                     console.log(`⏭️ "${track.name}" already in library — skipped`);
                 } else if (result.success) {
                     successCount++;
+                    addedRows.push({ id: result.wishlist_id || track.id, album: result.lib2_album_id });
                     console.log(`✅ Added "${track.name}" to wishlist`);
                 } else {
                     errorCount++;
@@ -1093,7 +1097,11 @@ async function handleAddToWishlist() {
         if (successCount === 0 && skippedCount > 0 && errorCount === 0) {
             showToast(`All ${skippedCount} track${skippedCount !== 1 ? 's' : ''} already in your library`, 'success');
         } else if (successCount > 0) {
-            let message = `Added ${successCount} track${successCount !== 1 ? 's' : ''} to wishlist`;
+            // "Monitor" downloads the added tracks now (shell/download-modal-library.ts)
+            let message = wishlistAddLabel() === 'Monitor' && window.monitorAddedTracks
+                ? await window.monitorAddedTracks(successCount, addedRows,
+                    Boolean(album?.total_tracks) && tracks.length >= album.total_tracks)
+                : `Added ${successCount} track${successCount !== 1 ? 's' : ''} to wishlist`;
             if (skippedCount > 0) message += ` (${skippedCount} already owned)`;
             if (errorCount > 0) message += ` — ${errorCount} failed`;
             // a profile that asks first hears who it went to instead
@@ -1410,14 +1418,34 @@ async function addModalTracksToWishlist(playlistId) {
 
     // Filter tracks based on checkbox selection (if checkboxes exist in this modal)
     const wishlistTbody = document.getElementById(`download-tracks-tbody-${playlistId}`);
-    let tracks = process.tracks;
+    let selectedIndices = null;
     if (wishlistTbody) {
         const allCbs = wishlistTbody.querySelectorAll('.track-select-cb');
         if (allCbs.length > 0) {
             const checkedCbs = wishlistTbody.querySelectorAll('.track-select-cb:checked');
-            const selectedIndices = new Set([...checkedCbs].map(cb => parseInt(cb.dataset.trackIndex)));
-            tracks = process.tracks.filter((_, i) => selectedIndices.has(i));
+            selectedIndices = new Set([...checkedCbs].map(cb => parseInt(cb.dataset.trackIndex)));
         }
+    }
+
+    // songs you already own don't go on the wishlist (#1910): the same
+    // ownership answer the modal shows. Force Download All means you asked
+    // for everything, owned or not.
+    const forceAll = document.getElementById(`force-download-all-${playlistId}`)?.checked;
+    if (!forceAll && !process.ownedIndices && typeof previewModalOwnership === 'function') {
+        await previewModalOwnership(playlistId);
+    }
+    const owned = (!forceAll && process.ownedIndices) || new Set();
+    let ownedSkipped = 0;
+    const tracks = process.tracks.filter((_, i) => {
+        if (selectedIndices && !selectedIndices.has(i)) return false;
+        if (owned.has(i)) { ownedSkipped++; return false; }
+        return true;
+    });
+    if (!tracks.length) {
+        showToast(ownedSkipped
+            ? `All ${ownedSkipped} selected track${ownedSkipped !== 1 ? 's are' : ' is'} already in your library`
+            : 'No tracks selected', ownedSkipped ? 'success' : 'info');
+        return;
     }
 
     // Get album context if available (for artist album downloads)
@@ -1441,13 +1469,16 @@ async function addModalTracksToWishlist(playlistId) {
     if (wishlistBtn) {
         wishlistBtn.disabled = true;
         wishlistBtn.classList.add('loading');
-        wishlistBtn.textContent = 'Adding...';
+        wishlistBtn.textContent = wishlistAddLabel() === 'Monitor' ? 'Monitoring...' : 'Adding...';
     }
 
     try {
         let successCount = 0;
         let errorCount = 0;
-        let skippedCount = 0;   // already-in-library tracks the backend declined to add (#825)
+        // already-in-library tracks: the ones the modal knew about (#1910) plus
+        // any the backend declined to add (#825)
+        let skippedCount = ownedSkipped;
+        const addedRows = [];   // what "Monitor" downloads (and monitors) right after the adds
 
         // Add each track to wishlist individually
         let wingItSkipped = 0;
@@ -1557,8 +1588,11 @@ async function addModalTracksToWishlist(playlistId) {
 
                 const result = await response.json();
 
-                if (result.success) {
+                if (result.success && result.skipped) {
+                    skippedCount++;
+                } else if (result.success) {
                     successCount++;
+                    addedRows.push({ id: result.wishlist_id || track.id, album: result.lib2_album_id });
                 } else {
                     errorCount++;
                     console.error(`❌ Failed to add "${track.name}" to wishlist: ${result.error}`);
@@ -1574,7 +1608,11 @@ async function addModalTracksToWishlist(playlistId) {
             showToast(`All ${skippedCount} track${skippedCount !== 1 ? 's' : ''} already in your library`, 'success');
             await closeDownloadMissingModal(playlistId);
         } else if (successCount > 0) {
-            let message = `Added ${successCount} track${successCount !== 1 ? 's' : ''} to wishlist`;
+            // "Monitor" downloads the added tracks now (shell/download-modal-library.ts)
+            let message = wishlistAddLabel() === 'Monitor' && window.monitorAddedTracks
+                ? await window.monitorAddedTracks(successCount, addedRows,
+                    Boolean(process.album) && tracks.length === process.tracks.length)
+                : `Added ${successCount} track${successCount !== 1 ? 's' : ''} to wishlist`;
             if (skippedCount > 0) message += ` (${skippedCount} already owned)`;
             if (errorCount > 0) message += ` — ${errorCount} failed`;
             if (wingItSkipped > 0) message += ` (${wingItSkipped} wing-it skipped)`;
@@ -3996,7 +4034,7 @@ async function openMetadataCacheDetail(source, entityType, entityId) {
             addRow('Disc Number', data.disc_number);
             addRow('Explicit', data.explicit ? 'Yes' : 'No');
             addRow('ISRC', data.isrc);
-            if (data.preview_url) addRow('Preview', `<a href="${data.preview_url}" target="_blank" style="color:var(--accent,#6d5dfc)">Listen</a>`);
+            if (data.preview_url) addRow('Preview', `<a href="${data.preview_url}" target="_blank" style="color:var(--accent)">Listen</a>`);
         }
 
         fieldsHtml += '</table>';
@@ -5445,6 +5483,56 @@ const TOOL_HELP_CONTENT = {
                 <li>The newest 8 backups are kept; older ones rotate out automatically.</li>
                 <li>Download a backup from the list to keep an off-machine copy.</li>
             </ul>
+        `
+    },
+    'video-scan': {
+        title: 'Library Scan',
+        content: `
+            <h4>What is this?</h4>
+            <p>SoulSync reads your media server (Plex or Jellyfin) into its own video database. Everything else on the video side, from detail pages to missing episodes to the maintenance jobs, works off what this scan read in.</p>
+
+            <h4>Scan types</h4>
+            <ul>
+                <li><strong>Incremental Update:</strong> only what changed on the server since the last full read. The fast one.</li>
+                <li><strong>Full Refresh:</strong> reads every movie and show again, updating anything that drifted.</li>
+                <li><strong>Deep Scan:</strong> a full refresh that also removes titles the server no longer has.</li>
+            </ul>
+
+            <h4>Good to know</h4>
+            <p>Movies and TV are separate libraries, so you can scan one or both. Nothing on disk or on the server is changed by a scan. If you just downloaded something, run a <strong>Server Scan</strong> first so the server knows about the file.</p>
+        `
+    },
+    'video-server-scan': {
+        title: 'Server Scan',
+        content: `
+            <h4>What is this?</h4>
+            <p>Asks your media server to rescan its own folders, so files that just landed get indexed. It's the manual twin of the post-download "Scan Video Server" automation.</p>
+
+            <h4>How it fits with Library Scan</h4>
+            <p>Server Scan makes the <em>server</em> notice new files. Library Scan then reads the server into SoulSync. After a big import, run them in that order.</p>
+
+            <h4>Good to know</h4>
+            <p>Plex doesn't report a percentage, so the bar just shows that the server is working. Some servers can't say when they're done; the card tells you when that's the case.</p>
+        `
+    },
+    'video-overlay-studio': {
+        title: 'Overlay Studio',
+        content: `
+            <h4>What is this?</h4>
+            <p>A visual editor for poster overlays: ratings, resolution, HDR, awards, streaming badges and more, designed once and applied across your library.</p>
+
+            <h4>How it works</h4>
+            <p>Build a template, pick which titles it targets with filters, and apply it. The nightly automation re-applies it as ratings and files change, and the original artwork is kept so you can restore clean posters any time.</p>
+        `
+    },
+    'video-collection-studio': {
+        title: 'Collection Studio',
+        content: `
+            <h4>What is this?</h4>
+            <p>Builds living collections on your media server: franchises, universes, charts, seasonal windows and smart rules that keep themselves up to date.</p>
+
+            <h4>How it works</h4>
+            <p>Pick a source or write rules, preview the members, generate a poster and sync it to the server. Missing films can go straight to the wishlist, and seasonal collections only appear inside their window.</p>
         `
     },
     'video-rename': {

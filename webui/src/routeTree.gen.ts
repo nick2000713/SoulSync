@@ -9,6 +9,7 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
+import { Route as LibraryV2RouteImport } from './routes/library-v2'
 import { Route as SplatRouteImport } from './routes/$'
 import { Route as WishlistRouteRouteImport } from './routes/wishlist/route'
 import { Route as WatchlistRouteRouteImport } from './routes/watchlist/route'
@@ -25,6 +26,7 @@ import { Route as IssuesRouteRouteImport } from './routes/issues/route'
 import { Route as ImportRouteRouteImport } from './routes/import/route'
 import { Route as DiscoverRouteRouteImport } from './routes/discover/route'
 import { Route as DashboardRouteRouteImport } from './routes/dashboard/route'
+import { Route as CalendarRouteRouteImport } from './routes/calendar/route'
 import { Route as AutomationsRouteRouteImport } from './routes/automations/route'
 import { Route as AudiobooksRouteRouteImport } from './routes/audiobooks/route'
 import { Route as ActiveDownloadsRouteRouteImport } from './routes/active-downloads/route'
@@ -45,6 +47,11 @@ import { Route as AudiobooksNarratorNameRouteImport } from './routes/audiobooks/
 import { Route as AudiobooksAuthorNameRouteImport } from './routes/audiobooks/author/$name'
 import { Route as ArtistDetailSourceIdRouteImport } from './routes/artist-detail/$source/$id'
 
+const LibraryV2Route = LibraryV2RouteImport.update({
+  id: '/library-v2',
+  path: '/library-v2',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const SplatRoute = SplatRouteImport.update({
   id: '/$',
   path: '/$',
@@ -123,6 +130,11 @@ const DiscoverRouteRoute = DiscoverRouteRouteImport.update({
 const DashboardRouteRoute = DashboardRouteRouteImport.update({
   id: '/dashboard',
   path: '/dashboard',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const CalendarRouteRoute = CalendarRouteRouteImport.update({
+  id: '/calendar',
+  path: '/calendar',
   getParentRoute: () => rootRouteImport,
 } as any)
 const AutomationsRouteRoute = AutomationsRouteRouteImport.update({
@@ -226,6 +238,7 @@ export interface FileRoutesByFullPath {
   '/active-downloads': typeof ActiveDownloadsRouteRoute
   '/audiobooks': typeof AudiobooksRouteRouteWithChildren
   '/automations': typeof AutomationsRouteRoute
+  '/calendar': typeof CalendarRouteRoute
   '/dashboard': typeof DashboardRouteRoute
   '/discover': typeof DiscoverRouteRoute
   '/import': typeof ImportRouteRouteWithChildren
@@ -242,6 +255,7 @@ export interface FileRoutesByFullPath {
   '/watchlist': typeof WatchlistRouteRoute
   '/wishlist': typeof WishlistRouteRoute
   '/$': typeof SplatRoute
+  '/library-v2': typeof LibraryV2Route
   '/audiobooks/$asin': typeof AudiobooksAsinRoute
   '/audiobooks/library': typeof AudiobooksLibraryRoute
   '/audiobooks/wishlist': typeof AudiobooksWishlistRoute
@@ -262,6 +276,7 @@ export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/active-downloads': typeof ActiveDownloadsRouteRoute
   '/automations': typeof AutomationsRouteRoute
+  '/calendar': typeof CalendarRouteRoute
   '/dashboard': typeof DashboardRouteRoute
   '/discover': typeof DiscoverRouteRoute
   '/issues': typeof IssuesRouteRoute
@@ -276,6 +291,7 @@ export interface FileRoutesByTo {
   '/watchlist': typeof WatchlistRouteRoute
   '/wishlist': typeof WishlistRouteRoute
   '/$': typeof SplatRoute
+  '/library-v2': typeof LibraryV2Route
   '/audiobooks/$asin': typeof AudiobooksAsinRoute
   '/audiobooks/library': typeof AudiobooksLibraryRoute
   '/audiobooks/wishlist': typeof AudiobooksWishlistRoute
@@ -298,6 +314,7 @@ export interface FileRoutesById {
   '/active-downloads': typeof ActiveDownloadsRouteRoute
   '/audiobooks': typeof AudiobooksRouteRouteWithChildren
   '/automations': typeof AutomationsRouteRoute
+  '/calendar': typeof CalendarRouteRoute
   '/dashboard': typeof DashboardRouteRoute
   '/discover': typeof DiscoverRouteRoute
   '/import': typeof ImportRouteRouteWithChildren
@@ -314,6 +331,7 @@ export interface FileRoutesById {
   '/watchlist': typeof WatchlistRouteRoute
   '/wishlist': typeof WishlistRouteRoute
   '/$': typeof SplatRoute
+  '/library-v2': typeof LibraryV2Route
   '/audiobooks/$asin': typeof AudiobooksAsinRoute
   '/audiobooks/library': typeof AudiobooksLibraryRoute
   '/audiobooks/wishlist': typeof AudiobooksWishlistRoute
@@ -337,6 +355,7 @@ export interface FileRouteTypes {
     | '/active-downloads'
     | '/audiobooks'
     | '/automations'
+    | '/calendar'
     | '/dashboard'
     | '/discover'
     | '/import'
@@ -353,6 +372,7 @@ export interface FileRouteTypes {
     | '/watchlist'
     | '/wishlist'
     | '/$'
+    | '/library-v2'
     | '/audiobooks/$asin'
     | '/audiobooks/library'
     | '/audiobooks/wishlist'
@@ -373,6 +393,7 @@ export interface FileRouteTypes {
     | '/'
     | '/active-downloads'
     | '/automations'
+    | '/calendar'
     | '/dashboard'
     | '/discover'
     | '/issues'
@@ -387,6 +408,7 @@ export interface FileRouteTypes {
     | '/watchlist'
     | '/wishlist'
     | '/$'
+    | '/library-v2'
     | '/audiobooks/$asin'
     | '/audiobooks/library'
     | '/audiobooks/wishlist'
@@ -408,6 +430,7 @@ export interface FileRouteTypes {
     | '/active-downloads'
     | '/audiobooks'
     | '/automations'
+    | '/calendar'
     | '/dashboard'
     | '/discover'
     | '/import'
@@ -424,6 +447,7 @@ export interface FileRouteTypes {
     | '/watchlist'
     | '/wishlist'
     | '/$'
+    | '/library-v2'
     | '/audiobooks/$asin'
     | '/audiobooks/library'
     | '/audiobooks/wishlist'
@@ -446,6 +470,7 @@ export interface RootRouteChildren {
   ActiveDownloadsRouteRoute: typeof ActiveDownloadsRouteRoute
   AudiobooksRouteRoute: typeof AudiobooksRouteRouteWithChildren
   AutomationsRouteRoute: typeof AutomationsRouteRoute
+  CalendarRouteRoute: typeof CalendarRouteRoute
   DashboardRouteRoute: typeof DashboardRouteRoute
   DiscoverRouteRoute: typeof DiscoverRouteRoute
   ImportRouteRoute: typeof ImportRouteRouteWithChildren
@@ -462,12 +487,20 @@ export interface RootRouteChildren {
   WatchlistRouteRoute: typeof WatchlistRouteRoute
   WishlistRouteRoute: typeof WishlistRouteRoute
   SplatRoute: typeof SplatRoute
+  LibraryV2Route: typeof LibraryV2Route
   LabelDetailIdRoute: typeof LabelDetailIdRoute
   ArtistDetailSourceIdRoute: typeof ArtistDetailSourceIdRoute
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
+    '/library-v2': {
+      id: '/library-v2'
+      path: '/library-v2'
+      fullPath: '/library-v2'
+      preLoaderRoute: typeof LibraryV2RouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/$': {
       id: '/$'
       path: '/$'
@@ -578,6 +611,13 @@ declare module '@tanstack/react-router' {
       path: '/dashboard'
       fullPath: '/dashboard'
       preLoaderRoute: typeof DashboardRouteRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/calendar': {
+      id: '/calendar'
+      path: '/calendar'
+      fullPath: '/calendar'
+      preLoaderRoute: typeof CalendarRouteRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/automations': {
@@ -777,6 +817,7 @@ const rootRouteChildren: RootRouteChildren = {
   ActiveDownloadsRouteRoute: ActiveDownloadsRouteRoute,
   AudiobooksRouteRoute: AudiobooksRouteRouteWithChildren,
   AutomationsRouteRoute: AutomationsRouteRoute,
+  CalendarRouteRoute: CalendarRouteRoute,
   DashboardRouteRoute: DashboardRouteRoute,
   DiscoverRouteRoute: DiscoverRouteRoute,
   ImportRouteRoute: ImportRouteRouteWithChildren,
@@ -793,6 +834,7 @@ const rootRouteChildren: RootRouteChildren = {
   WatchlistRouteRoute: WatchlistRouteRoute,
   WishlistRouteRoute: WishlistRouteRoute,
   SplatRoute: SplatRoute,
+  LibraryV2Route: LibraryV2Route,
   LabelDetailIdRoute: LabelDetailIdRoute,
   ArtistDetailSourceIdRoute: ArtistDetailSourceIdRoute,
 }

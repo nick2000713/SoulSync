@@ -29,6 +29,11 @@ export interface FindingGroup {
   severity_max: string;
   last_seen?: string | null;
   job_ids?: string[];
+  /** Pending rows in this group that would overwrite a value someone set by
+   *  hand. Counted server-side: "apply all" and "apply all except my own
+   *  edits" are two different requests, and the choice has to be made before
+   *  the click — not after walking every finding's diff. */
+  manual_conflicts?: number;
 }
 
 /** One row of `GET /api/repair/finding-types`. The backend owns this: the
@@ -44,6 +49,18 @@ export interface FindingTypeInfo {
   job_ids?: string[];
   /** What the bulk-fix confirmation says, when the generic warning is wrong. */
   confirm?: string;
+  /** Approving starts downloads (a grab, wishlist rows). Video sends it; a
+   *  movie is gigabytes, so "fix all safe" leaves these alone. */
+  acquires?: boolean;
+  /** Served one-liner (video). Music's live in FINDING_TYPE_BLURBS below. */
+  blurb?: string;
+}
+
+/** Safe = approving only writes data: nothing on disk moves and nothing is
+ *  downloaded. What "Fix all safe" promises, so the count and the run must
+ *  agree on it. */
+export function isSafeType(info: FindingTypeInfo | undefined): boolean {
+  return Boolean(info?.fixable && !info.destructive && !info.acquires);
 }
 
 // ── One line explaining every finding type ───────────────────────────────────
@@ -64,11 +81,14 @@ export const FINDING_TYPE_BLURBS: Record<string, string> = {
   missing_lyrics: 'Tracks with no lyrics saved.',
   missing_replaygain: 'No loudness tags, so playback volume jumps between tracks.',
   replaygain_retag: 'Loudness tags written before your current target level.',
+  untagged_download: 'Downloads with no title, artist or album tag.',
   empty_folder: 'Folders left behind with no audio inside.',
   expired_download: 'Finished downloads older than your retention window.',
   metadata_gap: 'Missing genres, years or IDs that enrichment can fill in.',
   bpm_backfill: 'Tracks missing BPM that Deezer or local analysis can fill in.',
   duplicate_tracks: 'The same track stored more than once.',
+  native_duplicate_releases: 'Choose the surviving release. Provider editions and files stay.',
+  native_duplicate_tracks: 'Review copies. Keep Best preserves protected files.',
   single_album_redundant: 'Singles you also own inside the full album.',
   mbid_mismatch: 'Track MusicBrainz IDs disagree with the tags on disk.',
   album_mbid_mismatch: 'Album MusicBrainz IDs disagree with the tags on disk.',
@@ -80,6 +100,9 @@ export const FINDING_TYPE_BLURBS: Record<string, string> = {
   unknown_artist: 'Tracks filed under an unidentified or blank artist.',
   acoustid_mismatch: 'The audio fingerprint says this is a different track.',
   quality_upgrade: 'Files below the bitrate or format your profile asks for.',
+  quality_upgrade_review: 'Below the quality target. Applying monitors and queues the track.',
+  quality_format_not_targeted: 'Formats outside your profile. Review the profile before replacing.',
+  quality_unknown: 'Audio quality could not be measured. Inspect before replacing.',
   missing_discography_track: 'Releases by your artists that are not in the library.',
   library_retag: "Files whose tags are behind the library's metadata.",
   short_preview_track: '30-second preview clips saved in place of full tracks.',
@@ -88,20 +111,20 @@ export const FINDING_TYPE_BLURBS: Record<string, string> = {
   genre_cleanup: 'Genre tags that are junk, duplicated or wrongly cased.',
   comma_artist_split: 'One artist row holding several comma-separated names.',
   suspect_album_tag: 'Tracks probably filed under the wrong album due to bad tags.',
-  fake_lossless: 'FLAC upscaled from a lossy source. Review only.',
+  fake_lossless: 'FLAC upscaled from a lossy source; applying re-downloads it.',
   album_needs_enrichment: 'Albums still waiting on a metadata enrichment pass.',
   album_release_year_mismatch: 'Album and track release years disagree with the original release.',
 };
 
-export function findingTypeBlurb(findingType: string): string {
-  return FINDING_TYPE_BLURBS[findingType] || '';
+export function findingTypeBlurb(findingType: string, info?: FindingTypeInfo): string {
+  return info?.blurb || FINDING_TYPE_BLURBS[findingType] || '';
 }
 
 // ── Severity ─────────────────────────────────────────────────────────────────
 
 /** Sort order. Anything unrecognised sorts as `info` — the quietest bucket,
  *  so an unknown severity can never jump the queue ahead of real errors. */
-export const SEVERITY_RANK: Record<string, number> = { error: 0, warning: 1, info: 2 };
+export const SEVERITY_RANK: Record<string, number> = { error: 0, critical: 0, warning: 1, info: 2 };
 
 export function severityRank(severity: string | null | undefined): number {
   return SEVERITY_RANK[severity || 'info'] ?? 2;
@@ -114,7 +137,13 @@ export function severityRank(severity: string | null | undefined): number {
  * spread is deliberately wide so the number tracks what is actually wrong
  * rather than what is merely numerous.
  */
-export const SEVERITY_WEIGHTS: Record<string, number> = { error: 1, warning: 0.25, info: 0.02 };
+export const SEVERITY_WEIGHTS: Record<string, number> = {
+  error: 1,
+  // the video side's word for error
+  critical: 1,
+  warning: 0.25,
+  info: 0.02,
+};
 
 export function severityWeight(severity: string | null | undefined): number {
   return SEVERITY_WEIGHTS[severity || 'info'] ?? SEVERITY_WEIGHTS.info;
@@ -287,8 +316,7 @@ export function safeFixablePending(
 ): number {
   let total = 0;
   for (const group of groups) {
-    const info = infoOf(group.finding_type);
-    if (info?.fixable && !info.destructive) total += Math.max(0, group.pending || 0);
+    if (isSafeType(infoOf(group.finding_type))) total += Math.max(0, group.pending || 0);
   }
   return total;
 }

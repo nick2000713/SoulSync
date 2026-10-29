@@ -19,6 +19,7 @@ import {
   foundArtistLine,
   formatDuration,
   mergeArtistFaces,
+  playlistTrackOf,
   rankPlaylists,
   shelfAlbums,
   trackIdentity,
@@ -329,6 +330,7 @@ export function SearchResults({
         playTitle={libraryRow ? 'Play from library' : 'Stream this track'}
         onOpen={() => onTrackClick(track)}
         onPlay={() => onTrackPlay(track, libraryRow)}
+        playlistTrack={playlistTrackOf(track)}
       />
     );
   };
@@ -394,7 +396,10 @@ export function SearchResults({
               image={artistImages[String(artist.id ?? '')] || artistImage(artist)}
               href={onArtistHref(artist, inLibrary)}
               inLibrary={inLibrary}
-              artistId={artist.id}
+              // iss29-B04c: a lib2-native row's id is not resolvable by the
+              // provider image endpoint — withholding it keeps the
+              // placeholder instead of another artist's face.
+              artistId={artist.image_is_native ? undefined : artist.id}
             />
           )}
         />

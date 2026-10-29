@@ -1,13 +1,15 @@
 import { useQuery } from '@tanstack/react-query';
 import { useEffect, useMemo, useRef, useState } from 'react';
 
+import { Spinner } from '@/components/primitives';
+
 import { requestStems, stemAudioUrl, studioStemsStatusQueryOptions } from '../-sample-studio.api';
-import { STEM_LABEL, type StemName, type StemsInfo } from '../-sample-studio.types';
+import { STEM_LABEL, type StemName, type StemsInfo, type TrackId } from '../-sample-studio.types';
 import { PlayIcon, StopIcon } from './icons';
 import styles from './stems-panel.module.css';
 
 interface StemsPanelProps {
-  trackId: number | null;
+  trackId: TrackId | null;
   /** The stem the editor is currently auditioning, or null for the full mix. */
   activeStem: StemName | null;
   onSelectStem: (stem: StemName | null) => void;
@@ -44,7 +46,7 @@ function StemsSetupNote() {
   );
 }
 
-function useStemMixer(trackId: number | null, stems: StemName[]) {
+function useStemMixer(trackId: TrackId | null, stems: StemName[]) {
   const ctxRef = useRef<AudioContext | null>(null);
   const gainsRef = useRef<Map<StemName, GainNode>>(new Map());
   const [playing, setPlaying] = useState(false);
@@ -213,7 +215,7 @@ export default function StemsPanel({ trackId, activeStem, onSelectStem }: StemsP
 
         {busy && (
           <div className={styles.progress} role="status" aria-live="polite">
-            <div className={styles.spinner} aria-hidden="true" />
+            <Spinner className={styles.spinner} />
             <span>{message}. This takes a few minutes, keep editing meanwhile.</span>
           </div>
         )}

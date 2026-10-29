@@ -195,6 +195,25 @@ Repair and maintenance moved to the **Tools** page, which has two tabs:
 - **Operations** — the findings inbox. Repair scans surface problems here (missing tags, duplicates, dead files, …) and you fix them individually or in bulk.
 - **Tools** — launcher cards for scans and maintenance: **Media Server Scan**, **Metadata Updater**, **Backup Manager**, **Download Blacklist**, **Metadata Cache**, **Discovery Pool**, and more.
 
+## Working through findings
+
+**Simple mode** opens with one health score (the same one Advanced shows) and sorts every open finding by what fixing it would do:
+
+| Card | What's in it |
+|------|--------------|
+| **Safe to fix** | Fixes that only write tags and data. **Fix all** runs them in the background. |
+| **Needs your call** | Fixes that move, delete or replace files. Each asks first. |
+| **Review only** | Things worth a look that have no automatic fix. |
+
+Each card lists the finding types inside it; click one to open its findings.
+
+**Advanced mode** lands on **Issue Types**: one row per kind of finding, worst first, each with its own fix-all and dismiss-all. **Albums & Releases** is a lens on the findings that belong to an album; it says how many findings it can't show (orphan files have no album) and links to the rest.
+
+- **Dismiss** means "don't raise this again". Every dismiss shows an **Undo** for a few seconds, and dismissed findings can be reopened from the Dismissed view.
+- **Delete matching…** forgets findings outright (the next scan can raise them again). It's not the same as dismiss.
+- A fix that fails keeps its reason on the row, with **Retry Fix**.
+- Keyboard, in any open list: \`j\`/\`k\` move, \`x\` select, \`Enter\` details, \`f\` fix, \`d\` dismiss, \`z\` undo, \`/\` search.
+
 ## Repair jobs
 
 The background repair worker runs automated jobs on configurable schedules, including:
@@ -204,20 +223,17 @@ The background repair worker runs automated jobs on configurable schedules, incl
 | Track Number Repair | Fixes missing/incorrect track numbers against official tracklists |
 | Orphan File Detector | Finds audio files in your output folder not tracked in the database |
 | Dead File Cleaner | Removes database entries pointing to files that no longer exist |
-| Duplicate Detector | Identifies duplicate tracks by fingerprint or metadata match |
 | AcoustID Scanner | Batch audio fingerprint verification across your library |
 | Cover Art Filler | Detects albums/tracks without embedded artwork and fetches it |
 | Metadata Gap Filler | Completes missing fields (genre, year, …) from connected services |
-| Album Completeness | Flags incomplete albums and finds the missing tracks |
-| Fake Lossless Detector | Identifies FLAC files without real high-frequency content |
+| Fake Lossless Detector | Flags suspected lossy transcodes for review; findings have no automatic repair or re-download action |
 | Library Reorganize | Restructures folders to match your path templates |
 | MBID Mismatch Detector | Verifies MusicBrainz IDs are still accurate |
 | Album Tag Consistency | Standardizes tags across all tracks in an album |
 | Cache Maintenance | Cleans expired metadata cache entries |
 | Corrupt File Detector | Decode-tests every library FLAC (\`flac -t\`, falling back to ffmpeg) and flags physically damaged files — the only cure is a fresh download |
-| Resolve Canonical Album Versions | Pins each album's canonical release across metadata sources so the reorganizer and track-number repair resolve the same release (opt-in; costs API calls, done once per album) |
 | Comma Artist Splitter | Finds dummy artists that are really several artists joined by separators ("Camellia, Toby Fox") and splits their tags — verifies against metadata APIs first so real separator-named acts like "Tyler, The Creator" are never split |
-| Discography Backfill | Finds missing albums and tracks for artists already in your library |
+| Monitoring List Reconcile | Reconciles monitored artists with the Watchlist and missing or upgrade-eligible tracks with the Wishlist |
 | Empty Folder Cleaner | Finds truly-empty folders (or folders holding only OS junk like .DS_Store) in the library root — never touches a folder containing audio or cover art |
 | Expired Download Cleaner | Proposes deleting watchlist/playlist-sourced downloads past their per-origin retention window; always keeps actively-mirrored playlists, watched artists, and tracks you've played more than once (optional auto-delete) |
 | Genre Tag Cleanup | Re-applies the strict genre whitelist to genres stored before it was enabled — one finding per artist/album with off-whitelist genres |
@@ -226,12 +242,10 @@ The background repair worker runs automated jobs on configurable schedules, incl
 | Live/Commentary Cleaner | Finds live performances, commentary, interviews, and spoken-word content in the library |
 | Lossy Converter | Finds lossless files with no lossy copy alongside and converts them with ffmpeg using your configured codec/bitrate |
 | Lyrics Filler | Finds tracks with no \`.lrc\` sidecar, checks LRClib so instrumentals are never flagged, then fetches synced lyrics — writes the \`.lrc\` and embeds them |
-| Quality Upgrade Finder | Finds library tracks below your quality profile and actively searches a better version to add to the wishlist |
-| Quality Check | Flags library tracks below your quality profile — you decide re-download, delete, or ignore per finding |
 | ReplayGain Filler | Finds tracks with no ReplayGain loudness tag, analyzes them, and writes the tags |
 | Preview Clip Cleanup | Detects ~30s preview clips (some sources deliver samples instead of full songs), compares against the expected length from the metadata source, and re-fetches the full track |
-| Single/Album Dedup | Flags singles that are redundant because the same track already exists on an album in your library |
-| Fix Unknown Artists | Finds tracks tagged "Unknown Artist", resolves the correct artist/album/track from file tags or the metadata API, then re-tags, moves the file to the correct folder, and updates the database |
+
+Library v2 handles catalogue identity, duplicate review, release completeness, and wanted quality upgrades directly. The retired Duplicate Detector, Album Completeness, Quality Upgrade Finder, Quality Check, Single/Album Dedup, and Fix Unknown Artists jobs are not offered. Missing and upgrade-eligible monitored tracks reach the Wishlist through **Monitoring List Reconcile**; there is no **Apply Quality Upgrades** automation action.
 
 > [!WARNING]
 > **Mass orphan safety:** when the orphan detector's mass-orphan guard trips (over half the scanned files look like orphans — usually a DB↔filesystem path mismatch, not real orphans), the scan refuses to create any findings at all, so there's nothing to bulk-delete. The **"Witness Me"** type-the-phrase confirmation exists for bulk orphan deletes, but it can't trigger while the guard refuses findings.
@@ -360,7 +374,7 @@ Every downloaded file is verified by **AcoustID audio fingerprinting** against t
 ### ⚠ Unverified
 Imported files AcoustID could not hard-confirm (shown only when AcoustID is configured). Row badges explain why: **FORCE-IMPORTED** ("Accepted as best candidate after the retry budget was exhausted") or **ACOUSTID UNCONFIRMED** ("ambiguous / cross-script / no fingerprint match"). Expanding a row shows **Why flagged**, download source, quality, file, and download date.
 
-Per-row actions: **▶ Play** (in the media player), **⇆ Compare** (finds the expected track on Soulseek/streaming and plays it for A/B comparison), **🔍 Audit** (full audit trail: lifecycle, embedded tags, lyrics), **✔ Approve** ("mark as human-verified — the AcoustID scanner will skip it"), **🗑 Delete** (wrong file: delete from disk and remove the entry).
+Per-row actions: **▶ Play** (in the media player), **⇆ Compare** (finds the expected track on Soulseek/streaming and plays it for A/B comparison), **🔍 Audit** (full audit trail: lifecycle, embedded tags, lyrics), **✔ Approve** ("mark as human-verified — the AcoustID scanner will skip it"), **Wrong song** (deletes the file, skips that source next time, puts the song you asked for back on the wishlist and opens Interactive Search on it so you can pick the right one; close it and the wishlist keeps looking), **🗑 Delete** (wrong file: delete from disk, remove the entry, and skip that source next time).
 
 Bulk: **✔ Approve all**, **🧹 Clean orphaned** (removes dead log rows whose file no longer exists — never deletes a file), **🗑 Delete all**, plus checkbox multi-select.
 
@@ -371,6 +385,9 @@ Bulk: **✔ Approve all**, **🧹 Clean orphaned** (removes dead log rows whose 
 Files that **failed** verification and were **not** imported. Trigger badges: **DURATION / INTEGRITY**, **ACOUSTID MISMATCH**, **ACOUSTID UNVERIFIED**, **BIT DEPTH FILTER**. Alternative rejected candidates for the same track fold behind "▾ N more"; **🗑 Delete all N** clears a whole candidate group.
 
 Per-row: Play, Compare, Audit, **✔ Approve** (re-imports this exact file into the library, marked human-verified — nothing is renamed), **⤴ Recover** (legacy sidecars without embedded context go back to Staging for manual import), **🗑 Delete** (permanent).
+
+> [!TIP]
+> Lots of **DURATION** quarantines that turn out to be the right song? Raise **Duration tolerance** in Settings > Library > Post-Processing so future downloads with the same small drift go straight through.
 
 ### 🗑 Deleted — the recycle bin
 Files removed by repair tools and the duplicate cleaner land here instead of dying, hidden from media servers. Source chips: "Repair tool", "Duplicate cleaner", "Stalled album download". Per row: **↩ Restore** (back to where it was removed from) or **🗑 Delete permanently**.

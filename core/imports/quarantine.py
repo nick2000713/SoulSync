@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -260,7 +261,70 @@ def count_quarantine_entries(quarantine_dir: str) -> int:
         return 0
 
 
-def list_quarantine_entries(quarantine_dir: str) -> List[Dict[str, Any]]:
+def _build_quarantine_entry(quarantine_dir: str, name: str) -> Dict[str, Any]:
+    """Build one entry dict for a `.quarantined` file name."""
+    full_path = os.path.join(quarantine_dir, name)
+    entry_id = _entry_id_from_filename(name)
+    sidecar_path = os.path.join(quarantine_dir, f"{entry_id}.json")
+    sidecar: Dict[str, Any] = {}
+    if os.path.isfile(sidecar_path):
+        try:
+            with open(sidecar_path, encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                sidecar = loaded
+        except Exception as exc:
+            logger.debug("sidecar read failed for %s: %s", entry_id, exc)
+
+    try:
+        size_bytes = os.path.getsize(full_path)
+    except OSError:
+        size_bytes = 0
+
+    # Issue #608 follow-up (AfonsoG6): surface the source username
+    # + filename that was originally downloaded, so the user can see
+    # at a glance which uploader the bad file came from. Lives
+    # under `context.original_search_result` when full context is
+    # persisted; absent on legacy thin sidecars.
+    ctx = sidecar.get("context") if isinstance(sidecar.get("context"), dict) else {}
+    osr = ctx.get("original_search_result") if isinstance(ctx.get("original_search_result"), dict) else {}
+    source_username = osr.get("username", "") if isinstance(osr, dict) else ""
+    source_filename = osr.get("filename", "") if isinstance(osr, dict) else ""
+
+    return {
+        "id": entry_id,
+        "filename": name,
+        "original_filename": sidecar.get("original_filename", name),
+        "reason": sidecar.get("quarantine_reason", "Unknown reason"),
+        "expected_track": sidecar.get("expected_track", ""),
+        "expected_artist": sidecar.get("expected_artist", ""),
+        "group_key": quarantine_group_key(
+            sidecar.get("expected_artist", ""),
+            sidecar.get("expected_track", ""),
+            ctx,
+        ),
+        "timestamp": sidecar.get("timestamp", ""),
+        "size_bytes": size_bytes,
+        "has_full_context": isinstance(sidecar.get("context"), dict),
+        "trigger": sidecar.get("trigger", "unknown"),
+        "source_username": source_username,
+        "source_filename": source_filename,
+        "thumb_url": _extract_context_thumb(ctx),
+        # Real probed audio quality (recorded on the context before the
+        # quality/AcoustID gates) so the review UI shows what the file
+        # actually is when deciding to approve/delete.
+        "quality": ctx.get("_audio_quality", "") if isinstance(ctx, dict) else "",
+        "album_extra": (
+            {key: str(ctx["_album_import_extra"].get(key) or "")
+             for key in ("album", "download_source")}
+            if isinstance(ctx.get("_album_import_extra"), dict) else None
+        ),
+    }
+
+
+def list_quarantine_entries(
+    quarantine_dir: str, *, limit: Optional[int] = None, offset: int = 0
+) -> List[Dict[str, Any]]:
     """Enumerate quarantined files paired with their sidecars.
 
     Returns one dict per `.quarantined` file with: id, filename,
@@ -273,10 +337,30 @@ def list_quarantine_entries(quarantine_dir: str) -> List[Dict[str, Any]]:
     Orphaned `.quarantined` files (no sidecar) still surface — caller
     can delete them. Orphaned sidecars (no file) are skipped silently.
     Sorted newest-first by timestamp prefix.
+
+    With ``limit``/``offset`` the window is selected from the sorted
+    entry ids BEFORE any sidecar is read, so a paged caller only pays
+    for the entries it returns.
     """
     entries: List[Dict[str, Any]] = []
     if not os.path.isdir(quarantine_dir):
         return entries
+
+    if limit is not None or offset > 0:
+        candidates = []
+        for name in os.listdir(quarantine_dir):
+            if not name.endswith(_QUARANTINE_SUFFIX):
+                continue
+            full_path = os.path.join(quarantine_dir, name)
+            if not os.path.isfile(full_path):
+                continue
+            candidates.append((_entry_id_from_filename(name), name))
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        window = (
+            candidates[offset:offset + limit] if limit is not None
+            else candidates[offset:]
+        )
+        return [_build_quarantine_entry(quarantine_dir, name) for _, name in window]
 
     for name in os.listdir(quarantine_dir):
         if not name.endswith(_QUARANTINE_SUFFIX):
@@ -284,60 +368,7 @@ def list_quarantine_entries(quarantine_dir: str) -> List[Dict[str, Any]]:
         full_path = os.path.join(quarantine_dir, name)
         if not os.path.isfile(full_path):
             continue
-
-        entry_id = _entry_id_from_filename(name)
-        sidecar_path = os.path.join(quarantine_dir, f"{entry_id}.json")
-        sidecar: Dict[str, Any] = {}
-        if os.path.isfile(sidecar_path):
-            try:
-                with open(sidecar_path, encoding="utf-8") as f:
-                    loaded = json.load(f)
-                if isinstance(loaded, dict):
-                    sidecar = loaded
-            except Exception as exc:
-                logger.debug("sidecar read failed for %s: %s", entry_id, exc)
-
-        try:
-            size_bytes = os.path.getsize(full_path)
-        except OSError:
-            size_bytes = 0
-
-        # Issue #608 follow-up (AfonsoG6): surface the source username
-        # + filename that was originally downloaded, so the user can see
-        # at a glance which uploader the bad file came from. Lives
-        # under `context.original_search_result` when full context is
-        # persisted; absent on legacy thin sidecars.
-        ctx = sidecar.get("context") if isinstance(sidecar.get("context"), dict) else {}
-        osr = ctx.get("original_search_result") if isinstance(ctx.get("original_search_result"), dict) else {}
-        source_username = osr.get("username", "") if isinstance(osr, dict) else ""
-        source_filename = osr.get("filename", "") if isinstance(osr, dict) else ""
-
-        entries.append(
-            {
-                "id": entry_id,
-                "filename": name,
-                "original_filename": sidecar.get("original_filename", name),
-                "reason": sidecar.get("quarantine_reason", "Unknown reason"),
-                "expected_track": sidecar.get("expected_track", ""),
-                "expected_artist": sidecar.get("expected_artist", ""),
-                "group_key": quarantine_group_key(
-                    sidecar.get("expected_artist", ""),
-                    sidecar.get("expected_track", ""),
-                    ctx,
-                ),
-                "timestamp": sidecar.get("timestamp", ""),
-                "size_bytes": size_bytes,
-                "has_full_context": isinstance(sidecar.get("context"), dict),
-                "trigger": sidecar.get("trigger", "unknown"),
-                "source_username": source_username,
-                "source_filename": source_filename,
-                "thumb_url": _extract_context_thumb(ctx),
-                # Real probed audio quality (recorded on the context before the
-                # quality/AcoustID gates) so the review UI shows what the file
-                # actually is when deciding to approve/delete.
-                "quality": ctx.get("_audio_quality", "") if isinstance(ctx, dict) else "",
-            }
-        )
+        entries.append(_build_quarantine_entry(quarantine_dir, name))
 
     entries.sort(key=lambda e: e["id"], reverse=True)
     return entries
@@ -613,6 +644,71 @@ def recover_to_staging(
             logger.warning("recover: failed to remove sidecar %s: %s", sidecar_path, exc)
 
     return target
+
+
+@dataclass(frozen=True)
+class StagingRecoveryPlan:
+    """Resolved filesystem half of a journaled quarantine recovery."""
+
+    entry_id: str
+    source_path: str
+    sidecar_path: Optional[str]
+    target_path: str
+    context: Dict[str, Any]
+
+
+def plan_recover_to_staging(
+    quarantine_dir: str,
+    staging_dir: str,
+    entry_id: str,
+) -> Optional[StagingRecoveryPlan]:
+    """Resolve source, target and correlation context without moving a file."""
+    file_path, sidecar_path = _resolve_entry_paths(quarantine_dir, entry_id)
+    if not file_path:
+        return None
+    sidecar: Dict[str, Any] = {}
+    if sidecar_path:
+        try:
+            with open(sidecar_path, encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if isinstance(loaded, dict):
+                sidecar = loaded
+        except Exception as exc:
+            logger.debug("recover plan: sidecar read failed for %s: %s", entry_id, exc)
+    original = sidecar.get("original_filename")
+    restored_name = _restore_filename(os.path.basename(file_path), original)
+    os.makedirs(staging_dir, exist_ok=True)
+    target = _ensure_unique_path(os.path.join(staging_dir, restored_name))
+    context = sidecar.get("context")
+    return StagingRecoveryPlan(
+        entry_id=str(entry_id),
+        source_path=str(file_path),
+        sidecar_path=str(sidecar_path) if sidecar_path else None,
+        target_path=str(target),
+        context=dict(context) if isinstance(context, dict) else {},
+    )
+
+
+def execute_staging_recovery(plan: StagingRecoveryPlan) -> bool:
+    """Move the planned file while deliberately retaining its sidecar."""
+    if os.path.isfile(plan.target_path) and not os.path.exists(plan.source_path):
+        return True
+    if not os.path.isfile(plan.source_path):
+        return False
+    return _move_with_retry(plan.source_path, plan.target_path)
+
+
+def finalize_staging_recovery_sidecar(plan: StagingRecoveryPlan) -> None:
+    """Remove the sidecar only after the durable lifecycle commit succeeds."""
+    if plan.sidecar_path and os.path.isfile(plan.sidecar_path):
+        try:
+            os.remove(plan.sidecar_path)
+        except OSError as exc:
+            logger.warning(
+                "recover: failed to remove committed sidecar %s: %s",
+                plan.sidecar_path,
+                exc,
+            )
 
 
 def _ensure_unique_path(target: str) -> str:

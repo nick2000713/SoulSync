@@ -45,7 +45,6 @@ SPLIT_MODULES = [
     "api-monitor.js",
     # library-globals.js + manual-library-match.js ported to typescript
     # (src/shell, aug 26) - their globals now flow through the shell bundle
-    "beatport-ui.js",
     "enrichment.js",
     "stats-automations.js",
     "auto-sync.js",
@@ -54,7 +53,7 @@ SPLIT_MODULES = [
 ]
 
 # Other JS files that exist in static/ but are NOT part of the split
-NON_SPLIT_JS = {"setup-wizard.js", "docs.js", "helper.js", "particles.js", "worker-orbs.js",
+NON_SPLIT_JS = {"docs.js", "helper.js", "particles.js", "worker-orbs.js",
                 "enrichment-manager.js",
                 "config-migration.js", "video/video-service-status.js"}
 
@@ -77,8 +76,6 @@ def _shell_window_exports() -> set[str]:
 # regressions from the split — they should be deduplicated in a follow-up.
 KNOWN_CROSS_FILE_DUPES = {
     "escapeHtml",        # downloads.js, shared-helpers.js
-    "formatDuration",    # sync-spotify.js, wishlist-tools.js, sync-services.js
-    "_escAttr",          # downloads.js, stats-automations.js
     "_formatDuration",   # stats-automations.js, wishlist-tools.js
                          # (pages-extra.js declared a THIRD, millisecond-based
                          #  copy that loaded last and shadowed both; it went
@@ -91,6 +88,17 @@ KNOWN_CROSS_FILE_DUPES = {
 #     — downloads.js declared all three AND so did wishlist-tools.js, which
 #       loads second, so the downloads.js copies had never run. Deleted.
 #   loadDashboardData — search.js's copy went with the file.
+#   formatDuration — the sync-spotify.js / sync-services.js copies went with
+#     upstream's retired legacy sync-page scripts (3.6.0).
+# Resolved by the frontend audit (FE-07):
+#   _escAttr — downloads.js declared a JS-STRING escaper and stats-automations.js
+#     an HTML-ENTITY one under the same global name; stats-automations.js loads
+#     second, so its version won for both files and the onclick builders got
+#     `&#39;` where they needed `\'`. The attribute parser decoded it back into
+#     a bare apostrophe, which closed the JS string literal and threw — killing
+#     the whole handler ("Road trip-The Rolfe's" delete button). The downloads.js
+#     copy is gone; `_escAttr` and `_escJs` both live in stats-automations.js and
+#     each call site picks the one its context needs.
 
 # Pre-existing same-file duplicates (two filter UIs reuse the same names).
 # (the wishlist-tools double-pasted filter block was removed — c5a8bf241 —

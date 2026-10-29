@@ -37,6 +37,11 @@ _lock = threading.Lock()
 _FETCH_LIMIT = 200
 
 
+def _with_scene_numbering(items, db):
+    from core.video.numbering import annotate
+    return annotate(items, db=db)
+
+
 def is_running() -> bool:
     return _running
 
@@ -234,7 +239,7 @@ def _rss_pass_inner(*, fetch, log, extto=None) -> Dict[str, Any]:
     # due_only=False: matching an incoming feed against the wishlist spends no
     # searches, so there is nothing to back off from.
     for media_type, items in (("movie", db.movie_wishlist_to_download(due_only=False)),
-                              ("episode", db.episode_wishlist_to_download(due_only=False))):
+                              ("episode", _with_scene_numbering(db.episode_wishlist_to_download(due_only=False), db))):
         if any(it.get("owned") for it in items):
             per_item = vpw._cutoff_rank_for_item if any(
                 it.get("quality_profile_id") for it in items) else None
@@ -242,6 +247,11 @@ def _rss_pass_inner(*, fetch, log, extto=None) -> Dict[str, Any]:
         target = vpw._default_target_dir(media_type)
         if not target:
             continue
+        # each item's own folder, the way the wishlist drain files it: the
+        # anime folder by show type, the 4K one by quality profile (RSS used to
+        # send every episode to the TV folder, anime included)
+        anime_root = vpw._default_anime_dir() if media_type == "episode" else ""
+        four_k_root = vpw._default_four_k_dir(media_type)
         for item in items:
             if vpw.item_key(item, media_type) in active:
                 continue
@@ -261,7 +271,9 @@ def _rss_pass_inner(*, fetch, log, extto=None) -> Dict[str, Any]:
                 log("RSS skip: %s — %s" % (_item_label(item, media_type),
                                            _skip_reason(cands, min_rank, item)))
                 continue
-            if vpw._default_enqueue(item, best, cands, media_type, target):
+            folder = vpw.item_target_dir(item, media_type, target, anime_root, four_k_root,
+                                         vpw._default_route_type, vpw._default_profile_library)
+            if vpw._default_enqueue(item, best, cands, media_type, folder):
                 grabbed += 1
                 active.add(vpw.item_key(item, media_type))
                 log("RSS grab: %s (%s)" % (best.get("title"), media_type))
@@ -315,13 +327,15 @@ def _rank(pool: List[Dict[str, Any]], item: Dict[str, Any], media_type: str) -> 
     from api.video import get_video_db
     from api.video.downloads import _evaluate_hits
     from core.automation.handlers.video_process_wishlist import search_context
+    from core.video.numbering import ctx_alt
     from core.video.quality_profile import load_for_item
     ctx = search_context(item, media_type)
     cands = _evaluate_hits(pool, load_for_item(get_video_db(), item), ctx["scope"],
                            ctx.get("season"), ctx.get("episode"),
                            want_year=ctx.get("year"),
                            want_title=ctx.get("titles") or ctx.get("title"),
-                           want_date=ctx.get("air_date"), want_absolute=ctx.get("absolute"))
+                           want_date=ctx.get("air_date"), want_absolute=ctx.get("absolute"),
+                           want_alt=ctx_alt(ctx))
     for c in cands:
         c["source"] = "usenet" if str(c.get("protocol") or "") == "usenet" else "torrent"
     # Full ranked list, not just accepted: rejected candidates ride along into

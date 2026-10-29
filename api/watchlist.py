@@ -8,9 +8,12 @@ from core.watchlist_sources import (
     ARTIST_ID_COLUMNS, SOURCE_COLUMNS, artist_id_match_sql, normalize_source,
 )
 from database.music_database import get_database
+from utils.logging_config import get_logger
 from .auth import require_api_key
 from .helpers import api_success, api_error, parse_fields, parse_profile_id
 from .serializers import serialize_watchlist_artist
+
+logger = get_logger("api.watchlist")
 
 
 def _parse_quality_profile_id(db, body):
@@ -46,6 +49,14 @@ def register_routes(bp):
         try:
             db = get_database()
             artists = db.get_watchlist_artists(profile_id=profile_id)
+            # #1822: a follower reports the default rules it actually gets
+            from core.settings import config_manager
+            from core.watchlist_defaults import default_values
+            defaults = default_values(config_manager)
+            for artist in artists:
+                if getattr(artist, "follow_defaults", False):
+                    for key, value in defaults.items():
+                        setattr(artist, key, value)
             return api_success({
                 "artists": [serialize_watchlist_artist(a, fields) for a in artists]
             })
@@ -108,8 +119,18 @@ def register_routes(bp):
         profile_id = parse_profile_id(request)
         try:
             db = get_database()
+            # §69.1 reverse edge: capture identity before delete, demonitor the
+            # matching lib2 artist afterwards (both-way sync).
+            descriptor = db.get_watchlist_artist_descriptor(artist_id, profile_id=profile_id)
             ok = db.remove_artist_from_watchlist(artist_id, profile_id=profile_id)
             if ok:
+                try:
+                    from core.settings import config_manager
+                    from core.library2.monitor_sync import sync_watchlist_removal
+                    sync_watchlist_removal(db, config_manager, descriptor,
+                                           profile_id=profile_id)
+                except Exception as sync_e:
+                    logger.debug("watchlist reverse-sync skipped: %s", sync_e)
                 return api_success({"message": "Artist removed from watchlist."})
             return api_error("NOT_FOUND", "Artist not found in watchlist.", 404)
         except Exception as e:
@@ -122,7 +143,12 @@ def register_routes(bp):
 
         Body: {"include_albums": true, "include_live": false, ...}
         Accepts any combination of: include_albums, include_eps, include_singles,
-        include_live, include_remixes, include_acoustic, include_compilations
+        include_live, include_remixes, include_acoustic, include_compilations,
+        follow_defaults.
+
+        follow_defaults true puts the artist back on the watchlist defaults.
+        Sending release rules for an artist that follows the defaults gives it
+        its own rules, starting from the defaults it was getting (#1822).
         """
         body = request.get_json(silent=True) or {}
         profile_id = parse_profile_id(request)
@@ -134,7 +160,7 @@ def register_routes(bp):
         # Only fields the client actually SENT are touched — this is a real
         # partial PATCH, unlike the legacy full-form endpoint (P2-03).
         updates = {}
-        for key in allowed_fields & set(body):
+        for key in (allowed_fields | {"follow_defaults"}) & set(body):
             parsed = parse_strict_bool(body[key])
             if parsed is None:
                 return api_error("BAD_REQUEST", f"{key} must be a boolean.", 400)
@@ -152,12 +178,28 @@ def register_routes(bp):
                 return api_error(
                     "BAD_REQUEST",
                     "No valid fields provided. Allowed: "
-                    f"{', '.join(sorted(allowed_fields | {'quality_profile_id'}))}",
+                    f"{', '.join(sorted(allowed_fields | {'quality_profile_id', 'follow_defaults'}))}",
                     400,
                 )
 
             with db._get_connection() as conn:
                 cursor = conn.cursor()
+
+                rule_keys = allowed_fields & set(updates)
+                if rule_keys and "follow_defaults" not in updates:
+                    cursor.execute(f"""
+                        SELECT follow_defaults FROM watchlist_artists
+                        WHERE {artist_id_match_sql()} AND profile_id = ?
+                    """, [artist_id] * len(ARTIST_ID_COLUMNS) + [profile_id])
+                    row = cursor.fetchone()
+                    if row is not None and row[0]:
+                        # unsent rules come from the defaults it was getting,
+                        # not from stale columns
+                        from core.settings import config_manager
+                        from core.watchlist_defaults import default_values
+                        updates = {**{k: v for k, v in default_values(config_manager).items()
+                                      if k not in updates}, **updates}
+                        updates["follow_defaults"] = False
 
                 # Build SET clause
                 set_parts = [f"{k} = ?" for k in updates]

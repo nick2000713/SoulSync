@@ -25,6 +25,8 @@
 
 import type { ReactNode } from 'react';
 
+import { useState } from 'react';
+
 import type { MirroredPlaylistRow } from '../-sync.mirrored';
 
 import {
@@ -35,7 +37,9 @@ import {
   libraryOwnedKnown,
   libraryTotal,
 } from '../-sync.library';
-import { PlaylistArt, PlaylistCollage, playlistCoverTiles } from './playlist-art';
+import { needsMatchLabel } from '../-sync.mirrored';
+import { isLikedPlaylist } from '../../../features/playlists/user-playlists';
+import { LikedArt, PlaylistArt, PlaylistCollage, playlistCoverTiles } from './playlist-art';
 import { SourceIcon } from './source-icon';
 
 export interface PlaylistCardAction {
@@ -112,6 +116,14 @@ export interface PlaylistCardProps {
   selecting?: boolean;
   selected?: boolean;
   onToggleSelect?: () => void;
+  /** play the whole playlist from the card. a disc on the art, on hover. */
+  onPlay?: () => Promise<unknown>;
+  /**
+   * open the wing it pool for this playlist. the card's one loud line, and
+   * only when tracks need a pick: nothing downloads them until someone does,
+   * and the old card never said so (#1721).
+   */
+  onNeedsMatch?: () => void;
 }
 
 /**
@@ -178,7 +190,7 @@ export function playlistCardPrimaryLabel(row: MirroredPlaylistRow): string {
     // with a verb. "Sync & download", not "Sync now" (#1404): three buttons
     // said sync and did three different things. this one does all of it.
     default:
-      return 'Sync & download';
+      return row.is_request_list ? 'Process requests' : 'Sync & download';
   }
 }
 
@@ -199,9 +211,13 @@ export function PlaylistCard({
   selecting,
   selected,
   onToggleSelect,
+  onPlay,
+  onNeedsMatch,
 }: PlaylistCardProps) {
+  const [starting, setStarting] = useState(false);
   const state = libraryCardState(row);
   const pct = libraryCoveragePct(row);
+  const needsMatch = onNeedsMatch && !status ? needsMatchLabel(row) : null;
   // in select mode the whole card is the checkbox. one hit target the size
   // of the card beats a 16px box you have to aim for forty times over.
   const activate = selecting && onToggleSelect ? onToggleSelect : onOpen;
@@ -234,6 +250,8 @@ export function PlaylistCard({
               is the fallback for the sources that supply no poster at all. */}
           {row.image_url ? (
             <PlaylistArt url={row.image_url} fallback={<SourceIcon source={row.source} />} />
+          ) : isLikedPlaylist(row) ? (
+            <LikedArt />
           ) : (
             <PlaylistCollage
               tiles={playlistCoverTiles(row)}
@@ -251,6 +269,31 @@ export function PlaylistCard({
             aria-label={`${pct}% of tracks discovered`}
           />
         )}
+        {onPlay && !selecting ? (
+          <button
+            type="button"
+            className="pl-card-play"
+            aria-label={`Play ${name}`}
+            title="Play"
+            disabled={starting}
+            aria-busy={starting || undefined}
+            onClick={(e) => {
+              e.stopPropagation();
+              if (starting) return;
+              setStarting(true);
+              void onPlay().finally(() => setStarting(false));
+            }}
+            onKeyDown={(e) => e.stopPropagation()}
+          >
+            {starting ? (
+              <span className="pl-card-play-spin" aria-hidden="true" />
+            ) : (
+              <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+                <path d="M8 5.5v13l11-6.5z" fill="currentColor" />
+              </svg>
+            )}
+          </button>
+        ) : null}
       </div>
 
       <div className="pl-card-body">
@@ -280,6 +323,19 @@ export function PlaylistCard({
               📁
             </span>
           ) : null}
+          {row.is_request_list ? (
+            <span
+              className="pl-card-badge pl-card-badge--request"
+              title={
+                row.auto_remove_fulfilled
+                  ? 'Request List: server audio download only (no server playlist created). Fulfilled Spotify tracks are automatically removed.'
+                  : 'Request List: server audio download only (no server playlist created).'
+              }
+              aria-label="Request list"
+            >
+              📥{row.auto_remove_fulfilled ? ' ⚡' : ''}
+            </span>
+          ) : null}
         </div>
         {syncsAs ? (
           <div
@@ -290,6 +346,23 @@ export function PlaylistCard({
           </div>
         ) : null}
         <div className="pl-card-meta card-meta">{status ?? playlistCardMeta(row, when)}</div>
+        {needsMatch ? (
+          <button
+            type="button"
+            className="pl-card-attn"
+            title="Nothing downloads these until you pick the right song"
+            onClick={(e) => {
+              e.stopPropagation();
+              if (selecting) {
+                activate();
+                return;
+              }
+              onNeedsMatch?.();
+            }}
+          >
+            {needsMatch}
+          </button>
+        ) : null}
         {/* The schedule is a CONTROL, not a label: with Auto-Sync's board
             gone this is the only place a cadence gets set. It still reads as a
             quiet pill at rest — a dropdown sitting open on every card was the

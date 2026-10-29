@@ -9,9 +9,11 @@ artist/album folder structure, and returns compatible data objects.
 import hashlib
 import os
 import re
+import threading
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Set
 
+from core.text.normalize import fold_dashes
 from utils.logging_config import get_logger
 
 logger = get_logger("soulsync_client")
@@ -87,34 +89,36 @@ def _read_tags(file_path: str) -> Dict[str, Any]:
     return result
 
 
-class SoulSyncTrack:
-    """Track object compatible with DatabaseUpdateWorker expectations."""
+from core.media_server.items import MediaAlbum, MediaArtist, MediaTrack
+
+
+class SoulSyncTrack(MediaTrack):
+    """A file on disk read through its tags. Shape owned by ``core.media_server.items``."""
+    server = 'soulsync'
 
     def __init__(self, file_path: str, tags: Dict[str, Any], artist_ref=None, album_ref=None):
+        exists = os.path.exists(file_path)
+        try:
+            file_size = os.path.getsize(file_path) if exists else None
+        except OSError:
+            file_size = None
+        super().__init__(
+            _stable_id(file_path),
+            tags['title'],
+            added_at=datetime.fromtimestamp(os.path.getmtime(file_path)) if exists else datetime.now(),
+            duration_ms=tags['duration_ms'],
+            track_number=tags['track_number'] or None,
+            disc_number=tags['disc_number'] or 1,
+            year=int(tags['year']) if tags['year'] else None,
+            path=file_path,
+            bitrate_kbps=tags['bitrate'],
+            file_size=file_size,
+            suffix=os.path.splitext(file_path)[1].lstrip('.').lower(),
+        )
         self.file_path = file_path
         self._tags = tags
         self._artist_ref = artist_ref
         self._album_ref = album_ref
-
-        self.ratingKey = _stable_id(file_path)
-        self.title = tags['title']
-        self.duration = tags['duration_ms']
-        self.trackNumber = tags['track_number'] or None
-        self.discNumber = tags['disc_number'] or 1
-        self.year = int(tags['year']) if tags['year'] else None
-        self.userRating = None
-        self.addedAt = datetime.fromtimestamp(os.path.getmtime(file_path)) if os.path.exists(file_path) else datetime.now()
-        self.path = file_path
-        self.bitRate = tags['bitrate']
-        self.suffix = os.path.splitext(file_path)[1].lstrip('.').lower()
-        # File size in bytes (powers Library Disk Usage card on Stats).
-        # SoulSync standalone is the only "server" where we can read
-        # size from disk directly — Plex/Jellyfin/Navidrome get theirs
-        # from the API response.
-        try:
-            self.file_size = os.path.getsize(file_path) if os.path.exists(file_path) else None
-        except OSError:
-            self.file_size = None
 
     def artist(self):
         return self._artist_ref
@@ -171,40 +175,37 @@ def _split_by_release(entries: List) -> List:
     return list(groups.items())
 
 
-class SoulSyncAlbum:
-    """Album object compatible with DatabaseUpdateWorker expectations."""
+class SoulSyncAlbum(MediaAlbum):
+    """An album folder's worth of files. Shape owned by ``core.media_server.items``."""
+    server = 'soulsync'
 
     def __init__(self, album_key: str, title: str, year: Optional[int],
                  artist_ref=None, track_list: List[SoulSyncTrack] = None):
-        self.ratingKey = _stable_id(album_key)
-        self.title = title
-        self.year = year
-        self._artist_ref = artist_ref
-        self._tracks = track_list or []
-        self.thumb = None
-        self.addedAt = datetime.now()
-        self.leafCount = len(self._tracks)  # Plex compat: track count
-        self.duration = sum(t.duration for t in self._tracks)  # Total duration in ms
-
-        # Collect genres from track tags
+        tracks = track_list or []
         genre_set = set()
-        for t in self._tracks:
+        for t in tracks:
             if t._tags.get('genre'):
                 genre_set.add(t._tags['genre'])
-        self.genres = list(genre_set)
-
-        # Set addedAt from earliest track
-        if self._tracks:
-            self.addedAt = min(t.addedAt for t in self._tracks)
-
-        # Check for cover art in the album folder
-        if self._tracks:
-            album_dir = os.path.dirname(self._tracks[0].file_path)
+        thumb = None
+        if tracks:
+            album_dir = os.path.dirname(tracks[0].file_path)
             for cover_name in ['cover.jpg', 'cover.png', 'folder.jpg', 'folder.png']:
                 cover_path = os.path.join(album_dir, cover_name)
                 if os.path.isfile(cover_path):
-                    self.thumb = cover_path
+                    thumb = cover_path
                     break
+        super().__init__(
+            _stable_id(album_key),
+            title,
+            added_at=min(t.addedAt for t in tracks) if tracks else datetime.now(),
+            year=year,
+            thumb=thumb,
+            genres=list(genre_set),
+        )
+        self._artist_ref = artist_ref
+        self._tracks = tracks
+        self.leafCount = len(self._tracks)  # Plex compat: track count
+        self.duration = sum(t.duration for t in self._tracks)  # Total duration in ms
 
     def artist(self):
         return self._artist_ref
@@ -213,44 +214,44 @@ class SoulSyncAlbum:
         return self._tracks
 
 
-class SoulSyncArtist:
-    """Artist object compatible with DatabaseUpdateWorker expectations."""
+class SoulSyncArtist(MediaArtist):
+    """An artist folder. Shape owned by ``core.media_server.items``."""
+    server = 'soulsync'
 
     def __init__(self, artist_key: str, title: str, album_list: List[SoulSyncAlbum] = None):
-        self.ratingKey = _stable_id(artist_key)
-        self.title = title
-        self._albums = album_list or []
-        self.genres = []
-        self.summary = ''
-        self.thumb = None
-        self.addedAt = datetime.now()
-
-        # Collect genres from tracks
+        albums = album_list or []
         genre_set = set()
-        for album in self._albums:
+        thumb = None
+        for album in albums:
             for track in album.tracks():
                 if track._tags.get('genre'):
                     genre_set.add(track._tags['genre'])
-        self.genres = list(genre_set)
-
-        # Set addedAt from earliest album
-        if self._albums:
-            self.addedAt = min(a.addedAt for a in self._albums)
-
-        # Use first album's thumb as artist thumb
-        for album in self._albums:
-            if album.thumb:
-                self.thumb = album.thumb
-                break
+            if thumb is None and album.thumb:
+                thumb = album.thumb
+        super().__init__(
+            _stable_id(artist_key),
+            title,
+            added_at=min(a.addedAt for a in albums) if albums else datetime.now(),
+            genres=list(genre_set),
+            summary='',
+            thumb=thumb,
+        )
+        self._albums = albums
 
     def albums(self):
         return self._albums
 
 
-from core.media_server.contract import MediaServerClient
+from core.media_server.base import MediaServerBase
+from core.media_server.contract import Capability
 
 
-class SoulSyncClient(MediaServerClient):
+class SoulSyncClient(MediaServerBase):
+    # Reads the files itself, so a tag write is visible on the next scan.
+    CAPABILITIES = frozenset({
+        Capability.RECENTLY_ADDED, Capability.SCAN_TRIGGER, Capability.TAGS_AUTODETECTED,
+    })
+
     """Filesystem-based media server client for standalone SoulSync operation.
 
     Scans the Transfer folder recursively, reads audio file tags, and
@@ -268,6 +269,8 @@ class SoulSyncClient(MediaServerClient):
         self._cache_time = 0
         self._cache_ttl = 300  # 5 minute cache
         self._last_scan_time = None
+        self._scan_thread = None  # Background rescan started by trigger_library_scan
+        self._scan_lock = threading.Lock()  # Serializes trigger check + assign + start
         self._reload_config()
 
     def _reload_config(self):
@@ -390,7 +393,9 @@ class SoulSyncClient(MediaServerClient):
                 else:
                     album_name = tags['title'] or 'Unknown Album'
 
-            a_key = artist_name.lower().strip()
+            # #1797: alt-J with a U+2010 hyphen and with ascii is one artist; the first
+            # spelling seen stays the display name
+            a_key = fold_dashes(artist_name).lower().strip()
             al_key = album_name.lower().strip()
 
             if a_key not in artist_map:
@@ -462,6 +467,84 @@ class SoulSyncClient(MediaServerClient):
         return self._cache
 
     # ── Public Interface (matches Plex/Jellyfin/Navidrome) ──
+
+    # ── Library Scan ──
+
+    def trigger_library_scan(self, library_name: str = "Music") -> bool:
+        """Trigger a standalone library scan.
+
+        The other clients ask an external server to rescan; standalone
+        SoulSync IS the server, so a scan is a filesystem walk of the
+        Transfer folder. The walk reads every file's tags and can take
+        a while on a large library, so it runs on a background thread —
+        the same fire-and-forget shape as the server APIs. When the
+        walk finishes, its result replaces the scan cache, so the next
+        get_all_artists() (e.g. the DatabaseUpdateWorker) sees the new
+        files without waiting out the cache TTL.
+
+        ``library_name`` is accepted for parity with the other clients
+        and ignored — standalone has exactly one library. Returns True
+        when a scan is running after the call (started here, or one
+        was already in progress). Never raises, matching the other
+        clients: failures are logged and reported as False.
+        """
+        thread = None
+        try:
+            if not self.is_connected():
+                logger.warning("[SoulSync] Library scan requested but the Transfer path is not available")
+                return False
+            # The check + assign + start must be atomic: callers are
+            # concurrent by design (scan-manager timer thread, the
+            # audiobook monitor's per-book nudge threads), and two
+            # triggers racing the check would each spawn a full
+            # Transfer walk. is_alive() is also False in the
+            # assign→start gap, so the lock has to cover start() too.
+            with self._scan_lock:
+                if self.is_library_scanning():
+                    logger.info("[SoulSync] Library scan already in progress")
+                    return True
+                thread = threading.Thread(
+                    target=self._run_triggered_scan,
+                    daemon=True,
+                    name="soulsync-library-scan",
+                )
+                self._scan_thread = thread
+                thread.start()
+            logger.info("[SoulSync] Library scan triggered (background filesystem rescan)")
+            return True
+        except Exception as e:
+            logger.error(f"[SoulSync] Failed to trigger library scan: {e}")
+            if thread is not None and self._scan_thread is thread and not thread.is_alive():
+                self._scan_thread = None
+            return False
+
+    def is_library_scanning(self, library_name: str = "Music") -> bool:
+        """Whether a triggered background rescan is still running."""
+        thread = self._scan_thread
+        return thread is not None and thread.is_alive()
+
+    def _run_triggered_scan(self):
+        """Background body for trigger_library_scan: run a full rescan,
+        then swap the cache so readers pick up the new library state.
+        A walk that raises — or that finds the Transfer path gone
+        (unmounted between the trigger's connectivity check and the
+        walk, where _scan_transfer would otherwise return an empty
+        list) — keeps the previous cache: stale data beats an emptied
+        library view."""
+        import time
+        try:
+            if not os.path.isdir(self._transfer_path):
+                logger.error(f"[SoulSync] Triggered library scan aborted — Transfer path not available: {self._transfer_path}")
+                return
+            artists = self._scan_transfer()
+            self._cache = artists
+            self._cache_time = time.time()
+            self._last_scan_time = datetime.now().isoformat()
+        except Exception as e:
+            logger.error(f"[SoulSync] Triggered library scan failed: {e}")
+        finally:
+            if self._scan_thread is threading.current_thread():
+                self._scan_thread = None
 
     def get_all_artists(self) -> List[SoulSyncArtist]:
         """Get all artists from the Transfer folder."""

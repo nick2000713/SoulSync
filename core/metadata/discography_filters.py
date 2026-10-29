@@ -37,9 +37,12 @@ from typing import Any, Dict, List, Optional
 # entry (#830). Split on the common credit separators; " and " / " with " are
 # deliberately excluded (too many real band names contain them).
 _ARTIST_CREDIT_SPLIT_RE = re.compile(
-    r"\s*[,&;/]\s*|\s+(?:feat\.?|ft\.?|featuring|vs\.?|x)\s+",
+    r"\s*[,&;]\s*|\s+(?:feat\.?|ft\.?|featuring|vs\.?|x)\s+",
     re.IGNORECASE,
 )
+# "/" splits second, inside each piece. splitting on it first turned
+# "K/DA, Madison Beer" into K + DA and lost K/DA itself.
+_ARTIST_SLASH_SPLIT_RE = re.compile(r"\s*/\s*")
 
 
 def _artist_credit_components(name: str) -> List[str]:
@@ -50,8 +53,23 @@ def _artist_credit_components(name: str) -> List[str]:
     if not name:
         return []
     parts = [name]
-    parts.extend(p.strip() for p in _ARTIST_CREDIT_SPLIT_RE.split(name) if p.strip())
+    for piece in _ARTIST_CREDIT_SPLIT_RE.split(name):
+        piece = piece.strip()
+        if not piece:
+            continue
+        parts.append(piece)
+        parts.extend(p.strip() for p in _ARTIST_SLASH_SPLIT_RE.split(piece)
+                     if p.strip() and p.strip() != piece)
     return parts
+
+
+def _artist_key(name: str) -> str:
+    """case and punctuation blind name key. the library can hold a name with
+    its slash swapped for an underscore (K_DA) while the source credits K/DA,
+    and those are the same artist. all-punctuation names (!!!) keep their
+    plain lowercase form so they don't collapse to empty."""
+    plain = (name or "").strip().casefold()
+    return re.sub(r"[\W_]+", "", plain) or plain
 
 from core.watchlist_scanner import (
     is_acoustic_version,
@@ -89,7 +107,7 @@ def track_artist_matches(track_artists: Any, requested_artist_name: str) -> bool
         # caller forgot to pass the artist name.
         return True
 
-    target = requested_artist_name.strip().lower()
+    target = _artist_key(requested_artist_name)
     if not target:
         return True
 
@@ -106,7 +124,7 @@ def track_artist_matches(track_artists: Any, requested_artist_name: str) -> bool
         # matching is still exact per-name, so true contamination (the artist
         # genuinely absent) is dropped exactly as before.
         for component in _artist_credit_components(name):
-            if component.strip().lower() == target:
+            if _artist_key(component) == target:
                 return True
 
     return False
@@ -268,7 +286,10 @@ def resolve_watchlist_content_settings(
         def get(self, key, default=None):
             return _watchlist_cfg_get(key, default)
 
-    if override_enabled:
+    # #1822: an artist following the watchlist defaults gets them; the legacy
+    # override still counts as everyone following
+    from core.watchlist_defaults import follows_defaults
+    if follows_defaults(artist_row, override_enabled):
         settings = load_global_content_filter_settings(_CfgAdapter())
         settings['include_compilations'] = bool(
             _watchlist_cfg_get('watchlist.global_include_compilations', False)
@@ -416,6 +437,7 @@ def track_already_owned(
     server_source: Optional[str],
     confidence_threshold: float = 0.7,
     candidate_tracks: Optional[List[Any]] = None,
+    candidate_tracks_exhaustive: bool = False,
 ) -> bool:
     """Return True if the track is already in the user's library.
 
@@ -438,11 +460,13 @@ def track_already_owned(
     ``candidate_tracks`` (when not None) is the artist's library tracks,
     pre-fetched ONCE by the caller, so the check scores in-memory instead
     of firing per-track fuzzy SQL scans against the whole library. Pass an
-    empty list for an artist the user owns nothing of — it still routes
-    through the fast in-memory path (scores against zero candidates →
-    instant "not owned") rather than the slow per-track search. None
-    preserves the original per-track-SQL behaviour for callers that don't
-    pre-fetch.
+    empty list for an artist the user owns nothing of — WITH
+    ``candidate_tracks_exhaustive=True`` it still routes through the fast
+    in-memory path (scores against zero candidates → instant "not owned")
+    rather than the slow per-track search. A bare ``[]`` without the flag
+    means "no information" and falls through to the legacy SQL path
+    (#1621). None preserves the original per-track-SQL behaviour for
+    callers that don't pre-fetch.
 
     Returns False on any exception so a transient DB hiccup doesn't
     silently nuke a discography fetch — a redundant wishlist add is
@@ -457,8 +481,15 @@ def track_already_owned(
             server_source=server_source,
             album=album_name or None,
             candidate_tracks=candidate_tracks,
+            candidate_tracks_exhaustive=candidate_tracks_exhaustive,
+            include_downloads=True,
         )
     except Exception:
+        # Fail-open is deliberate (a redundant wishlist add is cheaper than a
+        # missed track), but never silent: without this, any exception inside
+        # check_track_exists degrades to "not owned" with zero log signal.
+        logger.debug("track_already_owned check failed; treating as not owned",
+                     exc_info=True)
         return False
     return bool(match) and confidence >= confidence_threshold
 
@@ -466,30 +497,9 @@ def track_already_owned(
 def _stored_release_kind_for_gate(db: Any, album_id: Any) -> str:
     """The library row's known release kind, '' when unknown.
 
-    Mirrors completion._stored_release_kind: ``record_type`` first (the
-    populated column), legacy ``album_type`` as fallback — queried
-    separately so a missing column can't hide the other.
-    """
-    for col in ("record_type", "album_type"):
-        try:
-            conn = db._get_connection()
-            try:
-                row = conn.execute(
-                    f"SELECT {col} FROM albums WHERE id = ?", (str(album_id),)
-                ).fetchone()
-            finally:
-                try:
-                    conn.close()
-                except Exception:  # noqa: S110 - cleanup only
-                    pass
-        except Exception:
-            continue
-        # Strip before the truthiness check: a whitespace-only value is
-        # unknown and must fall through to the next column, not return "".
-        val = str(row[0]).strip() if row and row[0] else ""
-        if val:
-            return val.lower()
-    return ""
+    Mirrors completion._stored_release_kind (ours: on Library v2)."""
+    from core.metadata.completion import _stored_release_kind
+    return _stored_release_kind(db, album_id)
 
 
 def owned_release_tracks(

@@ -1,6 +1,9 @@
 import { useQuery } from '@tanstack/react-query';
 import { Link } from '@tanstack/react-router';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+
+import { Spinner } from '@/components/primitives';
 
 import type { YearAlbum, YearInListening, YearSlideKind } from '../-year.types';
 
@@ -59,7 +62,6 @@ import styles from './year-story.module.css';
  */
 
 /** Artist detail is reached through the library source, same as the page. */
-const ARTIST_DETAIL_SOURCE = 'library' as const;
 
 interface YearStoryProps {
   onClose: () => void;
@@ -110,9 +112,19 @@ export function YearStory({ onClose }: YearStoryProps) {
     };
   }, []);
 
-  return (
+  // Portalled to <body>: the overlay is position:fixed, but it mounts
+  // inside .stats-container, whose backdrop-filter makes it the
+  // containing block for fixed descendants — the overlay was sized to
+  // the stats page's full scroll height (measured 3531px in an 844px
+  // viewport), leaving the controls thousands of pixels below the fold
+  // and the slide pinned to the top of a mostly-empty screen (Oct 13
+  // batch, M-17). At body level, fixed means the viewport again. The
+  // data attribute is the hook mobile.css hides the hamburger behind
+  // (the overlay's own class is a hashed CSS module).
+  return createPortal(
     <div
       className={styles.overlay}
+      data-year-story-overlay
       role="dialog"
       aria-modal="true"
       aria-label="Your Year in Listening"
@@ -136,7 +148,7 @@ export function YearStory({ onClose }: YearStoryProps) {
       <div className={styles.stage}>
         {isPending ? (
           <div className={styles.loadingWrap}>
-            <div className={styles.storySpinner} />
+            <Spinner className={styles.storySpinner} size={36} tone="soft" />
             <p className={styles.quiet}>Reading your year…</p>
           </div>
         ) : isError ? (
@@ -170,7 +182,8 @@ export function YearStory({ onClose }: YearStoryProps) {
           {current === slides.length - 1 ? 'Done' : 'Next'}
         </button>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -283,8 +296,8 @@ function ArtistLink({
   }
   return (
     <Link
-      to="/artist-detail/$source/$id"
-      params={{ source: ARTIST_DETAIL_SOURCE, id: String(id) }}
+      to="/library"
+      search={{ artist: Number(id), view: 'discovery', immersive: true }}
       className={className}
       // The story is an overlay over /stats. Navigating away has to drop the
       // ?story=year param too, or coming Back lands the reader in the middle

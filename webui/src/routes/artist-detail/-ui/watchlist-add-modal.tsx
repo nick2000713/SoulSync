@@ -1,5 +1,6 @@
 import { useState } from 'react';
 
+import { addToWatchlistRequest } from '../-artist-detail.watchlist-button';
 import { BodyPortal } from './portal';
 
 /**
@@ -26,6 +27,8 @@ export interface WatchlistAddSettings {
   include_acoustic: boolean;
   include_compilations: boolean;
   include_instrumentals: boolean;
+  /** Include tracks by artists other than the watched one (tributes, soundtracks). Default off. */
+  include_other_artists: boolean;
   auto_download_pref: 'on' | 'off' | null;
 }
 
@@ -38,6 +41,7 @@ export const WATCHLIST_ADD_DEFAULTS: WatchlistAddSettings = {
   include_acoustic: false,
   include_compilations: false,
   include_instrumentals: false,
+  include_other_artists: false,
   auto_download_pref: null,
 };
 
@@ -59,6 +63,7 @@ const CONTENT_FILTERS: ReadonlyArray<readonly [WatchBoolKey, string]> = [
   ['include_acoustic', 'Acoustic'],
   ['include_compilations', 'Compilations'],
   ['include_instrumentals', 'Instrumentals'],
+  ['include_other_artists', 'Other artists'],
 ];
 
 /** One compact pill-toggle row for the watchlist settings. */
@@ -97,14 +102,9 @@ export async function addArtistToWatchlist(
   artistId: unknown,
   artistName: string,
   settings: WatchlistAddSettings,
+  source?: string,
 ): Promise<string> {
-  const addResponse = await fetch('/api/watchlist/add', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ artist_id: artistId, artist_name: artistName }),
-  });
-  const addData = await addResponse.json();
-  if (!addData.success) throw new Error(addData.error || 'Failed to add to watchlist');
+  const message = await addToWatchlistRequest(artistId, artistName, source);
 
   const configResponse = await fetch(
     `/api/watchlist/artist/${encodeURIComponent(String(artistId))}/config`,
@@ -120,6 +120,7 @@ export async function addArtistToWatchlist(
         include_acoustic: settings.include_acoustic,
         include_compilations: settings.include_compilations,
         include_instrumentals: settings.include_instrumentals,
+        include_other_artists: settings.include_other_artists,
         auto_download_pref: settings.auto_download_pref,
       }),
     },
@@ -129,7 +130,7 @@ export async function addArtistToWatchlist(
     throw new Error(configData.error || 'Failed to save watchlist settings');
   }
   if (typeof window.updateWatchlistCount === 'function') window.updateWatchlistCount();
-  return String(addData.message ?? '');
+  return message;
 }
 
 export function WatchlistAddModal({
@@ -139,7 +140,7 @@ export function WatchlistAddModal({
   onDownloadExisting,
 }: {
   /** imageUrl is the artist's photo (release art as fallback); '' shows the note tile. */
-  artist: { id: unknown; name: string; imageUrl?: string };
+  artist: { id: unknown; name: string; source?: string; imageUrl?: string };
   onClose: () => void;
   onWatched: () => void;
   onDownloadExisting: () => void;
@@ -157,7 +158,7 @@ export function WatchlistAddModal({
     setBusy(true);
     setError(null);
     try {
-      const message = await addArtistToWatchlist(artist.id, artist.name, settings);
+      const message = await addArtistToWatchlist(artist.id, artist.name, settings, artist.source);
       window.showToast?.(message || `Watching ${artist.name}`, 'success');
       onWatched();
       onClose();

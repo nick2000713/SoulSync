@@ -62,6 +62,16 @@ def _album_is_lean(album_context: Any) -> bool:
     in ``build_import_album_info``."""
     if not isinstance(album_context, dict):
         return True
+    # A PLACEHOLDER album name is lean too: without this, a context
+    # carrying 'Unknown Album' plus rich release_date/total_tracks never
+    # triggered the details fetch, so the name backfill below (the one
+    # field these album-less tracks actually need) never ran. A merely
+    # MISSING name is not leanness — plenty of complete contexts carry
+    # no name on this dict shape, and fetching for them is a regression.
+    from core.imports.context import is_placeholder_album
+
+    if is_placeholder_album(album_context.get('name')):
+        return True
     if not album_context.get('release_date'):
         return True
     if not album_context.get('total_tracks'):
@@ -80,6 +90,20 @@ def _backfill_album_context(
     dt_album = detailed_track.get('album')
     if not isinstance(dt_album, dict) or not isinstance(album_context, dict):
         return
+
+    # The album NAME is filled only when the context holds the literal
+    # 'Unknown Album' placeholder (album-less playlist entries — paste-link
+    # playlists, discovery-pool rows). A placeholder is the absence of a
+    # value, not a value. A merely MISSING name is left alone: complete
+    # contexts routinely carry no name on this dict shape (their name
+    # arrives via the track object), and filling it here could pair a
+    # name from the fetched album with an id/total_tracks that belong
+    # to a different one. A real name is never overwritten.
+    from core.imports.context import has_real_album_name, is_placeholder_album
+
+    _current_name = album_context.get('name')
+    if is_placeholder_album(_current_name) and has_real_album_name(dt_album.get('name')):
+        album_context['name'] = dt_album['name']
 
     for key in ('release_date', 'album_type', 'total_tracks', 'id', 'upc', 'barcode'):
         if not album_context.get(key) and dt_album.get(key):
@@ -105,10 +129,19 @@ def _backfill_album_context(
 _SENTINEL_ALBUM_IDS = {'explicit_album', 'from_sync_modal', ''}
 
 
+def _album_id_source(source: Any) -> str:
+    """the track's own metadata source, when it names one. anything else
+    (a download source, a stray label) is ignored so the primary is used."""
+    from core.metadata.registry import METADATA_SOURCE_PRIORITY
+    name = str(source or '').strip().lower()
+    return name if name in METADATA_SOURCE_PRIORITY else ''
+
+
 def backfill_album_context_from_source(
     album_context: Dict[str, Any],
     primary_source: Optional[str],
     get_album_for_source_fn: Any,
+    album_source: Optional[str] = None,
 ) -> bool:
     """Hydrate a lean album context from the user's PRIMARY metadata source (#915).
 
@@ -122,7 +155,9 @@ def backfill_album_context_from_source(
 
     ``get_album_for_source_fn(source, album_id)`` is injected (the real one is
     ``core.metadata.album_tracks.get_album_for_source``) so this stays pure + testable.
-    No-op when: the context is already complete; the primary source is spotify (the existing
+    ``album_source`` is the source the track (and so its album id) came from; it wins over
+    the primary when it names a metadata source.
+    No-op when: the context is already complete; the album's source is spotify (the existing
     track-details path covers it); or no real source album id is present. Returns True when
     it filled anything. Never raises — a backfill failure must not break a download.
     """
@@ -133,15 +168,19 @@ def backfill_album_context_from_source(
     # spotify calls
     if not _album_is_lean(album_context) and album_context.get('artists'):
         return False
-    if not primary_source or primary_source == 'spotify':
+    # the album id belongs to the source the track came from. a deezer search
+    # result on a spotify-primary install carries a deezer album id, asking the
+    # primary with it finds nothing (#1605)
+    source = _album_id_source(album_source) or primary_source
+    if not source or source == 'spotify':
         return False
     album_id = album_context.get('id')
     if not album_id or str(album_id) in _SENTINEL_ALBUM_IDS:
         return False
     try:
-        album = get_album_for_source_fn(primary_source, str(album_id))
+        album = get_album_for_source_fn(source, str(album_id))
     except Exception as e:  # noqa: BLE001 — defensive: never let backfill break a download
-        logger.warning("[Context] primary-source (%s) album backfill failed: %s", primary_source, e)
+        logger.warning("[Context] %s album backfill failed: %s", source, e)
         return False
     if not isinstance(album, dict):
         return False
@@ -149,9 +188,9 @@ def backfill_album_context_from_source(
     _backfill_album_context(album_context, {'album': album})
     if album_context.get('release_date') and album_context.get('release_date') != before:
         logger.info(
-            "[Context] Hydrated lean album context from primary source %s "
+            "[Context] Hydrated lean album context from %s "
             "(release_date=%r, total_tracks=%r)",
-            primary_source, album_context.get('release_date'), album_context.get('total_tracks'),
+            source, album_context.get('release_date'), album_context.get('total_tracks'),
         )
     return True
 

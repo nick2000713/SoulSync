@@ -86,12 +86,6 @@ describe('the meta line', () => {
     ).toBe('140 tracks · synced 3h ago');
   });
 
-  it('says what is in the library only when it differs', () => {
-    expect(playlistCardMeta(row({ total_count: 86, discovered_count: 62 }), 'x')).toBe(
-      '86 tracks · 24 not found',
-    );
-  });
-
   it('reports a failure and a run in flight in the user’s words', () => {
     expect(playlistCardMeta(row({ pipeline_state: { status: 'error' } }), 'x')).toContain(
       'last run failed',
@@ -500,5 +494,62 @@ describe('the name it syncs under', () => {
     expect(document.querySelector('.pl-card-syncs-as')).toBeNull();
     const css = readFileSync(resolve(process.cwd(), 'static/style.css'), 'utf8');
     expect(css).toContain('.pl-card-syncs-as {');
+  });
+});
+
+describe('play from the card', () => {
+  function renderPlayable(onPlay: () => Promise<unknown>, over: Partial<MirroredPlaylistRow> = {}) {
+    const onOpen = vi.fn();
+    render(
+      <PlaylistCard
+        row={row(over)}
+        name="Road Trip"
+        when="synced 3h ago"
+        schedule="Every 6 hours"
+        onOpen={onOpen}
+        onMore={vi.fn()}
+        onPlay={onPlay}
+      />,
+    );
+    return { onOpen };
+  }
+
+  it('plays without also opening the card', () => {
+    const onPlay = vi.fn(async () => {});
+    const { onOpen } = renderPlayable(onPlay);
+    fireEvent.click(screen.getByLabelText('Play Road Trip'));
+    expect(onPlay).toHaveBeenCalledTimes(1);
+    expect(onOpen).not.toHaveBeenCalled();
+  });
+
+  it('cannot be started twice while the playlist is still loading', async () => {
+    let finish: () => void = () => {};
+    const onPlay = vi.fn(() => new Promise<void>((r) => (finish = r)));
+    renderPlayable(onPlay);
+    const button = screen.getByLabelText('Play Road Trip');
+    fireEvent.click(button);
+    fireEvent.click(button);
+    expect(onPlay).toHaveBeenCalledTimes(1);
+    expect(button).toHaveAttribute('aria-busy', 'true');
+    finish();
+    await vi.waitFor(() => expect(button).not.toHaveAttribute('aria-busy'));
+  });
+
+  it('no onPlay, no button', () => {
+    renderCard();
+    expect(screen.queryByLabelText('Play Road Trip')).toBeNull();
+  });
+
+  it('Liked Songs wears the heart until it has a cover of its own', () => {
+    const { container } = renderCard(
+      { source: 'soulsync', source_playlist_id: 'liked' },
+      'Liked Songs',
+    );
+    expect(container.querySelector('.playlist-liked-art')).not.toBeNull();
+    const own = renderCard(
+      { source: 'soulsync', source_playlist_id: 'liked', image_url: '/c.jpg' },
+      'Liked Songs',
+    );
+    expect(own.container.querySelector('.playlist-liked-art')).toBeNull();
   });
 });

@@ -49,6 +49,7 @@ import type { DiscoveryRow } from '../-sync.transform';
 import { discoveryRowAction } from '../-sync.core';
 import {
   descriptionSourceWord,
+  discoveryStatusLabel,
   initialProgressText,
   metadataSourceLabel,
   modalDescription,
@@ -57,8 +58,10 @@ import {
   matchLineNumbers,
   progressLineText,
   seededProgress,
+  skippedNoteText,
 } from '../-sync.modal-core';
 import { syncPercent } from '../-sync.state';
+import { BeatportSnapshotButton } from './beatport-snapshot-button';
 import { OrganizeToggle } from './organize-toggle';
 
 declare global {
@@ -188,7 +191,7 @@ function RowActions({
         <button
           type="button"
           className="rematch-btn"
-          style={{ marginLeft: 4, color: '#ff6b6b' }}
+          style={{ marginLeft: 4, color: 'var(--danger-light)' }}
           title="Remove this match"
           onClick={() => onUnmatchTrack?.(row)}
         >
@@ -300,10 +303,13 @@ function FooterActions(props: DiscoveryModalProps) {
     onRediscover,
     onRetryFailed,
   } = props;
-  // The vanilla's gates (9603-9605): results presence, COUNTER-only matches,
-  // and the converted-playlist fallback that keeps Download available.
+  // The vanilla's gates (9603-9605): results presence, matches, and the
+  // converted-playlist fallback that keeps Download available. matches count
+  // the found rows when the counter is 0, same as the progress line: a cached
+  // open has no worker to count them, so it said "4 / 4 tracks matched" with
+  // Push and Download hidden until a re-identify (#1603).
   const hasResults = state.rows.length > 0;
-  const hasMatches = state.spotifyMatches > 0;
+  const hasMatches = seededProgress(state).matches > 0;
   const hasConverted = Boolean(state.convertedSpotifyPlaylistId);
   // retryFailedMirroredDiscovery counts every row that is NOT found (9684).
   const failedCount = state.rows.filter((r) => r.status_class !== 'found').length;
@@ -404,6 +410,11 @@ function FooterActions(props: DiscoveryModalProps) {
             key="download-missing-btn"
             type="button"
             className="modal-btn modal-btn-primary"
+            title={
+              standalone
+                ? "Download the identified songs you don't have yet"
+                : "Download the identified songs you don't have yet. Push to server (or the next sync) adds them to your server playlist"
+            }
             onClick={() => onDownloadMissing()}
           >
             🔍 Download Missing Tracks
@@ -441,6 +452,7 @@ export function DiscoveryModal(props: DiscoveryModalProps) {
   const sourceLabel = modalSourceLabel(config.id, fakeHash, mirroredSource);
   const metadataLabel = metadataSourceLabel();
   const seeded = seededProgress(state);
+  const skippedNote = skippedNoteText(state.sourceSkipped, sourceLabel);
   const tracks = playlistTracks(state);
   // Seed with the playlist's own count (9518); once payloads flow, their
   // authoritative spotify_total wins (the live painter, 10113) — results can
@@ -490,6 +502,13 @@ export function DiscoveryModal(props: DiscoveryModalProps) {
                   )
                 : initialProgressText(state.phase)}
             </div>
+            {skippedNote && <div className="progress-skipped-note">{skippedNote}</div>}
+            {showLine && (
+              <div className="discovery-meaning-note">
+                Identified means the song was matched on {metadataLabel}. Whether you already have
+                it is checked when you download or sync.
+              </div>
+            )}
           </div>
 
           <div className="discovery-table-container">
@@ -498,7 +517,7 @@ export function DiscoveryModal(props: DiscoveryModalProps) {
                 <tr>
                   <th>{sourceLabel} Track</th>
                   <th>{sourceLabel} Artist</th>
-                  <th>Status</th>
+                  <th>Match</th>
                   <th>{metadataLabel} Track</th>
                   <th>{metadataLabel} Artist</th>
                   <th>Album</th>
@@ -523,7 +542,9 @@ export function DiscoveryModal(props: DiscoveryModalProps) {
                         ? row.spotify_artist
                         : row.yt_artist}
                     </td>
-                    <td className={`discovery-status ${row.status_class}`}>{row.status}</td>
+                    <td className={`discovery-status ${row.status_class}`}>
+                      {discoveryStatusLabel(row)}
+                    </td>
                     <td className="spotify-track">{row.spotify_track}</td>
                     <td className="spotify-artist">{row.spotify_artist}</td>
                     <td className="spotify-album">{row.spotify_album}</td>
@@ -571,6 +592,7 @@ export function DiscoveryModal(props: DiscoveryModalProps) {
             </div>
           </div>
           <div className="modal-footer-right">
+            {config.id === 'beatport' && <BeatportSnapshotButton chartRef={state.sourceId} />}
             <button type="button" className="modal-btn modal-btn-secondary" onClick={onClose}>
               🏠 Close
             </button>

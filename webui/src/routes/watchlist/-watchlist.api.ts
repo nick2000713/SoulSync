@@ -285,6 +285,15 @@ export async function saveWatchlistGlobalConfig(
   return withEditionDefaults(payload.config ?? config);
 }
 
+/** #1822: every artist with its own rules follows the defaults again. */
+export async function resetWatchlistToDefaults(): Promise<number> {
+  const payload = await readJson<{ success: boolean; reset?: number; error?: string }>(
+    apiClient.post('watchlist/reset-to-defaults'),
+  );
+  if (!payload.success) throw new Error(payload.error || 'Failed to reset artists');
+  return payload.reset ?? 0;
+}
+
 export async function fetchWatchlistArtistConfig(
   artistId: string,
 ): Promise<WatchlistArtistConfigResponse> {
@@ -309,6 +318,8 @@ export interface WatchlistArtistConfigUpdate {
   include_acoustic: boolean;
   include_compilations: boolean;
   include_instrumentals: boolean;
+  /** Include tracks by artists other than the watched one (tributes, soundtracks). Default off. */
+  include_other_artists: boolean;
   /** The three-state preference: null = follow the global. Sent INSTEAD of the
    *  legacy `auto_download` boolean — the server reads that one as a deliberate
    *  choice, so posting it on every save would pin every artist the user ever
@@ -317,6 +328,8 @@ export interface WatchlistArtistConfigUpdate {
   quality_profile_id: number | null;
   lookback_days: number | null;
   preferred_metadata_source: string | null;
+  /** #1822: always sent by the panel, so a save says which rules it means. */
+  follow_defaults: boolean;
 }
 
 export async function saveWatchlistArtistConfig(
@@ -412,20 +425,4 @@ export async function updateWatchlistPodcastSettings(
     }),
   );
   assertSuccess(payload, 'Failed to update podcast settings');
-}
-
-export async function scanWatchlistPodcasts(): Promise<{
-  success: boolean;
-  podcasts_checked?: number;
-  episodes_queued?: number;
-  episodes_pruned?: number;
-}> {
-  const payload = await readJson<{
-    success: boolean;
-    podcasts_checked?: number;
-    episodes_queued?: number;
-    episodes_pruned?: number;
-  }>(apiClient.post('podcasts/watchlist/scan-now'));
-  assertSuccess(payload, 'Failed to scan podcasts');
-  return payload;
 }

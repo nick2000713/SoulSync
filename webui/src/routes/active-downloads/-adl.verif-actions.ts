@@ -9,6 +9,8 @@
  * They hit different endpoints and their confirm copy differs accordingly.
  */
 
+import { openWishlistInspector } from '@/features/downloads/inspector-modal';
+
 import type { AdlDeletedEntry, AdlDownload, AdlQuarantineEntry } from './-adl.types';
 
 import {
@@ -27,6 +29,7 @@ import {
   verificationDelete,
   verificationEntry,
   verificationPlay,
+  verificationWrongSong,
 } from './-adl.api';
 import { verificationHistoryId } from './-adl.helpers';
 import { ADL_DONE_STATUSES, ADL_REVIEW_STATUSES } from './-adl.types';
@@ -150,6 +153,39 @@ export async function unverifiedDelete(historyId: string, onDone: () => void): P
     } else toast(data.error || 'Delete failed', 'error');
   } catch {
     toast('Delete failed', 'error');
+  }
+}
+
+/**
+ * The file is the wrong song: it goes like a delete (and its source is
+ * skipped from now on), the song that was asked for goes back on the
+ * wishlist, and the interactive search opens on it to pick the right one.
+ * Closing the search leaves the wishlist to keep hunting.
+ */
+export async function unverifiedWrongSong(
+  historyId: string,
+  asked: string,
+  onDone: () => void,
+): Promise<void> {
+  const confirmed = await window.showConfirmDialog?.({
+    title: 'Wrong song',
+    message: `This deletes the file, skips where it came from next time, and opens a search for ${asked} so you can pick the right one.`,
+    confirmText: 'Delete and search',
+    cancelText: 'Cancel',
+    destructive: true,
+  });
+  if (!confirmed) return;
+  try {
+    const data = await verificationWrongSong(historyId);
+    if (!data.success || !data.wishlist_track) {
+      toast(data.error || 'Could not reject the file', 'error');
+      return;
+    }
+    toast('File deleted. Pick the right one, or close and the wishlist keeps looking.', 'success');
+    onDone();
+    openWishlistInspector(data.wishlist_track);
+  } catch (error) {
+    toast((error as Error).message || 'Could not reject the file', 'error');
   }
 }
 
@@ -336,14 +372,17 @@ export async function quarantineDeleteEntry(
  */
 export async function quarantineDeleteGroup(
   entry: AdlQuarantineEntry,
-  count: number,
+  count: number | null,
   onDone: () => void,
 ): Promise<void> {
   const name = entry.expected_track || entry.original_filename || entry.filename || 'this track';
   const confirmed = await window.showConfirmDialog?.({
     title: 'Delete All Candidates',
-    message: `This permanently deletes all ${count} quarantined candidates for "${name}" and their metadata sidecars. Cannot be undone.`,
-    confirmText: `Delete all ${count}`,
+    message:
+      count === null
+        ? `This permanently deletes every quarantined candidate for "${name}" and their metadata sidecars — including candidates that are not loaded yet. Cannot be undone.`
+        : `This permanently deletes all ${count} quarantined candidates for "${name}" and their metadata sidecars. Cannot be undone.`,
+    confirmText: count === null ? 'Delete all' : `Delete all ${count}`,
     cancelText: 'Cancel',
     destructive: true,
   });
@@ -352,8 +391,15 @@ export async function quarantineDeleteGroup(
     const data = await quarantineDelete(entry.id, { siblings: true });
     if (data.success) {
       // The server's tally, not the UI's - the list can be a few seconds stale.
-      const gone = data.deleted ?? count;
-      toast(`Deleted ${gone} quarantined file${gone === 1 ? '' : 's'}`, 'success');
+      if (data.deleted != null) {
+        const gone = data.deleted;
+        toast(`Deleted ${gone} quarantined file${gone === 1 ? '' : 's'}`, 'success');
+      } else if (count === null) {
+        // No server tally and no trustworthy local count — don't invent one.
+        toast('Deleted the quarantined candidates', 'success');
+      } else {
+        toast(`Deleted ${count} quarantined file${count === 1 ? '' : 's'}`, 'success');
+      }
       onDone();
     } else toast(data.error || 'Delete failed', 'error');
   } catch {
@@ -406,11 +452,13 @@ export async function approveAllQuarantine(
 export async function clearAllQuarantine(
   entries: AdlQuarantineEntry[],
   onDone: () => void,
+  totalCount?: number,
 ): Promise<void> {
-  if (!entries.length) return;
+  const count = totalCount ?? entries.length;
+  if (!count) return;
   const confirmed = await window.showConfirmDialog?.({
     title: 'Clear Quarantine',
-    message: `This permanently deletes all ${entries.length} quarantined files and their metadata sidecars. Cannot be undone.`,
+    message: `This permanently deletes all ${count} quarantined files and their metadata sidecars. Cannot be undone.`,
     confirmText: 'Delete All',
     cancelText: 'Cancel',
     destructive: true,

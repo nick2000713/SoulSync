@@ -468,17 +468,32 @@ export async function fetchReleases(asin: string): Promise<AudiobookReleaseCandi
   }
 }
 
-/** Begin a search. Returns the job id to poll, or null if it could not start. */
+/**
+ * Begin a search. Returns the job id to poll, or null if it could not start.
+ *
+ * `query` is one the user typed. It replaces the generated queries outright;
+ * empty means the normal automatic search. `defaultQuery` is what the
+ * automatic search leads with, so the search box can start from it.
+ */
 export async function startReleaseSearch(
   asin: string,
-): Promise<{ id: string; pollMs: number } | null> {
+  query = '',
+): Promise<{ id: string; pollMs: number; defaultQuery: string } | null> {
   if (!asin) return null;
   try {
-    const data = await readJson<{ success?: boolean; id?: string; poll_ms?: number }>(
-      audiobookClient.post(`audiobooks/releases/${encodeURIComponent(asin)}/start`),
+    const data = await readJson<{
+      success?: boolean;
+      id?: string;
+      poll_ms?: number;
+      default_query?: string;
+    }>(
+      audiobookClient.post(
+        `audiobooks/releases/${encodeURIComponent(asin)}/start`,
+        query ? { json: { query } } : undefined,
+      ),
     );
     if (!data?.success || !data.id) return null;
-    return { id: data.id, pollMs: data.poll_ms || 1200 };
+    return { id: data.id, pollMs: data.poll_ms || 1200, defaultQuery: data.default_query || '' };
   } catch (err) {
     console.error(`Failed to start a release search for ${asin}:`, err);
     return null;
@@ -675,7 +690,7 @@ export async function restoreRecycledBook(name: string): Promise<{ ok: boolean; 
     return { ok: Boolean(data?.success), error: data?.error || '' };
   } catch (err) {
     console.error('Failed to restore the book:', err);
-    return { ok: false, error: 'Request failed' };
+    return { ok: false, error: err instanceof Error ? err.message : 'Request failed' };
   }
 }
 
@@ -767,16 +782,33 @@ export async function clearBlocklist(): Promise<boolean> {
 export async function grabRelease(
   asin: string,
   release: AudiobookReleaseCandidate,
-): Promise<{ ok: boolean; error: string; ref: string }> {
+): Promise<{ ok: boolean; error: string; ref: string; adopted: boolean }> {
   try {
-    const data = await readJson<{ success?: boolean; error?: string; ref?: string }>(
-      audiobookClient.post('audiobooks/grab', { json: { asin, release } }),
-    );
+    const data = await readJson<{
+      success?: boolean;
+      error?: string;
+      ref?: string;
+      adopted?: boolean;
+    }>(audiobookClient.post('audiobooks/grab', { json: { asin, release } }));
     // The ref is how the row that was clicked follows its own download.
-    return { ok: Boolean(data?.success), error: data?.error || '', ref: data?.ref || '' };
+    // `adopted`: the client already had this torrent, so it was picked up
+    // where it is instead of being added again.
+    return {
+      ok: Boolean(data?.success),
+      error: data?.error || '',
+      ref: data?.ref || '',
+      adopted: Boolean(data?.adopted),
+    };
   } catch (err) {
     console.error('Failed to grab the release:', err);
-    return { ok: false, error: 'Request failed', ref: '' };
+    // readJson put the server's reason on the error (already owned, the
+    // download client refused, disk full). "Request failed" hid all of them.
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : 'Request failed',
+      ref: '',
+      adopted: false,
+    };
   }
 }
 
@@ -817,30 +849,80 @@ export async function fetchFollowedAuthors(): Promise<AudiobookFollowedAuthor[]>
   }
 }
 
+/** What a watchlist row follows. The role is part of its key. */
+export type AudiobookFollowRole = 'author' | 'narrator' | 'series';
+
+/** A watchlist row's role, narrowed. Anything unrecognised is an author, as on the server. */
+export function followRole(row: { role?: string }): AudiobookFollowRole {
+  return row.role === 'narrator' || row.role === 'series' ? row.role : 'author';
+}
+
+/** Extra options when following something other than a plain author. */
+export interface FollowOptions {
+  role?: AudiobookFollowRole;
+  /** The Audible series ASIN, which makes a series match exact. */
+  seriesAsin?: string;
+  /** Take everything already published, not only what comes out from today. */
+  backfill?: boolean;
+}
+
+export interface FollowResult {
+  ok: boolean;
+  /** Volumes put on the wishlist straight away (series followed with backfill). */
+  wishlisted?: number;
+}
+
 /**
- * Follow an author so their new releases get wishlisted.
+ * Follow an author, narrator or series so new releases get wishlisted.
  *
  * The cutoff is the day you follow them — following an author means "tell me
- * about the next one", not "queue the eighty-eight they already wrote".
+ * about the next one", not "queue the eighty-eight they already wrote". A series
+ * is the exception callers opt into with `backfill`, since people usually want
+ * the volumes that already exist.
  */
-export async function followAuthor(name: string, coverUrl = ''): Promise<boolean> {
-  if (!name) return false;
+export async function followAuthor(
+  name: string,
+  coverUrl = '',
+  options: FollowOptions = {},
+): Promise<boolean> {
+  return (await followWatchlist(name, coverUrl, options)).ok;
+}
+
+export async function followWatchlist(
+  name: string,
+  coverUrl = '',
+  options: FollowOptions = {},
+): Promise<FollowResult> {
+  if (!name) return { ok: false };
   try {
-    const data = await readJson<{ success?: boolean }>(
-      audiobookClient.post('audiobooks/watchlist', { json: { name, cover_url: coverUrl } }),
+    const data = await readJson<{ success?: boolean; wishlisted?: number }>(
+      audiobookClient.post('audiobooks/watchlist', {
+        json: {
+          name,
+          cover_url: coverUrl,
+          role: options.role ?? 'author',
+          series_asin: options.seriesAsin ?? '',
+          backfill: Boolean(options.backfill),
+        },
+      }),
     );
-    return Boolean(data?.success);
+    return { ok: Boolean(data?.success), wishlisted: data?.wishlisted };
   } catch (err) {
     console.error(`Failed to follow ${name}:`, err);
-    return false;
+    return { ok: false };
   }
 }
 
-export async function unfollowAuthor(name: string): Promise<boolean> {
+export async function unfollowAuthor(
+  name: string,
+  role: AudiobookFollowRole = 'author',
+): Promise<boolean> {
   if (!name) return false;
   try {
     const data = await readJson<{ success?: boolean }>(
-      audiobookClient.delete(`audiobooks/watchlist/${encodeURIComponent(name)}`),
+      audiobookClient.delete(`audiobooks/watchlist/${encodeURIComponent(name)}`, {
+        searchParams: { role },
+      }),
     );
     return Boolean(data?.success);
   } catch (err) {
@@ -849,15 +931,17 @@ export async function unfollowAuthor(name: string): Promise<boolean> {
   }
 }
 
-/** Check followed authors now instead of waiting for the daily automation. */
-/** Change one followed author's settings from their card. */
+/** Change one follow's settings from its card. */
 export async function updateFollowedAuthor(
   name: string,
   fields: { auto_wishlist?: number; narrator_mode?: string; since_date?: string },
+  role: AudiobookFollowRole = 'author',
 ): Promise<boolean> {
   try {
     const data = await readJson<{ success?: boolean }>(
-      audiobookClient.patch(`audiobooks/watchlist/${encodeURIComponent(name)}`, { json: fields }),
+      audiobookClient.patch(`audiobooks/watchlist/${encodeURIComponent(name)}`, {
+        json: { ...fields, role },
+      }),
     );
     return Boolean(data?.success);
   } catch (err) {
@@ -866,6 +950,7 @@ export async function updateFollowedAuthor(
   }
 }
 
+/** Check followed authors, narrators and series now instead of waiting for the daily automation. */
 export async function runAuthorScan(): Promise<Record<string, number> | null> {
   try {
     const data = await readJson<{ success?: boolean; summary?: Record<string, number> }>(

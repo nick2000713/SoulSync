@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import struct
+import re
 import threading
 import time
 import uuid
@@ -28,6 +29,9 @@ logger = get_logger("deezer_download")
 
 # Deezer API endpoints
 _GW_API = "https://www.deezer.com/ajax/gw-light.php"
+# gateway reads the session heal may re-execute after a re-login (#1677);
+# writes (playlist.create / playlist.addSongs) are healed but never retried
+_GW_READ_METHODS = frozenset({"song.getData"})
 _MEDIA_API = "https://media.deezer.com/v1/get_url"
 
 # Blowfish decryption secret (public knowledge, used by all Deezer clients)
@@ -83,8 +87,24 @@ def _decrypt_chunk(chunk: bytes, key: bytes) -> bytes:
 from core.download_plugins.base import DownloadSourcePlugin
 
 
+def _keep_album_artist(album_artists: dict, album_id: str, album_data) -> None:
+    """remember an /album/{id} response's own artist as {'name', 'id'}."""
+    artist = album_data.get('artist') if isinstance(album_data, dict) else None
+    if isinstance(artist, dict) and artist.get('name'):
+        album_artists[album_id] = {'name': artist['name'], 'id': str(artist.get('id') or '')}
+
+
 class DeezerDownloadClient(DownloadSourcePlugin):
     """Deezer download client using ARL token authentication."""
+
+    # sign-in event state (see __init__), declared here too so a client built
+    # without __init__ still has it: an alert must never be what breaks a login
+    _event_emit = None
+    _signin_lock = threading.Lock()
+    _signin_failing = False
+    _last_good_arl = None
+    # the sign-in check asks deezer from a session of its own (see check_signin)
+    _probe_session_factory = staticmethod(lambda: requests.Session())
 
     def __init__(self, download_path: str = None):
         from core.settings import config_manager
@@ -126,6 +146,23 @@ class DeezerDownloadClient(DownloadSourcePlugin):
         # next try, doubling each miss (see is_authenticated)
         self._auth_retry_at = 0.0
         self._auth_retry_wait = 0.0
+        # session-token heals (#1677): one re-login at a time, and the login's
+        # own gateway call must never trigger a nested heal. The generation
+        # counts reconnects so a caller holding a rejected token can tell the
+        # session was refreshed even when the new token string matches the old.
+        self._reauth_lock = threading.Lock()
+        self._reauth_thread = None
+        self._auth_generation = 0
+
+        # sign-in failed / restored automation events. a dead arl is otherwise
+        # silent: downloads fall back to the next source and nothing says why.
+        # one 'failed' per episode (the retry backoff would repeat it), and
+        # 'restored' when deezer takes an arl again after a failure, or a
+        # different arl than the last one that worked. set by web_server.
+        self._event_emit = None
+        self._signin_lock = threading.Lock()
+        self._signin_failing = False
+        self._last_good_arl = config_manager.get('deezer_download.arl', '') or None
 
         # Quality preference
         self._quality = quality_tier_for_source('deezer', default='flac')
@@ -189,7 +226,21 @@ class DeezerDownloadClient(DownloadSourcePlugin):
     def _authenticate(self, arl: str) -> bool:
         """Authenticate with Deezer using ARL cookie token."""
         try:
-            self._session.cookies.set('arl', arl)
+            # a sign-in starts from nothing but the arl. the session keeps the
+            # 'sid' cookie deezer set at the last login, and while that is alive
+            # deezer answers as that account whatever arl is set, so a changed
+            # or dead arl would never actually be tried (it only took effect
+            # once the old session ended, often at the next restart)
+            cookies = self._session.cookies
+            clear = getattr(cookies, 'clear', None)
+            if callable(clear):
+                clear()
+            cookies.set('arl', arl)
+            # The bootstrap must not present the previous session's token:
+            # Deezer validates it before issuing a new one, so a dead token
+            # would reject the very login meant to replace it (#1677). The
+            # ARL test endpoint bootstraps with 'null' for the same reason.
+            self._api_token = None
 
             # Get user data and API token
             resp = self._gw_call('deezer.getUserData')
@@ -201,6 +252,7 @@ class DeezerDownloadClient(DownloadSourcePlugin):
             user_id = user.get('USER_ID', 0)
             if not user_id or user_id == 0:
                 logger.error("Invalid ARL token — Deezer returned no user")
+                self._note_signin(False, arl)
                 return False
 
             self._api_token = resp.get('checkForm', '')
@@ -219,6 +271,7 @@ class DeezerDownloadClient(DownloadSourcePlugin):
                 tier = 'Premium'
 
             logger.info(f"Deezer authenticated as '{user_name}' (tier: {tier})")
+            self._note_signin(True, arl, user=user_name, tier=tier)
             return True
 
         except Exception as e:
@@ -227,16 +280,41 @@ class DeezerDownloadClient(DownloadSourcePlugin):
             return False
 
     def _gw_call(self, method: str, params: dict = None) -> Optional[dict]:
-        """Call the Deezer gateway API."""
+        """Call the Deezer gateway API.
+
+        The gateway's api_token is a web-session token: it ages out over
+        hours while the ARL itself stays valid (#1677). When Deezer answers
+        VALID_TOKEN_REQUIRED the session is dead, not the ARL — re-login
+        once with the configured ARL and retry the call, instead of failing
+        every download until the container restarts."""
+        generation_used = getattr(self, '_auth_generation', 0)
+        results, token_required, token_used = self._gw_call_once(method, params)
+        if not token_required:
+            return results
+        if method == 'deezer.getUserData':
+            return None  # the login itself: a rejected bootstrap has no heal
+        if not self._reauthenticate_session(token_used, generation_used):
+            return None
+        if method not in _GW_READ_METHODS:
+            # healed for the next call, but never re-execute a write: if the
+            # token died mid-request the write may already have landed, and
+            # a blind retry would duplicate it (playlist.addSongs/create)
+            return None
+        results, _, _ = self._gw_call_once(method, params)
+        return results
+
+    def _gw_call_once(self, method: str, params: dict = None):
+        """One gateway attempt: (results, token_required, token_used)."""
         with self._api_lock:
             elapsed = time.time() - self._last_request
             if elapsed < self._min_interval:
                 time.sleep(self._min_interval - elapsed)
             self._last_request = time.time()
 
+        token_used = self._api_token
         try:
             url_params = {'method': method, 'api_version': '1.0'}
-            url_params['api_token'] = self._api_token if self._api_token else 'null'
+            url_params['api_token'] = token_used if token_used else 'null'
 
             resp = self._session.post(
                 _GW_API,
@@ -251,17 +329,135 @@ class DeezerDownloadClient(DownloadSourcePlugin):
                 error = data['error']
                 if isinstance(error, dict):
                     error_msg = error.get('VALID_TOKEN_REQUIRED') or error.get('GATEWAY_ERROR') or str(error)
+                    token_required = 'VALID_TOKEN_REQUIRED' in error
                 else:
                     error_msg = str(error)
+                    token_required = 'VALID_TOKEN_REQUIRED' in error_msg
                 if error_msg:
                     logger.warning(f"Deezer API error ({method}): {error_msg}")
-                    return None
+                    return None, token_required, token_used
 
-            return data.get('results', {})
+            return data.get('results', {}), False, token_used
 
         except Exception as e:
             logger.error(f"Deezer API call failed ({method}): {e}")
-            return None
+            return None, False, token_used
+
+    def _reauthenticate_session(self, failed_token, failed_generation=None) -> bool:
+        """Re-login after the gateway rejected the session token (#1677).
+
+        One heal at a time: a burst of downloads hitting the same dead token
+        waits for a single re-login, and the login's own gateway call
+        (deezer.getUserData, running on the healing thread) can never
+        recurse into a nested heal. A failed re-login drops the client
+        into the pending-ARL backoff via reconnect(), so it stops claiming
+        to be authenticated."""
+        if getattr(self, '_reauth_thread', None) == threading.get_ident():
+            return False  # this call IS the login's own gateway call
+        from core.boot_phase import is_boot_phase
+        if is_boot_phase():
+            return False  # logins stay deferred until boot is over
+        with self._reauth_lock:
+            if self._authenticated and (
+                    self._api_token != failed_token
+                    or (failed_generation is not None
+                        and getattr(self, '_auth_generation', 0) != failed_generation)):
+                return True  # another thread already refreshed the session
+            if time.time() < getattr(self, '_auth_retry_at', 0.0):
+                # a login already failed and its backoff is still running —
+                # shared by every caller, whatever token (or none) they hold
+                return False
+            self._reauth_thread = threading.get_ident()
+            try:
+                return self.reconnect()
+            except Exception as e:  # noqa: BLE001 — a heal must never break the caller
+                logger.error(f"Deezer session re-login raised: {e}")
+                return False
+            finally:
+                self._reauth_thread = None
+
+    # ─── Sign-in health ──────────────────────────────────────────
+
+    _SIGNIN_FAILED_DETAIL = ("Deezer returned no user for this ARL. It has expired or been "
+                             "signed out: paste a fresh one in Settings.")
+
+    def _note_signin(self, ok: bool, arl: str, *, user: str = "", tier: str = "") -> None:
+        """record what deezer said about the arl and send the event, if any.
+        only deezer's own answer counts: a dropped connection never comes
+        here, so an outage doesn't read as a dead arl"""
+        with self._signin_lock:
+            if ok:
+                changed = bool(self._last_good_arl) and arl != self._last_good_arl
+                event = 'deezer_signin_restored' if (self._signin_failing or changed) else None
+                self._signin_failing = False
+                self._last_good_arl = arl
+                data = {'user': user or 'Unknown', 'tier': tier or 'Unknown'}
+            else:
+                event = None if self._signin_failing else 'deezer_signin_failed'
+                self._signin_failing = True
+                data = {'reason': 'invalid_arl', 'detail': self._SIGNIN_FAILED_DETAIL}
+        if event:
+            logger.info("Deezer sign-in: %s", 'restored' if ok else 'failed (ARL rejected)')
+            emit = self._event_emit
+            if emit:
+                try:
+                    emit(event, data)
+                except Exception as e:  # noqa: BLE001 - an alert must never break a login
+                    logger.debug("deezer sign-in event failed: %s", e)
+
+    def set_event_emitter(self, emit) -> None:
+        """where sign-in events go (the automation engine's emit). a failure
+        already on record -- a sign-in at startup, before this was wired -- is
+        sent now, or its episode would never be announced"""
+        self._event_emit = emit
+        with self._signin_lock:
+            pending = self._signin_failing
+        if pending and emit:
+            try:
+                emit('deezer_signin_failed', {'reason': 'invalid_arl', 'detail': self._SIGNIN_FAILED_DETAIL})
+            except Exception as e:  # noqa: BLE001
+                logger.debug("deezer sign-in event failed: %s", e)
+
+    def check_signin(self) -> dict:
+        """ask deezer who the configured arl belongs to (the scheduled 'Check
+        Deezer Sign-in'). catches an arl that died while nothing needed it.
+
+        returns {'status': 'ok'|'failed'|'unreachable'|'skipped', ...}. a
+        logged-in client is probed from a fresh session, its own left alone; a
+        logged-out one gets a full sign-in, the same as its own retry would make."""
+        arl = self._config.get('deezer_download.arl', '')
+        if not arl:
+            return {'status': 'skipped', 'reason': 'no ARL set'}
+        if not self._authenticated:
+            if self.reconnect(arl):
+                return {'status': 'ok'}
+            return {'status': 'failed' if self._signin_failing else 'unreachable'}
+        with self._api_lock:
+            elapsed = time.time() - self._last_request
+            if elapsed < self._min_interval:
+                time.sleep(self._min_interval - elapsed)
+            self._last_request = time.time()
+        try:
+            # its own session holding only the arl: the live one carries deezer's
+            # 'sid', which would answer for the old login whatever the arl is,
+            # and the probe must not disturb the session downloads are using
+            probe = self._probe_session_factory()
+            probe.headers.update(dict(getattr(self._session, 'headers', None) or {}))
+            probe.cookies.set('arl', arl)
+            resp = probe.post(_GW_API, params={'method': 'deezer.getUserData',
+                                               'api_version': '1.0', 'api_token': 'null'},
+                              json={}, timeout=15)
+            resp.raise_for_status()
+            results = (resp.json() or {}).get('results') or {}
+        except Exception as e:  # noqa: BLE001 - unreachable is not a dead arl
+            logger.warning("Deezer sign-in check couldn't reach Deezer: %s", e)
+            return {'status': 'unreachable', 'reason': str(e)}
+        user = results.get('USER') or {}
+        if not user.get('USER_ID'):
+            self._note_signin(False, arl)
+            return {'status': 'failed'}
+        self._note_signin(True, arl, user=user.get('BLOG_NAME', ''))
+        return {'status': 'ok'}
 
     # ─── Status & Config ─────────────────────────────────────────
 
@@ -372,6 +568,12 @@ class DeezerDownloadClient(DownloadSourcePlugin):
         else:
             self._pending_arl = None
             self._auth_retry_wait = 0.0
+            # a successful login supersedes any earlier failure: clear its
+            # backoff so it can't suppress a future heal, and bump the
+            # generation so callers holding the rejected token can tell the
+            # session was refreshed even if the token string is unchanged
+            self._auth_retry_at = 0.0
+            self._auth_generation = getattr(self, '_auth_generation', 0) + 1
         return ok
 
     def get_quality_label(self) -> str:
@@ -560,6 +762,10 @@ class DeezerDownloadClient(DownloadSourcePlugin):
             # (It used to get the PLAYLIST's track count — a 12-track album
             # imported from a 1582-track playlist claimed 1582 tracks.)
             album_track_counts = {}
+            # the album's own artist, from the same /album/{id} response. without
+            # it a playlist track's album artist fell back to the track's singer
+            # and one soundtrack split across artist folders (#1605)
+            album_artists = {}
             # Deezer PLAYLIST tracks do NOT carry `track_position` (only `/track/<id>`
             # and `/album/<id>/tracks` do), so numbering them by their playlist index
             # poisons the real album track number — which then rides into the wishlist
@@ -599,6 +805,7 @@ class DeezerDownloadClient(DownloadSourcePlugin):
                             album_release_dates[aid] = cached['release_date']
                             if cached.get('nb_tracks'):
                                 album_track_counts[aid] = cached['nb_tracks']
+                            _keep_album_artist(album_artists, aid, cached)
                     except Exception as e:
                         logger.debug("cache get_entity album release_date: %s", e)
                 # Cache miss — fetch from API
@@ -613,6 +820,7 @@ class DeezerDownloadClient(DownloadSourcePlugin):
                             album_release_dates[aid] = a_data.get('release_date', '')
                             if a_data.get('nb_tracks'):
                                 album_track_counts[aid] = a_data['nb_tracks']
+                            _keep_album_artist(album_artists, aid, a_data)
                             # Store in metadata cache for future use
                             if cache:
                                 try:
@@ -652,6 +860,9 @@ class DeezerDownloadClient(DownloadSourcePlugin):
                         # lookup failed entirely.
                         'total_tracks': album_track_counts.get(album_id) or total_tracks,
                         'id': album_id,
+                        # only when the lookup named one, the download's album
+                        # backfill still fills it otherwise
+                        **({'artists': [album_artists[album_id]]} if album_id in album_artists else {}),
                     },
                     'duration_ms': t.get('duration', 0) * 1000,
                     # REAL album position (resolved above); the playlist index is a last
@@ -860,6 +1071,54 @@ class DeezerDownloadClient(DownloadSourcePlugin):
             logger.debug(f"get_track_result failed for Deezer {track_id}: {e}")
             return None
 
+    @staticmethod
+    def _name_key(value: str) -> str:
+        import unicodedata
+        folded = unicodedata.normalize('NFKD', str(value or '')).encode('ascii', 'ignore').decode()
+        return re.sub(r'[^a-z0-9]+', '', folded.casefold())
+
+    def _hinted_tracks(self) -> List[TrackResult]:
+        """the song a download is for, straight from deezer: its own track id
+        when the task came from deezer, and a track:"title" search kept to the
+        track's own artist. deezer's free-text search ranks reprises, karaoke
+        and key-shifted copies above the original and can leave it out
+        (#1582); the artist filter is done here because deezer's artist:""
+        filter is broken (#1295). once per download task, not per query"""
+        from core.downloads.track_hint import current_track_hint
+        hint = current_track_hint()
+        if not hint:
+            return []
+        if '_deezer' in hint:
+            return list(hint['_deezer'])
+        out: List[TrackResult] = []
+        tid = hint.get('deezer_id')
+        if tid:
+            tr = self.get_track_result(str(tid))
+            if tr:
+                out.append(tr)
+        title = str(hint.get('title') or '').replace('"', ' ').strip()
+        want_artist = self._name_key(hint.get('artist') or '')
+        if title and want_artist:
+            try:
+                resp = self._api_get(
+                    'https://api.deezer.com/search',
+                    params={'q': f'track:"{title}"', 'limit': 50},
+                    timeout=getattr(self._config, 'get_source_search_timeout', lambda: None)() or 10,
+                )
+                resp.raise_for_status()
+                for item in (resp.json() or {}).get('data', []) or []:
+                    artist = item.get('artist') if isinstance(item.get('artist'), dict) else {}
+                    got = self._name_key(artist.get('name') or '')
+                    if not got or (want_artist not in got and got not in want_artist):
+                        continue
+                    tr = self._item_to_track_result(item)
+                    if tr and all(tr.filename != o.filename for o in out):
+                        out.append(tr)
+            except Exception as e:
+                logger.debug("Deezer title-scoped search failed for %r: %s", title, e)
+        hint['_deezer'] = list(out)
+        return out
+
     async def search(self, query: str, timeout: int = None,
                      progress_callback=None) -> Tuple[List[TrackResult], List[AlbumResult]]:
         """Search Deezer for tracks matching the query."""
@@ -883,11 +1142,26 @@ class DeezerDownloadClient(DownloadSourcePlugin):
             resp.raise_for_status()
             data = resp.json()
 
+            items = list(data.get('data', []))
+            items.extend(self._exact_title_items(query, items))
+
             results = []
-            for item in data.get('data', []):
+            seen_ids = set()
+            for item in items:
+                item_id = str((item or {}).get('id') or '')
+                if item_id in seen_ids:
+                    continue
+                seen_ids.add(item_id)
                 tr = self._item_to_track_result(item)
                 if tr:
                     results.append(tr)
+
+            # the plain search can miss the song itself (#1582): put the
+            # track's own id and a title-scoped match first when we know them
+            hinted = self._hinted_tracks()
+            if hinted:
+                have = {r.filename.split('||', 1)[0] for r in hinted}
+                results = hinted + [r for r in results if r.filename.split('||', 1)[0] not in have]
 
             logger.info(f"Deezer search for '{query}' returned {len(results)} results")
             return results, []
@@ -895,6 +1169,62 @@ class DeezerDownloadClient(DownloadSourcePlugin):
         except Exception as e:
             logger.error(f"Deezer search failed: {e}")
             return [], []
+
+    def _exact_title_items(self, query: str, plain_items: List[dict]) -> List[dict]:
+        """Extra results from Deezer's ``track:"title"`` filter.
+
+        Plain ``/search`` ranks reprises, karaoke and key-shifted copies first and
+        can leave the original out of the page entirely (e.g. "How Far I'll Go"
+        by Auli'i Cravalho), so no matching step downstream can pick it. The
+        exact-title filter does return it. The artist in the query is found from
+        the plain results' own artist names (see ``core.deezer_track_query``).
+
+        Skipped (no request) when a download hint is active (the hint search
+        covers it), or when the plain results already hold the exact
+        title by the artist the query names. Best-effort: any failure returns []
+        and the plain results stand.
+        """
+        try:
+            # A queued download carries the song itself (see _hinted_tracks),
+            # which already runs a title-scoped search. Only a typed query
+            # (no hint) needs this one, so a playlist doesn't pay for both.
+            from core.downloads.track_hint import current_track_hint
+            hint = current_track_hint()
+            if hint and (hint.get('deezer_id') or (hint.get('title') and hint.get('artist'))):
+                return []
+            from core.deezer_track_query import (
+                exact_title_queries, plain_has_exact_title, query_is_an_artist,
+            )
+            names = []
+            pairs = []
+            for it in plain_items:
+                artist = it.get('artist') if isinstance(it, dict) else None
+                if isinstance(artist, dict) and artist.get('name'):
+                    names.append(artist['name'])
+                    pairs.append((it.get('title') or '', artist['name']))
+            # The plain search already found the song (the usual case): one
+            # request per query, not two. A playlist makes many of these.
+            if plain_has_exact_title(query, pairs):
+                return []
+            # "taylor swift" is an artist search. track:"taylor swift" only finds
+            # songs that happen to be called that, so it's a wasted request
+            if query_is_an_artist(query, names):
+                return []
+            extra: List[dict] = []
+            for scoped in exact_title_queries(query, names):
+                resp = self._api_get(
+                    'https://api.deezer.com/search',
+                    params={'q': scoped, 'limit': 30},
+                    timeout=getattr(self._config, 'get_source_search_timeout', lambda: None)() or 10,
+                )
+                if resp is None:
+                    continue
+                resp.raise_for_status()
+                extra.extend(resp.json().get('data', []))
+            return extra
+        except Exception as e:   # noqa: BLE001 - the plain search already has its answer
+            logger.debug("Deezer exact-title search skipped for '%s': %s", query, e)
+            return []
 
     # ─── Download ────────────────────────────────────────────────
 
@@ -959,8 +1289,14 @@ class DeezerDownloadClient(DownloadSourcePlugin):
         # Get track data from private API
         track_data = self._get_track_data(track_id)
         if not track_data:
-            self._set_error(download_id, 'Deezer would not return this track (expired ARL, '
-                                         'or not available in your region)')
+            if not getattr(self, '_authenticated', False):
+                # the session died and the re-login failed too — only now is
+                # the ARL itself the suspect (#1677)
+                self._set_error(download_id, 'Deezer login failed — expired ARL, '
+                                             'or the ARL in Settings is invalid')
+            else:
+                self._set_error(download_id, 'Deezer would not return this track '
+                                             '(not available in your region, or removed)')
             return None
 
         track_token = track_data.get('TRACK_TOKEN', '')

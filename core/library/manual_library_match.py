@@ -137,6 +137,8 @@ def refresh_mirrored_library_flags(
                 "in_library": True,
                 "library_track_id": library_track_id,
                 "library_checked_at": checked_at,
+                # a user's own answer: the library check never re-asks it
+                "library_checked_via": "manual",
             }):
                 updated += 1
         except Exception as exc:  # noqa: BLE001
@@ -215,6 +217,8 @@ def clear_mirrored_library_flags(
                 "in_library": False,
                 "library_track_id": None,
                 "library_checked_at": checked_at,
+                # a user's own answer: the library check never re-asks it
+                "library_checked_via": "manual",
             }):
                 updated += 1
         except Exception as exc:  # noqa: BLE001
@@ -615,7 +619,9 @@ def list_unmatched_wanted_tracks(db, profile_id: int, limit: int = 200) -> list[
         wishlist_rows = []
     ext_lookup = getattr(db, "api_get_track_by_external_id", None)
     for r in wishlist_rows:
-        tid = r.get("track_id") or ""
+        # a row wanted from one release is keyed `<track>::<album>`; the
+        # source track is the part before the separator
+        tid = str(r.get("track_id") or "").split("::", 1)[0]
         if not tid:
             continue
         key = ("spotify", tid)

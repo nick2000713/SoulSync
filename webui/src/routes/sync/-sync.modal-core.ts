@@ -140,6 +140,26 @@ export function progressLineText(matches: number, total: number, percent: number
 }
 
 /**
+ * Why the matched line can read 364 / 364 on a 395 track playlist (#1613):
+ * the source never handed some entries over. null when nothing was skipped.
+ */
+export function skippedNoteText(
+  skipped: { videos?: number; unavailable?: number } | undefined,
+  sourceLabel: string,
+): string | null {
+  const unavailable = skipped?.unavailable ?? 0;
+  const videos = skipped?.videos ?? 0;
+  const parts: string[] = [];
+  if (unavailable > 0) {
+    parts.push(
+      `${unavailable} ${unavailable === 1 ? 'track' : 'tracks'} couldn't be loaded from ${sourceLabel} (removed or not available in your region)`,
+    );
+  }
+  if (videos > 0) parts.push(`${videos} ${videos === 1 ? 'video' : 'videos'} skipped`);
+  return parts.length ? parts.join(' · ') : null;
+}
+
+/**
  * Modal-open progress seeding (9512-9527): stored progress, else computed from
  * results/track counts; matches fall back to counting found rows.
  */
@@ -210,12 +230,16 @@ export function buildDownloadTracks(results: RawDiscoveryResult[]): unknown[] {
         }
         return out;
       }
-      const albumData = (result as { spotify_album?: unknown }).spotify_album || 'Unknown Album';
+      // A missing album stays missing (empty name). Defaulting it to the
+      // literal 'Unknown Album' invents an album the source never named,
+      // and anything downstream that reads the payload's album treats
+      // the invention as a real name.
+      const albumData = (result as { spotify_album?: unknown }).spotify_album || '';
       const albumObject =
         typeof albumData === 'object' && albumData !== null
           ? albumData
           : {
-              name: typeof albumData === 'string' ? albumData : 'Unknown Album',
+              name: typeof albumData === 'string' ? albumData : '',
               album_type: 'album',
               images: [],
             };
@@ -233,4 +257,20 @@ export function buildDownloadTracks(results: RawDiscoveryResult[]): unknown[] {
       }
       return resTrack;
     });
+}
+
+/**
+ * The status cell's words (#1910). The row data keeps the vanilla's '✅ Found'
+ * (every found-test above reads it), but on screen "Found" read as "you have
+ * this song". It means the song was matched on the metadata source, so it
+ * says Identified. Owning it is a separate question, answered at download or
+ * sync time.
+ */
+export function discoveryStatusLabel(row: { status: string; status_class?: string }): string {
+  const found =
+    row.status_class === 'found' ||
+    row.status === '✅ Found' ||
+    row.status === 'Found' ||
+    row.status === 'found';
+  return found ? '✅ Identified' : row.status;
 }

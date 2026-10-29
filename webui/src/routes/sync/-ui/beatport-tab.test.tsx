@@ -5,16 +5,19 @@
  * putting them in the wrong order or handing a button the wrong argument.
  */
 
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { BeatportGenre } from '../-beatport.api';
 
-const openTop100 = vi.fn();
+const importList = vi.fn(async (_request: unknown) => 77);
 
 vi.mock('../-beatport.downloads', () => ({
   defaultBeatportDownloadEnv: () => ({ tag: 'env' }),
-  openBeatportTop100: (variant: string, env: unknown) => openTop100(variant, env),
+}));
+
+vi.mock('../-beatport.lists', () => ({
+  importBeatportList: (request: unknown) => importList(request),
 }));
 
 /** Each section is stubbed to a marker: this file's job is order, not content. */
@@ -71,9 +74,26 @@ vi.mock('./genre-page', () => ({
 }));
 
 import { BeatportTab } from './beatport-tab';
+import { type ImportLanding, ImportLandingProvider } from './use-importer';
+
+let land = vi.fn<ImportLanding['land']>();
+
+/** the tab inside an import landing, as the page renders it */
+function renderTab() {
+  land = vi.fn<ImportLanding['land']>();
+  return render(
+    <ImportLandingProvider value={{ land, showList: vi.fn() }}>
+      <BeatportTab />
+    </ImportLandingProvider>,
+  );
+}
 
 beforeEach(() => {
-  openTop100.mockClear();
+  importList.mockClear();
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () => new Response('[]')),
+  );
 });
 
 afterEach(() => {
@@ -129,21 +149,51 @@ describe('the pane', () => {
 });
 
 describe('the three nav buttons', () => {
-  it('sends each Top 100 button its OWN variant', () => {
-    // Both buttons call the same function and differ only by this argument, so
-    // a copy-paste gives you Beatport's chart under the Hype button.
-    render(<BeatportTab />);
+  it('imports each Top 100 button as its OWN list, and lands on it', async () => {
+    // Both buttons call the same function and differ only by the ref, so a
+    // copy-paste gives you Beatport's chart under the Hype button.
+    renderTab();
 
     fireEvent.click(screen.getByText('Beatport Top 100'));
-    expect(openTop100).toHaveBeenCalledWith('beatport', { tag: 'env' });
+    await waitFor(() => expect(land).toHaveBeenCalledWith(77, 'Beatport Top 100', false));
+    expect(importList.mock.calls[0][0]).toEqual({ ref: 'top-100', label: 'Beatport Top 100' });
 
     fireEvent.click(screen.getByText('Hype Top 100'));
-    expect(openTop100).toHaveBeenLastCalledWith('hype', { tag: 'env' });
-    expect(openTop100).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(importList).toHaveBeenCalledTimes(2));
+    expect(importList.mock.calls[1][0]).toEqual({ ref: 'hype-100', label: 'Hype Top 100' });
   });
 
-  it('opens the genre browser, and neither Top 100 does', () => {
-    render(<BeatportTab />);
+  it('a list already in opens without importing again', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify([{ id: 4, source: 'beatport', source_playlist_id: 'top-100' }]),
+          ),
+      ),
+    );
+    renderTab();
+    fireEvent.click(screen.getByText('Beatport Top 100'));
+    await waitFor(() => expect(land).toHaveBeenCalledWith(4, 'Beatport Top 100', true));
+    expect(importList).not.toHaveBeenCalled();
+  });
+
+  it('a failed import says why and lands nowhere', async () => {
+    const toast = vi.fn();
+    window.showToast = toast;
+    importList.mockRejectedValueOnce(new Error("Beatport didn't return this list."));
+    renderTab();
+    fireEvent.click(screen.getByText('Beatport Top 100'));
+    await waitFor(() =>
+      expect(toast).toHaveBeenCalledWith("Beatport didn't return this list.", 'error'),
+    );
+    expect(land).not.toHaveBeenCalled();
+    delete window.showToast;
+  });
+
+  it('opens the genre browser, and neither Top 100 does', async () => {
+    renderTab();
     expect(screen.queryByTestId('genre-modal')).toBeNull();
 
     fireEvent.click(screen.getByText('Beatport Top 100'));
@@ -151,7 +201,7 @@ describe('the three nav buttons', () => {
 
     fireEvent.click(screen.getByText('Browse by Genre'));
     expect(screen.getByTestId('genre-modal')).toBeTruthy();
-    expect(openTop100).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(importList).toHaveBeenCalledTimes(1));
   });
 });
 

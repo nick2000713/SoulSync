@@ -357,21 +357,41 @@ def test_usenet_has_a_tile(js):
     assert "torrent:" in m
 
 
+def _max_widths(css: str, selector: str) -> list[str]:
+    """Every max-width set on exactly this selector (ignoring :has() variants)."""
+    pattern = r"(?m)^" + re.escape(selector) + r"\s*\{([^}]*)\}"
+    return [m.strip() for body in re.findall(pattern, css)
+            for m in re.findall(r"max-width:\s*([^;]+);", body)]
+
+
 def test_the_page_width_is_one_number():
     """The nav row and the columns have to agree or the tabs and the content
-    below them line up differently."""
+    below them line up differently. They agree by both filling .settings-content,
+    which is the one thing capped, by the one token.
+
+    There used to be two numbers: style.css capped the nav row and columns at
+    the token while settings-premier.css capped .settings-content at 1240px and
+    lifted the columns' cap with max-width: none !important. The token was dead.
+    """
+    tokens = _strip_comments(_read("webui/static/tokens.css"))
+    assert "--settings-max-width:" in tokens
+    premier = _strip_comments(_read("webui/static/settings-premier.css"))
+    assert _max_widths(premier, "#settings-page .settings-content") == [
+        "var(--settings-max-width) !important"
+    ]
     css = _strip_comments(_read("webui/static/style.css"))
-    assert "--settings-max-width" in css
-    for sel in ("#settings-page .settings-nav-row {", "#settings-page .settings-columns {"):
-        block = css.split(sel, 1)[1].split("}", 1)[0]
-        assert "var(--settings-max-width)" in block, sel
-        assert "920px" not in block
+    for sel in ("#settings-page .settings-nav-row", "#settings-page .settings-columns"):
+        for source in (css, premier):
+            assert not _max_widths(source, sel), f"{sel} carries a cap of its own"
 
 
 def test_sources_gets_the_full_width_like_logs():
     # A grid uses width by fitting more tiles; a form just stretches its inputs.
+    # Nothing caps the columns below .settings-content, so every tab, logs and
+    # sources included, gets the full column.
     css = _strip_comments(_read("webui/static/style.css"))
-    assert 'data-stg="sources"' in css.split(":has(", 1)[1][:4000] or 'data-stg="sources"' in css
+    assert ".settings-columns:has(" not in css or "max-width" not in css.split(
+        ".settings-columns:has(", 1)[1].split("}", 1)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -692,10 +712,13 @@ def test_the_library_tab_speaks_one_card_language():
         # files & folders
         "Folders", "Organization",
         # processing
-        "Post-Processing", "Import", "Filtering",
-        # your library
-        "Playlists", "Listening Stats", "Discovery", "Video Preferences",
+        "Post-Processing", "Import",
+        # video
+        "Video Preferences",
     ], titles
+    # #1822: playlists, listening stats and discovery have their own Discovery
+    # tab now, and filtering (explicit content, genre whitelist) is a download
+    # rule, so it sits on Downloads
 
     # ...and they sit under three labelled groups. ten identical cards in a flat
     # column is a list you scan by reading every label; three groups is a list
@@ -706,7 +729,7 @@ def test_the_library_tab_speaks_one_card_language():
         re.search(r'<span class="stg-cardgroup-label">(.*?)</span>', markup[m.end():m.end() + 300]).group(1)
         for m in re.finditer(r'<div class="stg-cardgroup"[^>]*data-stg="library"[^>]*>', markup)
     ]
-    assert groups == ["Files &amp; folders", "Processing", "Your library"], groups
+    assert groups == ["Files &amp; folders", "Processing", "Video"], groups
 
     # no bare settings-group left stranded outside a card on this tab
     for m in re.finditer(r'<div class="settings-group"[^>]*data-stg="library"[^>]*>', markup):
@@ -1338,8 +1361,9 @@ def test_services_without_art_reuse_the_app_s_own_glyphs(js):
     The ones with no established glyph keep a monogram on their brand colour -
     that is a deliberate floor, not an oversight.
     """
-    index = _read("webui/index.html")
-    dash = set(re.findall(r'<span class="video-enrich-glyph"[^>]*>(.*?)</span>', index))
+    # the video dashboard is React now; its worker table holds the glyphs
+    hero = _read("webui/src/routes/dashboard/-video/video-hero.tsx")
+    dash = set(re.findall(r"logo: \{ glyph: '([^']+)' \}", hero))
     assert dash, "the dashboard glyphs this borrows from are gone"
 
     block = js.split('const SERVICE_GLYPHS = {', 1)[1].split('};', 1)[0]
@@ -1482,9 +1506,38 @@ def test_the_connections_tab_survives_a_phone():
     assert 'server-toggle-btn' in narrow, "the server toggles have no phone rules"
     assert 'flex: 1 1 calc(50% - 4px)' in narrow, "the toggles do not wrap two per line"
 
+    # the phone rules share the base rules' specificity, so they only win if
+    # they come after them - an earlier version sat above the base and never applied
+    base = re.search(
+        r'(?m)^#settings-page \.settings-group\[data-svc-side\] \.server-toggle-btn\s*\{', css)
+    phone = [m for m in re.finditer(r'@media \(max-width: 560px\)\s*\{(.*?)\n\}', css, re.S)
+             if 'flex: 1 1 calc(50% - 4px)' in m.group(1)]
+    assert base and phone and phone[0].start() > base.start(), (
+        "the phone toggle rules come before the base rules, so the base wins"
+    )
+    assert '--svc-server-logo-max: 30px' in phone[0].group(1), (
+        "the phone logo cap does not go through the token video-side.css reads"
+    )
+
     art = re.search(r'\.svc-tile-art\s*\{([^}]*)\}', narrow)
     assert art, "the icon well has no phone rule"
     assert 'width:' in art.group(1) and 'height:' in art.group(1), (
         "only one axis shrinks - the well stops being square"
     )
 
+
+
+def test_every_connections_service_sits_in_a_named_group(index, js):
+    """The grid groups services by what they do (metadata, scrobbling, subtitles
+    and so on). Anything unlisted falls into "Other" so it never vanishes, but a
+    new service landing there means nobody decided where it belongs."""
+    block = js.split('const SERVICE_GROUPS = {', 1)[1].split('\n};', 1)[0]
+    lists = ' '.join(re.findall(r'ids:\s*\[([^\]]*)\]', block))
+    grouped = set(re.findall(r"'([a-z]+)'", lists))
+    connections = index.split('data-stg="connections"', 1)[1].split('data-stg="library"', 1)[0]
+    ids = set(re.findall(r'data-(?:video-)?service="([a-z]+)"', connections))
+    assert len(ids) >= 20, f"only found {len(ids)} services, the page split is off"
+    assert ids - grouped == set(), f"services with no group: {sorted(ids - grouped)}"
+
+    build = js.split('function buildServiceTiles(', 1)[1].split('\nwindow.', 1)[0]
+    assert "'Other'" in build, "an unlisted service would vanish from the grid"

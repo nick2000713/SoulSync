@@ -20,7 +20,9 @@ export type SyncTabId =
   | 'lastfm-sync'
   | 'soulsync-discovery-sync'
   | 'import-file'
-  | 'mirrored';
+  | 'mirrored'
+  | 'my-playlists'
+  | 'request-lists';
 
 export interface SyncTab {
   id: SyncTabId;
@@ -68,6 +70,10 @@ export const SYNC_TABS: readonly SyncTab[] = [
   { id: 'soulsync-discovery-sync', label: 'SoulSync Discovery', icon: 'soulsync-discovery-icon' },
   { id: 'import-file', label: 'Import', icon: 'import-file-icon' },
   { id: 'mirrored', label: 'Mirrored', icon: 'mirrored-icon' },
+  // the playlists people make here. last in this table so the fifteen
+  // source tabs keep their order; the strip order comes from the primary list.
+  { id: 'my-playlists', label: 'My Playlists', icon: 'my-playlists-icon' },
+  { id: 'request-lists', label: 'Request Lists', icon: 'requests-icon' },
 ];
 
 /**
@@ -90,12 +96,19 @@ export const SYNC_DEFAULT_TAB: SyncTabId = 'mirrored';
  * not each need a chip in a strip that had fifteen of them, six of which were
  * duplicates of one another.
  *
- * What is left is genuinely three different things:
- *   mirrored  the library — the page's subject
+ * What is left is genuinely four different things:
+ *   mirrored      the library — the page's subject
+ *   my-playlists  the playlists people make here, with no service behind them
  *   server    the other direction: reading FROM Plex/Jellyfin/Navidrome
  *   beatport  a chart browser, a different page grafted into the strip
  */
-export const SYNC_PRIMARY_TAB_IDS: readonly SyncTabId[] = ['mirrored', 'server', 'beatport'];
+export const SYNC_PRIMARY_TAB_IDS: readonly SyncTabId[] = [
+  'mirrored',
+  'my-playlists',
+  'request-lists',
+  'server',
+  'beatport',
+];
 
 /**
  * Which chips to render, given what is open.

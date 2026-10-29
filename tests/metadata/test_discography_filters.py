@@ -125,6 +125,26 @@ class TestTrackArtistMatches:
         assert track_artist_matches(['Drakeo the Ruler'], 'Drake') is False
         assert track_artist_matches(['Drake & Future'], 'Drake') is True
 
+    def test_underscore_library_name_matches_slash_credit(self):
+        """discord (Chung Man): the K/DA page sent the name as 'K_DA' while the
+        source credits 'K/DA', so wishlist + watchlist skipped every track as
+        'by other artists'. punctuation is not part of who the artist is."""
+        assert track_artist_matches(['K/DA'], 'K_DA') is True
+        assert track_artist_matches([{'name': 'K/DA'}], 'K_DA') is True
+        assert track_artist_matches(['AC/DC'], 'ACDC') is True
+
+    def test_slash_name_survives_inside_a_combined_credit(self):
+        """'K/DA, Madison Beer' used to split on the slash first, so K/DA never
+        came out as a component and the real artist got dropped."""
+        assert track_artist_matches(['K/DA, Madison Beer, (G)I-DLE'], 'K/DA') is True
+        assert track_artist_matches(['K/DA, Madison Beer'], 'K_DA') is True
+        assert track_artist_matches(['Lil Nas X / Billy Ray Cyrus'], 'Billy Ray Cyrus') is True
+
+    def test_punctuation_blind_match_still_drops_absent_artist(self):
+        assert track_artist_matches(['Madison Beer, (G)I-DLE'], 'K_DA') is False
+        assert track_artist_matches(['!!!'], '!!!') is True
+        assert track_artist_matches(['!!!'], '???') is False
+
 
 # ---------------------------------------------------------------------------
 # content_type_skip_reason
@@ -313,17 +333,30 @@ class TestTrackAlreadyOwned:
         # The pre-fetched candidates must reach check_track_exists verbatim.
         assert db.calls[0]['candidate_tracks'] is owned
 
-    def test_empty_candidate_list_still_uses_batched_path(self):
-        """Owns-nothing case: an EMPTY list (not None) must be forwarded so the
-        check takes the fast in-memory path (scores against zero candidates →
-        instant 'not owned') instead of falling back to the slow per-track SQL."""
+    def test_empty_candidate_list_with_exhaustive_flag_uses_fast_path(self):
+        """Owns-nothing case: an EMPTY list (not None) WITH the exhaustive flag
+        must be forwarded so the check takes the fast in-memory path (scores
+        against zero candidates → instant 'not owned') instead of falling back
+        to the slow per-track SQL. (#1621: a bare [] without the flag now
+        means "no information" and takes the legacy path.)"""
         db = _FakeDB((None, 0.0))
         result = track_already_owned(
             db, 'Anything', 'Artist', 'Album', 'plex', candidate_tracks=[],
+            candidate_tracks_exhaustive=True,
         )
         assert result is False
-        # [] is forwarded (not coerced to None) — that's what keeps it fast.
+        # [] is forwarded (not coerced to None) with the flag — that's what
+        # keeps it fast.
         assert db.calls[0]['candidate_tracks'] == []
+        assert db.calls[0]['candidate_tracks_exhaustive'] is True
+
+    def test_bare_empty_list_forwards_without_exhaustive_flag(self):
+        """Without the flag, [] is "no information" (#1621) — the helper must
+        not claim exhaustiveness the caller didn't assert."""
+        db = _FakeDB((None, 0.0))
+        track_already_owned(db, 'Anything', 'Artist', 'Album', 'plex', candidate_tracks=[])
+        assert db.calls[0]['candidate_tracks'] == []
+        assert db.calls[0]['candidate_tracks_exhaustive'] is False
 
     def test_default_omits_candidate_tracks_for_legacy_callers(self):
         """Callers that don't pre-fetch get None → check_track_exists keeps its

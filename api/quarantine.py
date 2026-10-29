@@ -33,17 +33,23 @@ _post_process_matched_download = None
 _post_process_matched_download_with_verification = None
 _download_orchestrator = None
 _matching_engine = None
+get_database = None
+_automation_engine = None
+_web_scan_manager = None
 
 
 def configure(*, config_manager_, docker_resolve_path_,
               serve_audio_file_with_range, audio_mime_types,
               post_process_matched_download,
               post_process_matched_download_with_verification,
-              download_orchestrator_getter, matching_engine_getter):
+              download_orchestrator_getter, matching_engine_getter,
+              get_database_, automation_engine_getter,
+              web_scan_manager_getter):
     global config_manager, docker_resolve_path, _serve_audio_file_with_range
     global _AUDIO_MIME_TYPES, _post_process_matched_download
     global _post_process_matched_download_with_verification
     global _download_orchestrator, _matching_engine
+    global get_database, _automation_engine, _web_scan_manager
     config_manager = config_manager_
     docker_resolve_path = docker_resolve_path_
     _serve_audio_file_with_range = serve_audio_file_with_range
@@ -53,6 +59,11 @@ def configure(*, config_manager_, docker_resolve_path_,
         post_process_matched_download_with_verification)
     _download_orchestrator = download_orchestrator_getter
     _matching_engine = matching_engine_getter
+    get_database = get_database_
+    # Rebindable at boot like the orchestrator pair, so the approve path sees
+    # the live objects rather than whatever was None when this ran.
+    _automation_engine = automation_engine_getter
+    _web_scan_manager = web_scan_manager_getter
 
 
 bp = Blueprint('quarantine', __name__)
@@ -88,9 +99,45 @@ def _get_quarantine_dir():
 def list_quarantine():
     """Return all quarantined files with sidecar metadata."""
     try:
-        from core.imports.quarantine import list_quarantine_entries
-        entries = list_quarantine_entries(_get_quarantine_dir())
-        return jsonify({"success": True, "entries": entries})
+        limit = None
+        offset = 0
+        raw_limit = request.args.get('limit')
+        raw_offset = request.args.get('offset')
+        if raw_limit is not None:
+            if not (raw_limit.isascii() and raw_limit.isdigit() and len(raw_limit) <= 10):
+                return jsonify({"success": False, "error": "limit must be a non-negative integer"}), 400
+            limit = int(raw_limit)
+            if limit < 1:
+                return jsonify({"success": False, "error": "limit must be at least 1"}), 400
+            # Clamp rather than error: client paging advances by the returned
+            # length, so a clamped page is safe and still makes progress.
+            if limit > 500:
+                limit = 500
+        if raw_offset is not None:
+            if not (raw_offset.isascii() and raw_offset.isdigit() and len(raw_offset) <= 10):
+                return jsonify({"success": False, "error": "offset must be a non-negative integer"}), 400
+            offset = int(raw_offset)
+        paginated = limit is not None or raw_offset is not None
+        if paginated:
+            from core.imports.quarantine import (
+                count_quarantine_entries, list_quarantine_entries)
+            entries = list_quarantine_entries(
+                _get_quarantine_dir(), limit=limit, offset=offset)
+            # One entry exists per .quarantined file, so the listdir-only
+            # count equals the full (unpaged) list length.
+            total = count_quarantine_entries(_get_quarantine_dir())
+        else:
+            from core.imports.quarantine import list_quarantine_entries
+            entries = list_quarantine_entries(_get_quarantine_dir())
+            total = len(entries)
+        from core.imports.quarantine_library import annotate_quarantine_library
+        annotate_quarantine_library(entries, _get_quarantine_dir(), config_manager)
+        payload = {"success": True, "entries": entries, "total": total}
+        if paginated:
+            payload["offset"] = offset
+        if limit is not None:
+            payload["limit"] = limit
+        return jsonify(payload)
     except Exception as e:
         logger.error(f"[Quarantine] Error listing entries: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
@@ -200,6 +247,13 @@ def approve_quarantine_item(entry_id):
         # for this one restored pass so multi-reason failures do not loop.
         context['_skip_quarantine_check'] = 'all'
         context['_approved_quarantine_trigger'] = trigger
+        # Acquisition tracks: the approve resolves this track by hand, so the
+        # persistent retry walk must not be resumable after a restart.
+        try:
+            from core.acquisition.pipeline_callback import notify_quarantine_approved
+            notify_quarantine_approved(context)
+        except Exception as _acq_journal_exc:
+            logger.debug(f"[Quarantine] acquisition retry journal close skipped: {_acq_journal_exc}")
         # If the caller (download-modal chooser) passed the originating task, run
         # the re-import through the verification WRAPPER with that task_id so the
         # task is marked completed on success — otherwise the modal row stays
@@ -234,7 +288,42 @@ def approve_quarantine_item(entry_id):
                 context_key, context, restored_path, _task_id, _batch_id,
             )
         else:
-            _reprocess = lambda: _post_process_matched_download(context_key, context, restored_path)
+            def _reprocess():
+                _post_process_matched_download(context_key, context, restored_path)
+                # A manager approval can outlive its original in-memory task.
+                # Without a batch completion callback, external media servers
+                # never learn about the newly imported file. Request the same
+                # coalesced scan used by direct downloads, but only after the
+                # pipeline produced a real final file and no rejection flag.
+                try:
+                    from core.imports.pipeline import import_rejection_reason
+                    automation_engine = _automation_engine()
+                    web_scan_manager = _web_scan_manager()
+                    final_path = (
+                        context.get('_final_processed_path')
+                        or context.get('_final_path')
+                    )
+                    auto_scan_on = (
+                        automation_engine is None
+                        or automation_engine.is_event_action_enabled(
+                            'batch_complete', 'scan_library'
+                        )
+                    )
+                    if (
+                        web_scan_manager
+                        and auto_scan_on
+                        and final_path
+                        and os.path.isfile(final_path)
+                        and import_rejection_reason(context) is None
+                    ):
+                        web_scan_manager.request_scan(
+                            "Quarantine approval completed"
+                        )
+                except Exception as scan_exc:
+                    logger.warning(
+                        "[Quarantine] Post-approval media scan failed: %s",
+                        scan_exc,
+                    )
         threading.Thread(target=_reprocess, daemon=True).start()
         logger.info(f"[Quarantine] Approved {entry_id} (original_trigger={trigger}, bypass=all, task={_task_id}) → re-running pipeline")
         # #876: once one alternative for a song is accepted, the other
@@ -447,12 +536,21 @@ def recover_quarantine_item(entry_id):
     """Fallback for legacy thin sidecars: move file into Staging so the user
     can manually finish via the existing Import flow."""
     try:
-        from core.imports.quarantine import recover_to_staging
+        from core.acquisition.recovery import recover_quarantine_entry_to_staging
         from core.imports.staging import get_staging_path
-        target = recover_to_staging(_get_quarantine_dir(), get_staging_path(), entry_id)
-        if not target:
+        recovery = recover_quarantine_entry_to_staging(
+            get_database()._get_connection,
+            quarantine_dir=_get_quarantine_dir(),
+            staging_dir=get_staging_path(),
+            entry_id=entry_id,
+        )
+        if not recovery:
             return jsonify({"success": False, "error": "Entry not found"}), 404
-        return jsonify({"success": True, "staged_path": target})
+        return jsonify({
+            "success": True,
+            "staged_path": recovery.staged_path,
+            "recovery": recovery.to_public_dict(),
+        })
     except Exception as e:
         logger.error(f"[Quarantine] Error recovering {entry_id}: {e}")
         return jsonify({"success": False, "error": str(e)}), 500

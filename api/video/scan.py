@@ -21,20 +21,29 @@ def register_routes(bp):
     def video_scan_request():
         from . import get_video_db
         from core.video.scanner import get_video_scanner
-        from core.video.sources import get_active_video_source
+        from core.video.sources import scan_video_source
         body = request.get_json(silent=True) or {}
         mode = body.get("mode", "full")
         # Which library to scan — movies and TV are independent libraries, so the
         # UI can target one or both. The scanner normalizes/validates it.
         media_type = body.get("media_type", "all")
         scanner = get_video_scanner(get_video_db())
-        return jsonify(scanner.request_scan(get_active_video_source, mode, media_type))
+        return jsonify(scanner.request_scan(scan_video_source, mode, media_type))
 
     @bp.route("/scan/status", methods=["GET"])
     def video_scan_status():
         from . import get_video_db
         from core.video.scanner import get_video_scanner
-        return jsonify(get_video_scanner(get_video_db()).get_status())
+        from core.video.stats import _iso_utc
+        db = get_video_db()
+        status = dict(get_video_scanner(db).get_status() or {})
+        # when the whole library was last read in, so the tools card can say
+        # "last scan: 2 days ago" instead of "Never" after every reload
+        try:
+            status.setdefault("last_scan_at", _iso_utc(db.get_setting("video_last_scan_at")))
+        except Exception:   # noqa: BLE001 - a nicety on a status poll
+            status.setdefault("last_scan_at", None)
+        return jsonify(status)
 
     @bp.route("/scan/stop", methods=["POST"])
     def video_scan_stop():

@@ -5,6 +5,15 @@
  * module is pinned differentially in -sync.autosync.test.ts.
  */
 
+import {
+  humanizeType as autoSyncHumanizeType,
+  parseServerTime as autoSyncParseUTC,
+} from '@/features/automations/format';
+
+import { isLiveBeatportRef } from './-beatport.lists';
+
+export { autoSyncHumanizeType, autoSyncParseUTC };
+
 /* ── Constants (auto-sync.js 12, 106-110) ─────────────────────────────────── */
 
 export const AUTO_SYNC_BUCKETS: readonly number[] = [1, 2, 4, 8, 12, 16, 24, 48, 72, 168];
@@ -49,7 +58,11 @@ export interface MirroredRow {
   kind?: string;
   variant?: string;
   kind_label?: string;
+  /** The variant as a person reads it ('Electronic/Dance', not 'electronic_dance'). */
+  variant_label?: string;
   _personalized?: boolean;
+  /** A personalized playlist that has never been built: its 0 is "nothing yet", not empty. */
+  _never_generated?: boolean;
   /** The board's organize-by-playlist preference (1921). */
   organize_by_playlist?: boolean;
   /**
@@ -64,8 +77,25 @@ export interface MirroredRow {
 export interface PersonalizedKind {
   kind?: string;
   name_template?: string;
+  description?: string;
   requires_variant?: boolean;
   variants?: (string | number)[];
+  /** variant key -> readable label, from /api/personalized/kinds. */
+  variant_labels?: Record<string, string>;
+}
+
+/** A variant as a person reads it, the key when the kind sends no label. */
+export function autoSyncVariantLabel(
+  k: PersonalizedKind | null | undefined,
+  variant: string,
+): string {
+  return (k && k.variant_labels && k.variant_labels[variant]) || variant;
+}
+
+/** The count line: a never-built playlist isn't an empty one. */
+export function autoSyncTrackCountText(playlist: MirroredRow): string {
+  if (playlist._never_generated) return 'Not built yet';
+  return `${parseInt(String(playlist.track_count), 10) || 0} tracks`;
 }
 
 export interface AutomationRow {
@@ -261,29 +291,54 @@ export function autoSyncSourceLabel(source: string | null | undefined): string {
 }
 
 /**
- * file + beatport have no external refresh hook; lastfm radios are
- * seed-specific snapshots that never change upstream — re-syncing would just
- * re-discover the same tracks, so they are excluded from the board.
+ * a beatport mirror refreshes when its id is a live list ref (the same rule as
+ * core/playlists/sources/beatport.py is_refreshable_mirror): the homepage
+ * lists, a genre's lists, or a chart. an old random chart hash and a release
+ * (which never changes) don't.
+ */
+export function beatportMirrorRefreshes(playlist: MirroredRow | null | undefined): boolean {
+  return isLiveBeatportRef(playlist?.source_playlist_id);
+}
+
+/** a dated snapshot of a beatport list: '<ref>@2026-10-16'. frozen, never refreshes. */
+export function beatportMirrorIsSnapshot(playlist: MirroredRow | null | undefined): boolean {
+  const id = String(playlist?.source_playlist_id ?? '').toLowerCase();
+  const at = id.lastIndexOf('@');
+  if (at < 0 || !/^\d{4}-\d{2}-\d{2}$/.test(id.slice(at + 1))) return false;
+  const ref = id.slice(0, at);
+  return isLiveBeatportRef(ref) || /^release:[a-z0-9][a-z0-9-]*:\d+$/.test(ref);
+}
+
+/**
+ * file has no external refresh hook, nor does a beatport mirror that isn't a
+ * live list; lastfm radios are seed-specific snapshots that never change
+ * upstream — re-syncing would just re-discover the same tracks, so they are
+ * excluded from the board.
  */
 export function autoSyncCanSchedulePlaylist(playlist: MirroredRow | null | undefined): boolean {
   if (!playlist) return false;
   const src = playlist.source || '';
-  return !['file', 'beatport', 'lastfm'].includes(src);
+  if (src === 'beatport') return beatportMirrorRefreshes(playlist);
+  return !['file', 'lastfm'].includes(src);
 }
 
 /**
  * Whether an all-playlists pipeline actually processes this playlist.
- * Mirrors the backend filter (pipeline.py:325, refresh_mirrored.py:78):
- * file/beatport sources are skipped. NOTE: lastfm is NOT excluded here —
- * the backend processes it, even though autoSyncCanSchedulePlaylist won't
- * let you schedule it directly.
+ * Mirrors the backend filter (user_playlists.pipeline_runs): file is skipped,
+ * and so is a beatport mirror that is neither a live list nor a dated snapshot.
+ * NOTE: lastfm and snapshots are NOT excluded here — the backend processes
+ * them, even though autoSyncCanSchedulePlaylist won't let you schedule them.
  */
 export function autoSyncPipelineCoversPlaylist(
-  playlist: { source?: string | null } | null | undefined,
+  playlist: { source?: string | null; source_playlist_id?: string | number } | null | undefined,
 ): boolean {
   if (!playlist) return false;
   const src = playlist.source || '';
-  return !['file', 'beatport'].includes(src);
+  if (src === 'beatport') {
+    const row = playlist as MirroredRow;
+    return beatportMirrorRefreshes(row) || beatportMirrorIsSnapshot(row);
+  }
+  return src !== 'file';
 }
 
 /* ── Automation linkage (auto-sync.js 218-241) ────────────────────────────── */
@@ -365,10 +420,12 @@ export function autoSyncEnrichDiscoveryRows(
     }
     const vk = variantKinds.find((v) => sid.startsWith(v.prefix));
     if (vk) {
+      const variant = sid.slice(vk.prefix.length);
       out.push({
         ...p,
         kind: vk.k.kind,
-        variant: sid.slice(vk.prefix.length),
+        variant,
+        variant_label: autoSyncVariantLabel(vk.k, variant),
         kind_label: autoSyncKindLabel(vk.k),
       });
       continue;
@@ -421,11 +478,13 @@ export function autoSyncExpandPersonalizedRows(
       const variant = k.requires_variant ? String(raw) : '';
       const ssdId = `ssd_${k.kind}${variant ? `_${variant}` : ''}`;
       if (existingSsd.has(ssdId)) continue;
+      const label = autoSyncVariantLabel(k, variant);
       const name = k.requires_variant
-        ? String(k.name_template || `${k.kind} ${variant}`).replace('{variant}', variant)
+        ? String(k.name_template || `${k.kind} ${variant}`).replace('{variant}', label)
         : String(k.name_template || k.kind);
       const kindLabel = k.requires_variant ? autoSyncKindLabel(k) : '';
-      const generated = generatedCounts ? generatedCounts.get(`${k.kind} ${variant}`) || 0 : 0;
+      const key = `${k.kind} ${variant}`;
+      const generated = generatedCounts ? generatedCounts.get(key) || 0 : 0;
       rows.push({
         id: nextId--,
         source: 'soulsync_discovery',
@@ -433,7 +492,10 @@ export function autoSyncExpandPersonalizedRows(
         track_count: generated,
         kind: k.kind,
         variant,
+        variant_label: label,
         kind_label: kindLabel,
+        // no generated row at all: "0 tracks" read as an empty playlist
+        _never_generated: generatedCounts ? !generatedCounts.has(key) : false,
         source_playlist_id: ssdId,
         _personalized: true,
       });
@@ -442,14 +504,60 @@ export function autoSyncExpandPersonalizedRows(
   return rows;
 }
 
+/** Every personalized kind; the ones that take a variant are suffixed `_<variant>` in ssd ids. */
+const SSD_KINDS = [
+  'daily_mix',
+  'listening_mix',
+  'fresh_tape',
+  'archives',
+  'hidden_gems',
+  'discovery_shuffle',
+  'popular_picks',
+  'time_machine',
+  'genre_playlist',
+  'seasonal_mix',
+];
+const SSD_VARIANT_KINDS = new Set(['daily_mix', 'time_machine', 'genre_playlist', 'seasonal_mix']);
+
+/**
+ * The personalized playlist a SoulSync Discovery row stands for, or null.
+ * A synthetic or enriched row carries kind/variant; a mirror made by "Refresh
+ * & Mirror" may only carry its `ssd_<kind>[_<variant>]` id.
+ */
+export function autoSyncSsdTarget(
+  row: MirroredRow | null | undefined,
+): { kind: string; variant: string } | null {
+  if (!row || row.source !== 'soulsync_discovery') return null;
+  if (row.kind) return { kind: row.kind, variant: row.variant || '' };
+  const sid = String(row.source_playlist_id || '');
+  if (!sid.startsWith('ssd_')) return null;
+  const rest = sid.slice(4);
+  for (const kind of [...SSD_KINDS].sort((a, b) => b.length - a.length)) {
+    if (rest === kind) return { kind, variant: '' };
+    if (SSD_VARIANT_KINDS.has(kind) && rest.startsWith(`${kind}_`)) {
+      return { kind, variant: rest.slice(kind.length + 1) };
+    }
+  }
+  return null;
+}
+
+/** The ssd id a personalized kind/variant mirrors under. */
+export function autoSyncSsdId(target: { kind: string; variant: string }): string {
+  return `ssd_${target.kind}${target.variant ? `_${target.variant}` : ''}`;
+}
+
 /** The automation payload scheduling a board row creates (auto-sync.js 355-371). */
 export function autoSyncActionForPlaylist(
   playlist: MirroredRow | null | undefined,
   playlistId: number | string,
 ): { action_type: string; action_config: Record<string, unknown> } {
-  if (playlist && playlist._personalized) {
-    const entry: Record<string, unknown> = { kind: playlist.kind };
-    if (playlist.variant) entry.variant = playlist.variant;
+  // a discovery mirror is scheduled as its personalized playlist, the same
+  // automation the sidebar makes for it. a playlist pipeline on the mirror
+  // ran beside that one and pushed the same playlist twice
+  const target = playlist && (playlist._personalized ? playlist : autoSyncSsdTarget(playlist));
+  if (target && target.kind) {
+    const entry: Record<string, unknown> = { kind: target.kind };
+    if (target.variant) entry.variant = target.variant;
     return {
       action_type: 'personalized_pipeline',
       action_config: { kinds: [entry], refresh_first: true },
@@ -535,6 +643,12 @@ export interface AutoSyncScheduleEntry {
   owned: true;
   next_run?: string | null;
   trigger_config: unknown;
+  /**
+   * the row's own config, so a reschedule from the board keeps what was set
+   * in the builder (a pipeline's sync_mode, skip_wishlist) instead of
+   * replacing it with the board's bare payload (#1704)
+   */
+  action_config?: Record<string, unknown>;
 }
 
 export interface AutoSyncHourlyEntry extends AutoSyncScheduleEntry {
@@ -621,6 +735,7 @@ export function buildAutoSyncScheduleState(
           owned: true,
           next_run: auto.next_run,
           trigger_config: auto.trigger_config || {},
+          action_config: auto.action_config || {},
         };
         return;
       }
@@ -639,6 +754,7 @@ export function buildAutoSyncScheduleState(
           owned: true,
           next_run: auto.next_run,
           trigger_config: auto.trigger_config || {},
+          action_config: auto.action_config || {},
         };
         return;
       }
@@ -666,6 +782,7 @@ export function buildAutoSyncScheduleState(
           owned: true,
           next_run: auto.next_run,
           trigger_config: auto.trigger_config || {},
+          action_config: auto.action_config || {},
         };
       }
     } else if (auto.trigger_type === 'weekly_time') {
@@ -681,6 +798,7 @@ export function buildAutoSyncScheduleState(
           owned: true,
           next_run: auto.next_run,
           trigger_config: auto.trigger_config || {},
+          action_config: auto.action_config || {},
         };
       }
     }
@@ -785,16 +903,6 @@ export function autoSyncBuildLanes(
       (p) => playlistSchedules?.[String(p?.id)]?.hours === hours,
     ),
   }));
-}
-
-/**
- * stats-automations.js 4260-4264, reached from auto-sync.js 1863/2002 as a
- * cross-file global. A bare timestamp is UTC, so it gets a 'Z' appended; one
- * that already carries an offset is parsed as-is.
- */
-export function autoSyncParseUTC(ts: string): number {
-  if (/[Zz]$/.test(ts) || /[+-]\d{2}:\d{2}$/.test(ts)) return new Date(ts).getTime();
-  return new Date(`${ts}Z`).getTime();
 }
 
 /**
@@ -1000,21 +1108,6 @@ export function autoSyncPipelineLatestLog(state: PipelineState | null | undefine
 
 /* ── The read-only Automations panel (1185-1198, 1883-1918) ─────────────── */
 
-/**
- * stats-automations.js 4144-4152. 'deep_scan_library' → 'Deep Scan Library'.
- * The video/music prefix is stripped first.
- */
-export function autoSyncHumanizeType(type: string | null | undefined): string {
-  return (
-    String(type || '')
-      .replace(/^(video|music)_/, '')
-      .split('_')
-      .filter(Boolean)
-      .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-      .join(' ') || 'Unknown'
-  );
-}
-
 const TRIGGER_LABELS: Record<string, string> = {
   app_started: 'App Started',
   track_downloaded: 'Track Downloaded',
@@ -1028,11 +1121,23 @@ const TRIGGER_LABELS: Record<string, string> = {
   database_update_completed: 'Database Updated',
   download_failed: 'Download Failed',
   download_quarantined: 'File Quarantined',
+  deezer_signin_failed: 'Deezer Sign-in Failed',
+  deezer_signin_restored: 'Deezer Sign-in Restored',
   wishlist_item_added: 'Wishlist Item Added',
   watchlist_artist_added: 'Artist Watched',
   watchlist_artist_removed: 'Artist Unwatched',
   import_completed: 'Import Complete',
   import_needs_attention: 'Import Needs Attention',
+  audiobook_grab_started: 'Audiobook Grabbed',
+  audiobook_download_failed: 'Audiobook Download Failed',
+  audiobook_import_needs_attention: 'Audiobook Import Held',
+  audiobook_wishlist_item_added: 'Audiobook Wishlist Item Added',
+  audiobook_wishlist_processing_completed: 'Audiobook Wishlist Processed',
+  audiobook_new_release: 'Audiobook New Release Found',
+  audiobook_watchlist_scan_completed: 'Audiobook Watchlist Scan Done',
+  audiobook_author_followed: 'Audiobook Author Followed',
+  audiobook_author_unfollowed: 'Audiobook Author Unfollowed',
+  audiobook_library_scan_completed: 'Audiobook Library Scan Done',
   mirrored_playlist_created: 'Playlist Mirrored',
   quality_scan_completed: 'Quality Scan Done',
   duplicate_scan_completed: 'Duplicate Scan Done',
@@ -1409,6 +1514,8 @@ export function autoSyncHistoryResultPills(
       ['Synced', result.tracks_synced],
       ['Skipped', result.sync_skipped],
       ['Wishlisted', result.wishlist_queued],
+      // only when something failed: "Sync errors 0" on every clean run is noise
+      ['Sync errors', Number(result.sync_errors) > 0 ? result.sync_errors : undefined],
     ] as [string, unknown][]
   )
     .filter(([, v]) => v !== undefined && v !== null && v !== '')
@@ -1516,12 +1623,17 @@ export function autoSyncSchedulePayload(
   playlist: MirroredRow,
   playlistId: number | string,
   trigger: { trigger_type: string; trigger_config: unknown },
+  existingConfig?: Record<string, unknown> | null,
 ): Record<string, unknown> {
+  const action = autoSyncActionForPlaylist(playlist, playlistId);
   return {
     name: `Auto-Sync: ${playlist.name}`,
     trigger_type: trigger.trigger_type,
     trigger_config: trigger.trigger_config,
-    ...autoSyncActionForPlaylist(playlist, playlistId),
+    action_type: action.action_type,
+    // the board's target keys win, anything else the row already had (a
+    // sync_mode set in the builder) rides along (#1704)
+    action_config: { ...existingConfig, ...action.action_config },
     then_actions: [],
     group_name: 'Playlist Auto-Sync',
     owned_by: 'auto_sync',

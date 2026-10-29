@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import socket
 import threading
@@ -21,8 +22,12 @@ from core.imports.context import (
     get_import_source_ids,
     get_import_track_info,
     get_source_tag_names,
+    has_real_album_name,
+    is_real_provider_album_id,
     normalize_import_context,
 )
+from core.imports.collab_artist import first_listed_artist, listed_primary_of
+from core.imports.compilation import VARIOUS_ARTIST_NAMES
 from core.metadata.artist_resolution import resolve_track_artists
 from core.metadata.registry import get_itunes_client
 from database.music_database import get_database
@@ -163,7 +168,8 @@ SOURCE_TAG_CONFIG = {
     "GENIUS_TRACK_ID": "genius.tags.track_id",
 }
 
-DEFAULT_SOURCE_ORDER = ["musicbrainz", "deezer", "audiodb", "jiosaavn", "tidal", "hifi", "qobuz", "lastfm", "genius", "bandcamp"]
+# beatport goes last: it looks a track up by the isrc the sources before it found
+DEFAULT_SOURCE_ORDER = ["musicbrainz", "deezer", "audiodb", "jiosaavn", "tidal", "hifi", "qobuz", "lastfm", "genius", "bandcamp", "beatport"]
 
 ID3_TAG_MAP = {
     "MUSICBRAINZ_RECORDING_ID": ("UFID", "http://musicbrainz.org"),
@@ -276,6 +282,17 @@ def _collect_source_ids(metadata: dict, cfg) -> dict:
             if metadata.get("itunes_album_id"):
                 source_ids["ITUNES_ALBUM_ID"] = metadata["itunes_album_id"]
 
+    # Native catalogue callers carry every already confirmed identity. Use
+    # the existing namespace/frame map and each provider's embed switch.
+    for provider, ids in (metadata.get('known_source_ids') or {}).items():
+        if not isinstance(ids, dict) or cfg.get(f'{provider}.embed_tags', True) is False:
+            continue
+        names = get_source_tag_names(provider)
+        for kind in ('track', 'artist', 'album'):
+            tag = names.get(kind) or f'{provider.upper()}_{kind.upper()}_ID'
+            if (ids.get(kind) and (names.get(kind) or tag in SOURCE_TAG_CONFIG)
+                    and cfg.get(SOURCE_TAG_CONFIG.get(tag, f'{provider}.tags.{kind}_id'), True) is not False):
+                source_ids[tag] = ids[kind]
     return source_ids
 
 
@@ -320,6 +337,51 @@ def _cached_mb_artist_details(mb_service, artist_mbid: str) -> Optional[Dict[str
                 mb_artist_detail_cache, key, detail, _MB_ARTIST_DETAIL_CACHE_MAX_ENTRIES
             )
     return detail
+
+
+def _isrc_tag_value(audio) -> Optional[str]:
+    """The ISRC out of an already-parsed mutagen file object, or None."""
+    for key in ("TSRC", "ISRC", "isrc", "WM/ISRC", "----:com.apple.iTunes:ISRC"):
+        try:
+            value = audio.get(key)
+        except Exception:  # noqa: BLE001, S112 — one bad frame says nothing about the others
+            continue
+        if not value:
+            continue
+        if isinstance(value, (list, tuple)):
+            value = value[0] if value else None
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", "ignore")
+        text = str(value or "").strip()
+        if text:
+            return text
+    return None
+
+
+def _audio_file_probes(audio_file):
+    """(isrc, duration_ms) for the MusicBrainz pass from ONE parse.
+
+    `_process_musicbrainz_source` needs both values for the same file;
+    parsing it twice (once per probe) doubled the mutagen I/O on every
+    post-processed download. Same fail-soft contract as the individual
+    probes: (None, None) when anything is unknown or unreadable.
+    """
+    if not audio_file:
+        return None, None
+    try:
+        symbols = get_mutagen_symbols()
+        if not symbols:
+            return None, None
+        audio = symbols.File(str(audio_file))
+        if audio is None:
+            return None, None
+        duration_ms = None
+        length = getattr(getattr(audio, "info", None), "length", None)
+        if length and float(length) > 0:
+            duration_ms = int(float(length) * 1000)
+        return _isrc_tag_value(audio), duration_ms
+    except Exception:  # noqa: BLE001, S110 — probe failure means 'unknown', never a reject
+        return None, None
 
 
 def _audio_file_duration_ms(audio_file) -> Optional[int]:
@@ -369,10 +431,34 @@ def _process_musicbrainz_source(pp: dict, metadata: dict, cfg, runtime, track_ti
 
     details = {}
     searched_recording = None
+    # #1705: the track's ISRC, from wherever this pipeline already knows
+    # it. The downloaded file's own embedded tag is probed FIRST: it
+    # describes these exact bytes, while source metadata describes the
+    # listing the download claimed to be — when the two disagree (a
+    # radio-edit ISRC on an album-version listing), the file is the one
+    # being matched. The remaining sources, in order: the download's
+    # source metadata, then the pp ISRC slots seeded from the download's
+    # cached metadata before the source loop (tidal/hifi; the deezer /
+    # qobuz slots are also read for custom post-process orders that run
+    # those sources before musicbrainz — in the default order they are
+    # still empty here). Nothing is probed when a release is pinned:
+    # the recording lookup is skipped entirely then, and a mutagen
+    # parse spent on a value nobody reads is waste.
+    track_isrc = None
+    file_duration_ms = None
+    if not pinned_release:
+        file_isrc, file_duration_ms = _audio_file_probes(audio_file)
+        track_isrc = (
+            file_isrc
+            or metadata.get("isrc")
+            or pp.get("tidal_isrc") or pp.get("hifi_isrc")
+            or pp.get("deezer_isrc") or pp.get("qobuz_isrc")
+        )
     result = None if pinned_release else _call_source_lookup(
         "MusicBrainz recording", mb_service.match_recording, track_title, artist_name,
         artist_mbid=pp.get("artist_mbid"),
-        duration_ms=_audio_file_duration_ms(audio_file))
+        duration_ms=file_duration_ms,
+        isrc=track_isrc)
     if result and result.get("mbid"):
         pp["recording_mbid"] = result["mbid"]
         searched_recording = result["mbid"]
@@ -469,7 +555,8 @@ def _process_musicbrainz_source(pp: dict, metadata: dict, cfg, runtime, track_ti
         from core.metadata.musicbrainz_tags import release_by_artist
         expected_artists = [pp.get("batch_artist_name"), artist_name, metadata.get("album_artist")]
         if (release_detail and not pinned_release
-                and not release_by_artist(release_detail, expected_artists, pp.get("artist_mbid"))):
+                and not release_by_artist(release_detail, expected_artists, pp.get("artist_mbid"),
+                                          mbid_name=track_artist_name)):
             logger.info("MusicBrainz release %s is not by '%s'; not using it",
                         pp["release_mbid"], pp.get("batch_artist_name") or artist_name)
             release_detail = {}
@@ -936,7 +1023,59 @@ def _process_bandcamp_source(pp: dict, metadata: dict, cfg, runtime, track_title
             pp["bandcamp_label"] = bc_label
 
 
-def _process_source_enrichment(source_name: str, pp: dict, metadata: dict, cfg, runtime, track_title: str, artist_name: str, provenance=None, audio_file=None) -> None:
+def _known_isrc(pp: dict, metadata: dict, audio_file=None) -> Optional[str]:
+    """the isrc any earlier source, the download or the file already has."""
+    for value in (pp.get("isrc"), pp.get("deezer_isrc"), pp.get("tidal_isrc"), pp.get("hifi_isrc"),
+                  pp.get("qobuz_isrc"), metadata.get("isrc")):
+        if value:
+            return str(value)
+    if audio_file is not None:
+        try:
+            return _isrc_tag_value(audio_file)
+        except Exception:
+            return None
+    return None
+
+
+def _process_beatport_source(pp: dict, metadata: dict, cfg, runtime, track_title: str, artist_name: str,
+                             audio_file=None) -> None:
+    """bpm, key, label, catalog number and genre from beatport, for the exact
+    recording (core/beatport/enrich.py). free when the track came in through a
+    beatport list; a beatport search only for tracks that look electronic,
+    unless beatport.search_all_tracks is on."""
+    if cfg.get("beatport.embed_tags", True) is False:
+        return
+    isrc = _known_isrc(pp, metadata, audio_file)
+    if not isrc:
+        return
+    from core.beatport.enrich import lookup, looks_electronic
+    genres = (list(pp.get("mb_genres") or []) + list(pp.get("lastfm_tags") or [])
+              + list(pp.get("bandcamp_tags") or [])
+              + [pp.get("audiodb_genre"), pp.get("audiodb_style"), metadata.get("genre")])
+    allow_search = cfg.get("beatport.search_all_tracks", False) is True or looks_electronic(genres)
+    result = _call_source_lookup("Beatport track", lookup, isrc, artist_name, track_title,
+                                 allow_search=allow_search)
+    if result:
+        pp["beatport"] = result
+
+
+def _write_initial_key(audio_file, key: str, symbols) -> None:
+    if isinstance(audio_file.tags, symbols.ID3):
+        factory = getattr(symbols, "TKEY", None)
+        if factory is None:
+            from mutagen.id3 import TKEY as factory
+        audio_file.tags.add(factory(encoding=3, text=[key]))
+    elif is_vorbis_like(audio_file, symbols):
+        audio_file["INITIALKEY"] = [key]
+    elif isinstance(audio_file, symbols.MP4):
+        audio_file["----:com.apple.iTunes:initialkey"] = [symbols.MP4FreeForm(key.encode("utf-8"))]
+
+
+def _process_source_enrichment(source_name: str, pp: dict, metadata: dict, cfg, runtime, track_title: str, artist_name: str, provenance=None, audio_file=None, track_artist_name: str = None) -> None:
+    # #1567: lastfm/genius do TRACK-level lookups (track info / song search)
+    # — key them on the track artist, not the album artist. Every other
+    # source keeps the album_artist-preferred name.
+    _track_artist = track_artist_name or artist_name
     if source_name == "musicbrainz":
         _process_musicbrainz_source(pp, metadata, cfg, runtime, track_title, artist_name, audio_file=audio_file)
     elif source_name == "deezer":
@@ -952,11 +1091,13 @@ def _process_source_enrichment(source_name: str, pp: dict, metadata: dict, cfg, 
     elif source_name == "qobuz":
         _process_qobuz_source(pp, metadata, cfg, runtime, track_title, artist_name)
     elif source_name == "lastfm":
-        _process_lastfm_source(pp, metadata, cfg, runtime, track_title, artist_name)
+        _process_lastfm_source(pp, metadata, cfg, runtime, track_title, _track_artist)
     elif source_name == "genius":
-        _process_genius_source(pp, metadata, cfg, runtime, track_title, artist_name)
+        _process_genius_source(pp, metadata, cfg, runtime, track_title, _track_artist)
     elif source_name == "bandcamp":
         _process_bandcamp_source(pp, metadata, cfg, runtime, track_title, artist_name)
+    elif source_name == "beatport":
+        _process_beatport_source(pp, metadata, cfg, runtime, track_title, _track_artist, audio_file=audio_file)
 
 
 def _more_precise_date(existing: Any, new: Any) -> str:
@@ -1116,7 +1257,15 @@ def _write_embedded_metadata(audio_file, metadata: dict, pp: dict, cfg, symbols)
             audio_file["\xa9day"] = [release_year]
         logger.info("Date tag: %s", release_year)
 
+    beatport = pp.get("beatport") or {}
     bpm_candidates = []
+    # beatport's bpm is the label's own, so it goes first when there is one
+    if beatport.get("bpm") and _tag_enabled(cfg, "beatport.tags.bpm"):
+        try:
+            if float(beatport["bpm"]) > 0:
+                bpm_candidates.append(("Beatport", beatport["bpm"]))
+        except (TypeError, ValueError):
+            pass
     if pp["deezer_bpm"] and pp["deezer_bpm"] > 0 and _tag_enabled(cfg, "deezer.tags.bpm"):
         bpm_candidates.append(("Deezer", pp["deezer_bpm"]))
     if pp["tidal_bpm"] and pp["tidal_bpm"] > 0 and _tag_enabled(cfg, "tidal.tags.bpm"):
@@ -1124,15 +1273,38 @@ def _write_embedded_metadata(audio_file, metadata: dict, pp: dict, cfg, symbols)
     if pp["hifi_bpm"] and pp["hifi_bpm"] > 0 and _tag_enabled(cfg, "hifi.tags.bpm"):
         bpm_candidates.append(("HiFi", pp["hifi_bpm"]))
     if bpm_candidates:
-        bpm_source, bpm_val = bpm_candidates[0]
-        bpm_int = int(bpm_val)
-        if isinstance(audio_file.tags, symbols.ID3):
-            audio_file.tags.add(symbols.TBPM(encoding=3, text=[str(bpm_int)]))
-        elif is_vorbis_like(audio_file, symbols):
-            audio_file["BPM"] = [str(bpm_int)]
-        elif isinstance(audio_file, symbols.MP4):
-            audio_file["tmpo"] = [bpm_int]
-        logger.info("BPM (%s): %s", bpm_source, bpm_int)
+        # Store through tag_writer's _stored_bpm — the one stored form
+        # every BPM writer uses and build_tag_diff compares against, so
+        # an enrichment-written BPM does not preview as changed
+        # afterwards (#1871). It also guards non-finite/non-numeric
+        # candidates (returns None) instead of raising here; a candidate
+        # with no stored form falls through to the next source rather
+        # than skipping BPM entirely. Local import, matching this
+        # module's style, avoids any import-order coupling with
+        # core.tag_writer.
+        from core.tag_writer import _stored_bpm
+        bpm_int = None
+        bpm_source = None
+        for cand_source, bpm_val in bpm_candidates:
+            stored = _stored_bpm(bpm_val)
+            if stored is not None:
+                bpm_source, bpm_int = cand_source, stored
+                break
+        if bpm_int is not None:
+            if isinstance(audio_file.tags, symbols.ID3):
+                audio_file.tags.add(symbols.TBPM(encoding=3, text=[str(bpm_int)]))
+            elif is_vorbis_like(audio_file, symbols):
+                audio_file["BPM"] = [str(bpm_int)]
+            elif isinstance(audio_file, symbols.MP4):
+                audio_file["tmpo"] = [bpm_int]
+            logger.info("BPM (%s): %s", bpm_source, bpm_int)
+
+    if beatport.get("key") and _tag_enabled(cfg, "beatport.tags.key"):
+        from core.beatport.enrich import standard_key
+        initial_key = standard_key(beatport["key"])
+        if initial_key:
+            _write_initial_key(audio_file, initial_key, symbols)
+            logger.info("Key (Beatport): %s", initial_key)
 
     if _tag_enabled(cfg, "audiodb.tags.mood") and pp["audiodb_mood"]:
         if isinstance(audio_file.tags, symbols.ID3):
@@ -1160,6 +1332,8 @@ def _write_embedded_metadata(audio_file, metadata: dict, pp: dict, cfg, symbols)
             enrichment_genres += pp["lastfm_tags"]
         if pp["bandcamp_tags"] and _tag_enabled(cfg, "bandcamp.tags.genre_merge"):
             enrichment_genres += pp["bandcamp_tags"]
+        if beatport.get("genre") and _tag_enabled(cfg, "beatport.tags.genre_merge"):
+            enrichment_genres.append(beatport["genre"])
         if enrichment_genres:
             from core.genre_filter import filter_genres as _filter_genres
             from core.genre_filter import _normalize_for_match
@@ -1247,6 +1421,9 @@ def _write_embedded_metadata(audio_file, metadata: dict, pp: dict, cfg, symbols)
         label_candidates.append(("Qobuz", pp["qobuz_label"]))
     if pp["bandcamp_label"] and _tag_enabled(cfg, "bandcamp.tags.label"):
         label_candidates.append(("Bandcamp", pp["bandcamp_label"]))
+    if (beatport.get("label") and beatport["label"] != "Unknown Label"
+            and _tag_enabled(cfg, "beatport.tags.label")):
+        label_candidates.append(("Beatport", beatport["label"]))
     if label_candidates and "LABEL" not in filtered_tags:
         label_source, final_label = label_candidates[0]
         # "a;b;c" from a provider is three labels, written as three values (#1305)
@@ -1276,6 +1453,14 @@ def _write_embedded_metadata(audio_file, metadata: dict, pp: dict, cfg, symbols)
         elif isinstance(audio_file, symbols.MP4):
             audio_file["----:com.apple.iTunes:GENIUS_URL"] = [symbols.MP4FreeForm(pp["genius_url"].encode("utf-8"))]
 
+    if (beatport.get("catalog_number") and "CATALOGNUMBER" not in filtered_tags
+            and _tag_enabled(cfg, "beatport.tags.catalog_number")):
+        write_tag(audio_file, "CATALOGNUMBER", beatport["catalog_number"], symbols)
+        logger.info("Catalog number (Beatport): %s", beatport["catalog_number"])
+
+    if beatport.get("beatport_id") and _tag_enabled(cfg, "beatport.tags.track_id"):
+        write_tag(audio_file, "BEATPORT_TRACK_ID", str(beatport["beatport_id"]), symbols)
+
     if _tag_enabled(cfg, "bandcamp.tags.url") and pp["bandcamp_url"]:
         if isinstance(audio_file.tags, symbols.ID3):
             audio_file.tags.add(symbols.TXXX(encoding=3, desc="BANDCAMP_URL", text=[pp["bandcamp_url"]]))
@@ -1295,20 +1480,22 @@ def _update_album_year_in_database(db, metadata: dict, release_year) -> None:
         album_name_for_db = metadata.get("album", "")
         album_artist_for_db = metadata.get("album_artist", "") or metadata.get("artist", "")
         if album_name_for_db and album_artist_for_db:
+            from core.library2.importer import normalize_name
             conn = db._get_connection()
             try:
                 cursor = conn.cursor()
                 cursor.execute(
                     """
-                    UPDATE albums SET year = ?
+                    UPDATE lib2_albums SET year = ?
                     WHERE (year IS NULL OR year = 0)
                       AND id IN (
-                        SELECT al.id FROM albums al
-                        JOIN artists ar ON ar.id = al.artist_id
-                        WHERE LOWER(al.title) = LOWER(?) AND LOWER(ar.name) = LOWER(?)
+                        SELECT al.id FROM lib2_albums al
+                        JOIN lib2_artists ar ON ar.id = al.primary_artist_id
+                        WHERE LOWER(al.title) = LOWER(?) AND ar.name_key = ?
                       )
                     """,
-                    (int(release_year), album_name_for_db, album_artist_for_db),
+                    (int(release_year), album_name_for_db,
+                     normalize_name(album_artist_for_db)),
                 )
                 if cursor.rowcount > 0:
                     conn.commit()
@@ -1331,6 +1518,488 @@ def _album_artist_names(artists) -> list:
         if name and name != "Unknown Artist" and name not in names:
             names.append(name)
     return names if len(names) > 1 else []
+
+
+def _source_album_genres(album_ctx, source: str, source_ids: dict) -> list:
+    """the album's own genres: from the context when it has them, else from
+    deezer's /album/{id} (cached, the download already looked it up). only
+    deezer is asked, other sources keep genre on the artist. never raises."""
+    names = album_ctx.get("genres") if isinstance(album_ctx, dict) else None
+    if isinstance(names, list) and names:
+        return [str(g) for g in names if isinstance(g, str) and g.strip()]
+    album_id = str((source_ids or {}).get("album_id") or "")
+    if (source or "").strip().lower() != "deezer" or not album_id.isdigit():
+        return []
+    try:
+        from core.metadata.registry import get_deezer_client
+        album = get_deezer_client().get_album_metadata(album_id, include_tracks=False) or {}
+        return [g for g in (album.get("genres") or []) if isinstance(g, str) and g.strip()]
+    except Exception as e:
+        logger.debug("deezer album genres for %s: %s", album_id, e)
+        return []
+
+
+# VARIOUS_ARTIST_NAMES is the codebase's single shared various-artists
+# vocabulary (core/imports/compilation.py). A batch album context claiming
+# one of these is a genuine compilation, never a poisoned single-artist
+# claim (#1567).
+
+
+def _track_own_provider_album(
+    original_search: Optional[Dict[str, Any]],
+    track_info: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """#1567: the track's OWN provider album, resolved WITHOUT the batch album
+    context (which may be poisoned first-row-wins). Used as the fallback when
+    the batch album context is distrusted: whatever the track's own payload
+    names is safer than a stranger's album stamped on every track. Also used
+    as the ground-truth side of the album-identity comparison.
+
+    Returns {"name", "id", "id_source", "total_tracks", "release_date",
+    "image_url"} — any of which may be empty/0 when the track's own payload
+    carries no album data. ``id`` is the raw provider album id (may be a
+    pipeline placeholder — compare with is_real_provider_album_id, never raw
+    equality). ``id_source`` names which payload the id came from:
+    "spotify" for track_info.spotify_data, "search" for the original search
+    result (the download source's own payload, so its id family matches the
+    download source). R3F3: callers must not write a cross-source id into a
+    provider-namespaced column (a Spotify id in albums.deezer_id breaks the
+    Deezer worker's honor_stored_match permanently).
+    """
+    name = ""
+    album_id = ""
+    id_source = ""
+    total_tracks = 0
+    release_date = ""
+    image_url = ""
+
+    def _album_dict(payload):
+        alb = (payload or {}).get("album")
+        if isinstance(alb, str):
+            return {"name": alb}
+        return alb if isinstance(alb, dict) else {}
+
+    os_album = _album_dict(original_search if isinstance(original_search, dict) else {})
+    clean_album = (original_search or {}).get("clean_album") if isinstance(original_search, dict) else None
+    if isinstance(clean_album, str) and clean_album.strip():
+        name = clean_album.strip()
+    if not name:
+        v = os_album.get("name")
+        if isinstance(v, str) and v.strip():
+            name = v.strip()
+
+    ti = track_info if isinstance(track_info, dict) else {}
+    sp = ti.get("spotify_data") or {}
+    if isinstance(sp, str):
+        try:
+            sp = json.loads(sp)
+        except Exception:
+            sp = {}
+    sp_album = _album_dict(sp if isinstance(sp, dict) else {})
+    if not name:
+        v = sp_album.get("name")
+        if isinstance(v, str) and v.strip():
+            name = v.strip()
+
+    for src, src_name in ((sp_album, "spotify"), (os_album, "search")):
+        v = src.get("id")
+        if isinstance(v, int) and not isinstance(v, bool) and v:
+            v = str(v)
+        if isinstance(v, str) and v.strip():
+            album_id = v.strip()
+            id_source = src_name
+            break
+    for src in (sp_album, os_album):
+        try:
+            tt = int(src.get("total_tracks"))
+        except (TypeError, ValueError):
+            tt = 0
+        if tt > 0:
+            total_tracks = tt
+            break
+    for src in (sp_album, os_album):
+        rd = src.get("release_date")
+        if isinstance(rd, str) and rd.strip():
+            release_date = rd.strip()
+            break
+    for src in (sp_album, os_album):
+        iu = src.get("image_url")
+        if isinstance(iu, str) and iu.strip():
+            image_url = iu.strip()
+            break
+        imgs = src.get("images")
+        if isinstance(imgs, list) and imgs:
+            first = imgs[0]
+            u = first.get("url") if isinstance(first, dict) else None
+            if isinstance(u, str) and u.strip():
+                image_url = u.strip()
+                break
+
+    return {"name": name, "id": album_id, "id_source": id_source,
+            "total_tracks": total_tracks, "release_date": release_date,
+            "image_url": image_url}
+
+
+def _track_own_artist_map(
+    original_search: Optional[Dict[str, Any]],
+    track_info: Optional[Dict[str, Any]],
+) -> Dict[str, str]:
+    """The track's OWN artist names as {casefolded: display-case}, built from
+    per-track provider payloads ONLY (#1567). Single source of truth for the
+    two accessors below."""
+    seen: Dict[str, str] = {}
+
+    def _add(value):
+        if isinstance(value, str) and value.strip():
+            folded = value.strip().casefold()
+            if folded and folded != "unknown artist" and folded not in seen:
+                seen[folded] = value.strip()
+
+    osrch = original_search if isinstance(original_search, dict) else {}
+    ti = track_info if isinstance(track_info, dict) else {}
+
+    for entry in osrch.get("artists") or []:
+        _add(entry.get("name") if isinstance(entry, dict) else entry)
+    _add(osrch.get("artist"))
+    # R2 (#1567 round 3): the search payload's own album artists are part of
+    # the track's own ground truth too (wishlist rows carry them).
+    _os_album = osrch.get("album")
+    if isinstance(_os_album, dict):
+        for entry in _os_album.get("artists") or []:
+            _add(entry.get("name") if isinstance(entry, dict) else entry)
+    for entry in ti.get("artists") or []:
+        _add(entry.get("name") if isinstance(entry, dict) else entry)
+
+    sp = ti.get("spotify_data") or {}
+    if isinstance(sp, str):
+        try:
+            sp = json.loads(sp)
+        except Exception:
+            sp = {}
+    if isinstance(sp, dict):
+        for entry in sp.get("artists") or []:
+            _add(entry.get("name") if isinstance(entry, dict) else entry)
+        sp_album = sp.get("album")
+        if isinstance(sp_album, dict):
+            for entry in sp_album.get("artists") or []:
+                _add(entry.get("name") if isinstance(entry, dict) else entry)
+
+    return seen
+
+
+def _track_own_artist_display_names(
+    original_search: Optional[Dict[str, Any]],
+    track_info: Optional[Dict[str, Any]],
+) -> list:
+    """Case-preserving view of the track's own artist names, in stable order —
+    for display fallback when the batch artist param is poisoned (#1567)."""
+    return list(_track_own_artist_map(original_search, track_info).values())
+
+
+def _track_own_artist_names(
+    original_search: Optional[Dict[str, Any]],
+    track_info: Optional[Dict[str, Any]],
+) -> set:
+    """#1567: the track's OWN artist names, from per-track provider payloads
+    ONLY — casefolded, with ""/"unknown artist" dropped.
+
+    Deliberately EXCLUDES everything a bundle flow can derive from the batch:
+    the ``artist`` param (candidates.py builds it from ``_explicit_artist_context``,
+    i.e. the poisoned first-row artist), ``_explicit_artist_context`` itself,
+    and the batch album context. M1: the round-1 check unioned
+    ``artist_dict.get("name")`` into the ground-truth set, so the poisoned
+    claim corroborated itself and distrust could never fire.
+    """
+    return set(_track_own_artist_map(original_search, track_info))
+
+
+def _track_own_album_artist_names(
+    original_search: Optional[Dict[str, Any]],
+    track_info: Optional[Dict[str, Any]],
+) -> set:
+    """#1567 (R3F2): the track's OWN album-artist-eligible names, casefolded —
+    primary artists + the track's own album artists ONLY.
+
+    Featured/guest artists are deliberately EXCLUDED: a pile claiming 'Eminem'
+    as the album artist must not be corroborated by a victim track that merely
+    features Eminem (Rihanna ft. Eminem on Rihanna's album is not an Eminem
+    album). The full contributor set (_track_own_artist_names) stays the
+    emptiness gate — this set only narrows the corroboration comparisons.
+    """
+    names: set = set()
+
+    def _add(value):
+        if isinstance(value, str) and value.strip():
+            folded = value.strip().casefold()
+            if folded and folded != "unknown artist":
+                names.add(folded)
+                return True
+        return False
+
+    def _add_first(entries):
+        # First usable entry: the primary artist by provider convention
+        # (Spotify lists the main artist first). Skips blank and
+        # "unknown artist" placeholders so a malformed leading entry doesn't
+        # hide the real primary artist.
+        for entry in entries or []:
+            name = entry.get("name") if isinstance(entry, dict) else entry
+            if _add(name):
+                return
+
+    osrch = original_search if isinstance(original_search, dict) else {}
+    ti = track_info if isinstance(track_info, dict) else {}
+
+    # Singular primary-artist field (mirrors _track_own_artist_map's sources —
+    # the narrow set must stay a strict subset of the full contributor set).
+    _add(osrch.get("artist"))
+    # Primary artist by array position.
+    _add_first(osrch.get("artists") or [])
+    _add_first(ti.get("artists") or [])
+
+    sp = ti.get("spotify_data") or {}
+    if isinstance(sp, str):
+        try:
+            sp = json.loads(sp)
+        except Exception:
+            sp = {}
+    if isinstance(sp, dict):
+        _add_first(sp.get("artists") or [])
+        sp_album = sp.get("album")
+        if isinstance(sp_album, dict):
+            for entry in sp_album.get("artists") or []:
+                _add(entry.get("name") if isinstance(entry, dict) else entry)
+
+    # The track's own album artists (wishlist rows carry them).
+    _os_album = osrch.get("album")
+    if isinstance(_os_album, dict):
+        for entry in _os_album.get("artists") or []:
+            _add(entry.get("name") if isinstance(entry, dict) else entry)
+
+    return names
+
+
+def _album_release_year(value: Any) -> str:
+    """The YYYY of a release_date-ish value ("" when unparseable). Year-only
+    comparison keeps "2001" and "2001-09-11" in agreement — same release,
+    different precision (#1567)."""
+    m = re.match(r"^\s*(\d{4})", str(value or ""))
+    return m.group(1) if m else ""
+
+
+def _album_identity_disagrees(own_album: Dict[str, Any], album_ctx: Any) -> bool:
+    """#1567 (M2): does the track's OWN provider album affirmatively contradict
+    the batch album context?
+
+    When the batch context carries a REAL provider album id, its identity is
+    authoritative — the rows really are that release. The only contradiction
+    that still distrusts it is the track's own album being a DIFFERENT real
+    release (the track doesn't belong to this batch at all). Name/track-count/
+    year nuances against a real id are edition or provider differences, not
+    poison (#1607: a Deezer soundtrack album credited to its composer while
+    the track is performed by someone else).
+
+    When the batch context has NO verifiable identity (placeholder or missing
+    id — the #1567 shape), any affirmative contradiction in name, track count
+    or release year distrusts it: a bare name is not an album identity.
+
+    Fail-open everywhere else: an empty/unknown side (no id, no name, 0
+    tracks, unparseable date) is "unknown", never a disagreement. Pipeline
+    placeholder ids (``wishlist_album``/``explicit_album``/``from_sync_modal``/
+    ``_name_*``) never count as real — compare with is_real_provider_album_id.
+    """
+    if not isinstance(album_ctx, dict):
+        return False
+    own = own_album or {}
+
+    # deezer/mirror payloads carry the album id as an int
+    own_id = str(own.get("id") or "").strip()
+    ctx_id = str(album_ctx.get("id") or "").strip()
+    own_real = is_real_provider_album_id(own_id)
+    ctx_real = is_real_provider_album_id(ctx_id)
+
+    if ctx_real:
+        return bool(own_real and own_id != ctx_id)
+
+    own_name = (own.get("name") or "").strip().casefold()
+    ctx_name = (album_ctx.get("name") or "").strip().casefold()
+    if own_name and ctx_name and own_name != ctx_name:
+        return True
+
+    try:
+        own_tt = int(own.get("total_tracks") or 0)
+    except (TypeError, ValueError):
+        own_tt = 0
+    try:
+        ctx_tt = int(album_ctx.get("total_tracks") or 0)
+    except (TypeError, ValueError):
+        ctx_tt = 0
+    if own_tt > 0 and ctx_tt > 0 and own_tt != ctx_tt:
+        return True
+
+    own_year = _album_release_year(own.get("release_date"))
+    ctx_year = _album_release_year(album_ctx.get("release_date"))
+    if own_year and ctx_year and own_year != ctx_year:
+        return True
+
+    return False
+
+
+def evaluate_batch_album_distrust(original_search, track_info, album_ctx, explicit_artist):
+    """Pure function (R4F3): evaluate whether the batch album context is
+    poisoned, without running the full metadata extraction.
+
+    This is the verdict that extract_source_metadata computes inline (the
+    #1316-derived wire plus wires 1/2/3). Hoisted so pipeline.py can compute
+    it BEFORE the filing path is built — the path builder runs before
+    metadata enhancement, and a poisoned batch context would otherwise stamp
+    the stranger's folder/year/type.
+
+    Parameters are the same values extract_source_metadata derives from the
+    import context:
+      - original_search: get_import_original_search(context)
+      - track_info: get_import_track_info(context)
+      - album_ctx: get_import_context_album(context)
+      - explicit_artist: track_info.get("_explicit_artist_context")
+
+    Returns a dict:
+      - "distrusted": bool — the batch album context is poisoned; do not
+        stamp album/date/total_tracks/artist from it.
+      - "reason": str — human-readable reason (for logging only).
+      - "explicit_name": str — the batch artist hint's name.
+      - "own_album_artist": str — the album context's claimed artist.
+      - "own_album_artists": list|None — the album context's artist list.
+      - "ctx_artist_untrusted": bool — the #1316 corroboration result.
+      - "own_album": dict — _track_own_provider_album ground truth.
+      - "own_artist_display_names": list — track's own display names.
+      - "track_own_artists": set — full ground-truth artist names.
+      - "track_own_album_artists": set — narrow corroboration set.
+
+    No logging, no side effects — callers log the reason when acting on it.
+    """
+    track_info_ctx = track_info if isinstance(track_info, dict) else {}
+    original_search = original_search if isinstance(original_search, dict) else {}
+    album_ctx = album_ctx if isinstance(album_ctx, dict) else {}
+
+    # The track's own album context is ground truth — resolve it first so a
+    # batch-level hint below is sanity-checked instead of blindly trusted.
+    own_album_artist = ""
+    own_album_artists = None
+    if album_ctx:
+        album_artists = album_ctx.get("artists", [])
+        if album_artists:
+            first_album_artist = album_artists[0]
+            if isinstance(first_album_artist, dict):
+                candidate = first_album_artist.get("name", "")
+            elif isinstance(first_album_artist, str):
+                candidate = first_album_artist
+            else:
+                candidate = ""
+            # Bug #735: an unresolved "Unknown Artist" placeholder from the
+            # album context must NOT clobber the real track artist. Only
+            # override when the album context names a real artist.
+            if candidate and candidate != "Unknown Artist":
+                own_album_artist = candidate
+                own_album_artists = album_artists
+
+    explicit_name = ""
+    if isinstance(explicit_artist, dict) and explicit_artist.get("name"):
+        explicit_name = str(explicit_artist["name"])
+    elif isinstance(explicit_artist, str) and explicit_artist:
+        explicit_name = explicit_artist
+
+    # The track's OWN artist names — per-track provider payloads only (#1567
+    # ground truth).
+    track_own_artists = _track_own_artist_names(original_search, track_info_ctx)
+    # R3F2: corroboration of an album-artist CLAIM uses the narrow set —
+    # primary + own album artists only.
+    track_own_album_artists = _track_own_album_artist_names(original_search, track_info_ctx)
+    own_album = _track_own_provider_album(original_search, track_info_ctx)
+    own_artist_display_names = _track_own_artist_display_names(original_search, track_info_ctx)
+
+    # R2: corroborate the ctx artist against the track's own artists/album
+    # artists first: a ctx artist that is a stranger to both, on a context
+    # with no REAL provider album id, means the whole batch album context
+    # is poisoned. A real shared id is a genuine release (a credit
+    # disagreement there is a nuance like #1607, not poison), and a Various
+    # Artists credit is a genuine multi-artist compilation — both stay
+    # trusted. Empty ground truth never fires.
+    _ctx_album_id = str(album_ctx.get("id") or "").strip()
+    _ctx_artist_norm = (own_album_artist or "").strip().casefold()
+    _ctx_artist_untrusted = (
+        bool(track_own_artists)
+        and bool(_ctx_artist_norm)
+        and _ctx_artist_norm != "unknown artist"
+        and _ctx_artist_norm not in VARIOUS_ARTIST_NAMES
+        and _ctx_artist_norm not in track_own_album_artists
+        and not is_real_provider_album_id(_ctx_album_id)
+    )
+
+    batch_album_distrusted = False
+    distrust_reason = ""
+
+    # Wire 3 (#1316-derived): the #1316 check saw _explicit_artist_context
+    # disagree with album_ctx's stranger artist and, finding that stranger
+    # uncorroborated, distrusts the whole batch context.
+    if explicit_name:
+        if (own_album_artist
+                and own_album_artist.strip().casefold() != explicit_name.strip().casefold()):
+            if _ctx_artist_untrusted:
+                batch_album_distrusted = True
+                distrust_reason = (
+                    f"claims album '{(album_ctx.get('name') or '?').strip()}' "
+                    f"by stranger '{own_album_artist}' (no real album id) while "
+                    f"the track's own artist is '{explicit_name}'"
+                )
+
+    # Wires 1 and 2 (skipped when wire 3 already fired).
+    if not batch_album_distrusted:
+        claimed_album_artist = explicit_name or own_album_artist
+        claimed_norm = (claimed_album_artist or "").strip().casefold()
+        ctx_album_name = (album_ctx.get("name") or "").strip()
+        ctx_has_real_id = is_real_provider_album_id(_ctx_album_id)
+        _reason_artist = own_artist_display_names[0] if own_artist_display_names else "?"
+        # Wire 1: artist mismatch — the claimed album artist is in NONE of
+        # the track's own album-artist-eligible names, and the batch context
+        # carries no REAL provider album id.
+        if (
+            claimed_norm
+            and claimed_norm != "unknown artist"
+            and claimed_norm not in VARIOUS_ARTIST_NAMES
+            and not ctx_has_real_id
+            and track_own_artists
+            and claimed_norm not in track_own_album_artists
+            and (own_album_artist or "").strip().casefold() not in track_own_album_artists
+        ):
+            batch_album_distrusted = True
+            distrust_reason = (
+                f"claims album '{ctx_album_name or '?'}' by '{claimed_album_artist}' "
+                f"but the track's own artist is '{_reason_artist}'"
+            )
+        # Wire 2: album-identity mismatch — the track's own provider album
+        # affirmatively contradicts the batch album context.
+        elif (
+            claimed_norm
+            and claimed_norm not in VARIOUS_ARTIST_NAMES
+            and _album_identity_disagrees(own_album, album_ctx)
+        ):
+            batch_album_distrusted = True
+            distrust_reason = (
+                f"claims album '{ctx_album_name or '?'}' but the track's own provider "
+                f"album is '{own_album.get('name') or '?'}'"
+            )
+
+    return {
+        "distrusted": batch_album_distrusted,
+        "reason": distrust_reason,
+        "explicit_name": explicit_name,
+        "own_album_artist": own_album_artist,
+        "own_album_artists": own_album_artists,
+        "ctx_artist_untrusted": _ctx_artist_untrusted,
+        "own_album": own_album,
+        "own_artist_display_names": own_artist_display_names,
+        "track_own_artists": track_own_artists,
+        "track_own_album_artists": track_own_album_artists,
+    }
 
 
 def extract_source_metadata(context: dict, artist: dict, album_info: dict) -> dict:
@@ -1359,7 +2028,11 @@ def extract_source_metadata(context: dict, artist: dict, album_info: dict) -> di
     }
 
     from core.metadata.musicbrainz_tags import selected_release_id
-    release_id = selected_release_id(album_ctx) or selected_release_id(album_info)
+    # Track which side the release id came from: when the batch album context
+    # is distrusted below (#1567), an id taken from it is poisoned and must be
+    # dropped, while one from the per-track album_info is kept.
+    _ctx_release_id = selected_release_id(album_ctx)
+    release_id = _ctx_release_id or selected_release_id(album_info)
     if release_id:
         metadata["musicbrainz_release_id"] = release_id
 
@@ -1370,6 +2043,15 @@ def extract_source_metadata(context: dict, artist: dict, album_info: dict) -> di
         logger.info("Metadata: Using album info clean name: '%s'", metadata["title"])
     else:
         logger.warning("Metadata: Using original title as fallback: '%s'", metadata["title"])
+
+    # the matched track's isrc, for the musicbrainz exact-id rung (#1705).
+    # spotify keeps it under external_ids, deezer/tidal/itunes at the top.
+    for _isrc_src in (track_info, original_search):
+        _ext = _isrc_src.get("external_ids")
+        _isrc = _isrc_src.get("isrc") or (_ext.get("isrc") if isinstance(_ext, dict) else None)
+        if _isrc:
+            metadata["isrc"] = str(_isrc).strip()
+            break
 
     # Resolve canonical artists list. Soulseek matched-download contexts
     # only carry `original_search.artist` (singular string) — the full
@@ -1464,48 +2146,49 @@ def extract_source_metadata(context: dict, artist: dict, album_info: dict) -> di
     explicit_artist = track_info_ctx.get("_explicit_artist_context") if isinstance(track_info_ctx, dict) else None
     album_artists_for_collab = None
 
-    # The track's own album context is ground truth — resolve it first so a
-    # batch-level hint below is sanity-checked instead of blindly trusted.
-    own_album_artist = ""
-    own_album_artists = None
-    if album_ctx and isinstance(album_ctx, dict):
-        album_artists = album_ctx.get("artists", [])
-        if album_artists:
-            first_album_artist = album_artists[0]
-            if isinstance(first_album_artist, dict):
-                candidate = first_album_artist.get("name", "")
-            elif isinstance(first_album_artist, str):
-                candidate = first_album_artist
-            else:
-                candidate = ""
-            # An unresolved "Unknown Artist" placeholder from the album context
-            # must NOT clobber the real track artist already in raw_album_artist
-            # (bug #735: album-artist tag overwritten to "Unknown Artist" on
-            # import). Only override when the album context names a real artist.
-            if candidate and candidate != "Unknown Artist":
-                own_album_artist = candidate
-                own_album_artists = album_artists
-
-    explicit_name = ""
-    if isinstance(explicit_artist, dict) and explicit_artist.get("name"):
-        explicit_name = str(explicit_artist["name"])
-    elif isinstance(explicit_artist, str) and explicit_artist:
-        explicit_name = explicit_artist
+    # R4F3: the batch-album distrust verdict is a pure function of the
+    # per-track inputs (evaluate_batch_album_distrust, above). Pipeline.py
+    # computes it BEFORE the filing path is built so the path doesn't stamp
+    # the stranger's folder/year; when a verdict was already stashed on the
+    # shared context dict, reuse it verbatim instead of recomputing.
+    _stashed_verdict = (
+        context.get("_batch_album_distrust_verdict")
+        if isinstance(context, dict) else None
+    )
+    if isinstance(_stashed_verdict, dict) and "distrusted" in _stashed_verdict:
+        _verdict = _stashed_verdict
+    else:
+        _verdict = evaluate_batch_album_distrust(
+            original_search, track_info_ctx, album_ctx, explicit_artist)
+    batch_album_distrusted = bool(_verdict.get("distrusted"))
+    distrust_reason = _verdict.get("reason") or ""
+    explicit_name = _verdict.get("explicit_name") or ""
+    own_album_artist = _verdict.get("own_album_artist") or ""
+    own_album_artists = _verdict.get("own_album_artists")
+    own_album = _verdict.get("own_album") or {}
+    track_own_artists = _verdict.get("track_own_artists") or set()
+    track_own_album_artists = _verdict.get("track_own_album_artists") or set()
+    _ctx_artist_untrusted = bool(_verdict.get("ctx_artist_untrusted"))
 
     if explicit_name:
         # #1316: a batch-level artist hint must never silently override the
         # track's own album artist when they name different real artists (a
         # poisoned wishlist batch stamped an unrelated artist on 899 tracks'
-        # album_artist tags). On disagreement trust the track data, loudly.
+        # album_artist tags). On disagreement trust the track data, loudly —
+        # unless the "track's own album artist" is itself an uncorroborated
+        # stranger from the batch context (wire 3 above fired), in which
+        # case the batch context is poisoned and gets quarantined below.
         if (own_album_artist
                 and own_album_artist.strip().casefold() != explicit_name.strip().casefold()):
-            logger.warning(
-                "Metadata: explicit artist context '%s' disagrees with the track's "
-                "own album artist '%s' — trusting the track data (#1316)",
-                explicit_name, own_album_artist,
-            )
-            raw_album_artist = own_album_artist
-            album_artists_for_collab = own_album_artists
+            if not _ctx_artist_untrusted:
+                logger.warning(
+                    "Metadata: explicit artist context '%s' disagrees with the track's "
+                    "own album artist '%s' — trusting the track data (#1316)",
+                    explicit_name, own_album_artist,
+                )
+                raw_album_artist = own_album_artist
+                album_artists_for_collab = own_album_artists
+            # (wire 3 fired: quarantine below overrides raw_album_artist)
         else:
             raw_album_artist = explicit_name
             album_artists_for_collab = (
@@ -1516,12 +2199,45 @@ def extract_source_metadata(context: dict, artist: dict, album_info: dict) -> di
         raw_album_artist = own_album_artist
         album_artists_for_collab = own_album_artists
 
+    if batch_album_distrusted:
+        logger.warning(
+            "Metadata: batch album context %s — refusing to stamp album/date/"
+            "total_tracks from the batch context, falling back to the track's "
+            "own provider album (#1567)",
+            distrust_reason,
+        )
+        # The album_artist is part of the poisoned identity too: fall back to
+        # the track's own artist rather than the batch claim. all_artists can
+        # itself fall back to the poisoned artist param when the track carries
+        # no artist list that resolve_track_artists consults (its artist data
+        # may live only in spotify_data), so prefer the track's own display
+        # names and only then the resolved list.
+        _own_display_names = _track_own_artist_display_names(original_search, track_info_ctx)
+        raw_album_artist = (
+            _own_display_names[0]
+            if _own_display_names
+            else (all_artists[0] if all_artists else metadata.get("artist", ""))
+        )
+        album_artists_for_collab = None
+        # m1: the MusicBrainz release id is part of the poisoned identity too
+        # — a stranger's release id must not be embedded. Only the id taken
+        # from the batch album context is dropped; a per-track album_info id
+        # (if any) is kept.
+        if _ctx_release_id:
+            metadata.pop("musicbrainz_release_id", None)
+
     collab_mode = cfg.get("file_organization.collab_artist_mode", "first")
     if collab_mode == "first" and raw_album_artist:
         context_artists = album_artists_for_collab or original_search.get("artists") or track_info_ctx.get("artists") or []
-        if len(context_artists) > 1:
-            first = context_artists[0]
-            raw_album_artist = first.get("name", first) if isinstance(first, dict) else str(first)
+        primary = first_listed_artist(raw_album_artist, context_artists)
+        if not primary:
+            # the album list can be the combined name itself while the track
+            # names the primary on its own
+            _track_artists = original_search.get("artists") or track_info_ctx.get("artists") or []
+            if _track_artists:
+                primary = listed_primary_of(raw_album_artist, _track_artists[0])
+        if primary:
+            raw_album_artist = primary
         elif len(context_artists) == 1 and ("," in raw_album_artist or " & " in raw_album_artist):
             artist_id = str(artist_dict.get("id", ""))
             if source == "itunes" and artist_id.isdigit():
@@ -1539,17 +2255,80 @@ def extract_source_metadata(context: dict, artist: dict, album_info: dict) -> di
     # artists, a feature doesn't make it a collab album
     metadata["_album_artists_list"] = _album_artist_names(album_artists_for_collab)
 
-    if album_info.get("is_album"):
-        metadata["album"] = album_info.get("album_name", "Unknown Album")
-        metadata["track_number"] = album_info.get("track_number", 1)
-        metadata["total_tracks"] = album_ctx.get("total_tracks", 1) if album_ctx else 1
+    # 'Unknown Album' in any slot is the no-album placeholder, not a name —
+    # tracks from paste-link playlists / discovery-pool rows / TXT imports
+    # carry it in place of an album, and stamping it wiped the downloaded
+    # file's own (correct) album tag. Placeholder candidates fall through
+    # the same rungs an album-less track takes, including the file's own
+    # album tag (snapshotted by the enrichment writer onto the context as
+    # ``_file_album_tag`` before it clears the file's tags), which still
+    # outranks the title fallback.
+    _album_info_name = album_info.get("album_name")
+    if not has_real_album_name(_album_info_name):
+        _album_info_name = ""
+    _album_ctx_name = album_ctx.get("name") if album_ctx else ""
+    if not has_real_album_name(_album_ctx_name):
+        _album_ctx_name = ""
+    _own_album_name = own_album.get("name")
+    if not has_real_album_name(_own_album_name):
+        _own_album_name = ""
+    _file_album_tag = context.get("_file_album_tag")
+    from core.imports.track_number import (
+        embedded_album_belongs_to_track,
+        embedded_album_name_is_real,
+    )
+    if not embedded_album_name_is_real(_file_album_tag):
+        _file_album_tag = ""
+    elif batch_album_distrusted:
+        # #1567: in a distrusted batch the file came from the stranger's
+        # bundle — its album tag is the stranger's evidence, never the
+        # track's. The track's own provider album (the rung above) or
+        # its title are the only honest stamps.
+        _file_album_tag = ""
+    elif not embedded_album_belongs_to_track(
+        context.get("_file_album_artist_tag"), artist_dict.get("name"),
+    ):
+        # The file's album only counts as this track's album when the
+        # file's album artist agrees — a various-artists compilation (or
+        # another artist's album) must not be stamped onto the track.
+        _file_album_tag = ""
+
+    if album_info.get("is_album") and _album_info_name:
+        # 0 = unknown (3827b0227): never invent a track 1
+        metadata["track_number"] = album_info.get("track_number", 0)
+        if batch_album_distrusted:
+            # #1567: album_info['album_name'] is built from the same poisoned
+            # batch album in bundle flows — stamp the track's own provider
+            # album instead (or the title when the track carries no album of
+            # its own), and never the batch's total_tracks.
+            metadata["album"] = _own_album_name or metadata["title"]
+            metadata["total_tracks"] = own_album.get("total_tracks")
+        else:
+            metadata["album"] = _album_info_name
+            metadata["total_tracks"] = album_ctx.get("total_tracks") if album_ctx else None
         logger.info("[METADATA] Album track - track_number: %s, album: %s", metadata["track_number"], metadata["album"])
     else:
-        if album_ctx and album_ctx.get("name"):
+        if _album_ctx_name and not batch_album_distrusted:
             logger.info("[SAFEGUARD] Using album context name instead of track title for album metadata")
-            metadata["album"] = album_ctx["name"]
-            metadata["track_number"] = album_info.get("track_number", 1) if album_info else 1
-            metadata["total_tracks"] = album_ctx.get("total_tracks", 1)
+            metadata["album"] = _album_ctx_name
+            metadata["track_number"] = album_info.get("track_number", 0) if album_info else 0
+            metadata["total_tracks"] = album_ctx.get("total_tracks")
+        elif batch_album_distrusted and _own_album_name:
+            # #1567: the batch album context is poisoned — fall back to the
+            # track's own provider album rather than stamping a stranger's
+            # album on the track.
+            logger.info("[SAFEGUARD] Batch album context distrusted — using the track's own provider album (#1567)")
+            metadata["album"] = _own_album_name
+            metadata["track_number"] = album_info.get("track_number", 0) if album_info else 0
+            metadata["total_tracks"] = own_album.get("total_tracks")
+        elif _file_album_tag:
+            # No source named an album, but the downloaded file itself is
+            # tagged with one — that tag is the track's own evidence and
+            # beats modelling the track as a single named after its title.
+            logger.info("[SAFEGUARD] No album in context — using the file's own album tag: %s", _file_album_tag)
+            metadata["album"] = _file_album_tag
+            metadata["track_number"] = album_info.get("track_number", 0) if album_info else 0
+            metadata["total_tracks"] = album_info.get("total_tracks") if album_info else None
         else:
             metadata["album"] = metadata["title"]
             metadata["track_number"] = 1
@@ -1561,13 +2340,33 @@ def extract_source_metadata(context: dict, artist: dict, album_info: dict) -> di
     # as disc-less and ungroup the track in Jellyfin/Plex).
     from core.imports.track_number import resolve_disc_for_track
     metadata["disc_number"] = resolve_disc_for_track(original_search, album_info)
+    reference = context.get('_metadata_reference')
+    if reference:
+        for key, ref_key in (('title', 'title'), ('artist', 'track_artist'), ('album', 'album_title'), ('album_artist', 'artist_name')):
+            if reference.get(ref_key):
+                metadata[key] = reference[ref_key]
+        metadata.update(track_number=reference.get('track_number') or metadata['track_number'], total_tracks=reference.get('track_count'),
+                        disc_number=reference.get('disc_number') or metadata['disc_number'], total_discs=reference.get('total_discs'))
 
-    if album_ctx and album_ctx.get("release_date"):
+    if album_ctx and album_ctx.get("release_date") and not batch_album_distrusted:
         release_date = _normalize_release_date_tag(album_ctx.get("release_date"))
         if release_date:
             metadata["date"] = release_date
+    elif batch_album_distrusted and own_album.get("release_date"):
+        # #1567: the batch context's date is poisoned — use the track's own
+        # album date when it has one, otherwise leave the date to enrichment.
+        release_date = _normalize_release_date_tag(own_album.get("release_date"))
+        if release_date:
+            metadata["date"] = release_date
 
-    genres = artist_dict.get("genres") or []
+    # deezer's artist has no genres, its album does. without this every deezer
+    # download got no genre unless musicbrainz or last.fm had one (#1607)
+    # m1 (#1567): when the batch album context is distrusted its genres are a
+    # stranger's genres — skip the album_ctx fallback (the track keeps its
+    # artist genres; per-track enrichment sources can still fill the gap).
+    genres = artist_dict.get("genres") or (
+        [] if batch_album_distrusted else _source_album_genres(album_ctx, source, source_ids)
+    )
     if genres:
         from core.genre_filter import filter_genres
 
@@ -1575,13 +2374,27 @@ def extract_source_metadata(context: dict, artist: dict, album_info: dict) -> di
         if filtered:
             metadata["genre"] = ", ".join(filtered)
 
-    metadata["album_art_url"] = album_info.get("album_image_url") if album_info else None
-    if not metadata["album_art_url"] and album_ctx:
-        album_image = album_ctx.get("image_url")
-        if not album_image and album_ctx.get("images"):
-            first_image = album_ctx["images"][0]
-            album_image = first_image.get("url") if isinstance(first_image, dict) else None
-        metadata["album_art_url"] = album_image
+    if batch_album_distrusted:
+        # m1 (#1567): never take artwork from the poisoned batch — neither the
+        # batch album context nor album_info['album_image_url'] (built from
+        # that same batch album in bundle flows). The track's own provider
+        # album art, if it has any; otherwise no art URL (enrichment may still
+        # find some per-track).
+        metadata["album_art_url"] = own_album.get("image_url") or None
+    else:
+        metadata["album_art_url"] = album_info.get("album_image_url") if album_info else None
+        if not metadata["album_art_url"] and album_ctx:
+            album_image = album_ctx.get("image_url")
+            if not album_image and album_ctx.get("images"):
+                first_image = album_ctx["images"][0]
+                album_image = first_image.get("url") if isinstance(first_image, dict) else None
+            metadata["album_art_url"] = album_image
+
+    if reference:
+        for key, ref_key in (('date', 'year'), ('genre', 'genres'), ('album_art_url', 'thumb_url')):
+            if reference.get(ref_key):
+                value = reference[ref_key]
+                metadata[key] = ', '.join(value) if isinstance(value, list) else str(value)
 
     logger.info(
         "[Metadata Summary] title='%s' | artist='%s' | album_artist='%s' | album='%s' | date=%s | track=%s/%s | disc=%s",
@@ -1595,7 +2408,38 @@ def extract_source_metadata(context: dict, artist: dict, album_info: dict) -> di
         metadata.get("disc_number"),
     )
 
+    # #1567 (round 4): record_soulsync_library_entry (core/imports/side_effects.py)
+    # shares this import context dict — stash the distrust verdict here so the
+    # library row writer applies the same verdict to the albums/artists rows
+    # (batch-context year/track_count/art/release id must not reach the DB when
+    # distrusted). The writer only acts on an explicit True; a missing key is
+    # "trusted", exactly today's behavior. own_album is plain str/int data.
+    if isinstance(context, dict):
+        context["_batch_album_distrusted"] = bool(batch_album_distrusted)
+        context["_track_own_provider_album"] = (
+            dict(own_album) if isinstance(own_album, dict) else {}
+        )
+        # R4F1: the library row writer also needs the track's own artist when
+        # the batch artist is distrusted (the batch artist_context is a
+        # stranger's). Plain str data, like own_album above.
+        context["_track_own_artist_display_names"] = list(
+            _track_own_artist_display_names(original_search, track_info_ctx)
+        )
+
     return metadata
+
+
+def known_source_id_tags(metadata: dict, cfg=None) -> dict:
+    """The exact, configured identity tags shared by preview and writing."""
+    cfg = cfg or get_config_manager()
+    tags = _collect_source_ids(metadata, cfg)
+    if cfg.get('musicbrainz.embed_tags', True) is not False:
+        for key, tag in [('musicbrainz_recording_id', 'MUSICBRAINZ_RECORDING_ID'),
+                         ('musicbrainz_release_id', 'MUSICBRAINZ_RELEASE_ID')]:
+            if metadata.get(key):
+                tags[tag] = metadata[key]
+    return {tag: value for tag, value in tags.items()
+            if _tag_enabled(cfg, SOURCE_TAG_CONFIG.get(tag, ''))}
 
 
 def embed_known_source_ids(audio_file, metadata: dict) -> list:
@@ -1617,15 +2461,7 @@ def embed_known_source_ids(audio_file, metadata: dict) -> list:
     if not symbols or audio_file is None:
         return []
     try:
-        id_tags = _collect_source_ids(metadata, cfg)
-        # MusicBrainz ids aren't in _collect_source_ids (they come from the MB
-        # processor at import time); add them from the DB when present, using
-        # the canonical names the frame map already knows.
-        if cfg.get("musicbrainz.embed_tags", True) is not False:
-            if metadata.get("musicbrainz_recording_id"):
-                id_tags["MUSICBRAINZ_RECORDING_ID"] = metadata["musicbrainz_recording_id"]
-            if metadata.get("musicbrainz_release_id"):
-                id_tags["MUSICBRAINZ_RELEASE_ID"] = metadata["musicbrainz_release_id"]
+        id_tags = known_source_id_tags(metadata, cfg)
         if not id_tags:
             return []
         pp = _blank_post_process_state()
@@ -1649,7 +2485,7 @@ def _blank_post_process_state() -> dict:
         "tidal_copyright": None, "hifi_isrc": None, "qobuz_isrc": None,
         "qobuz_copyright": None, "qobuz_label": None, "lastfm_tags": [],
         "lastfm_url": None, "genius_url": None, "release_year": None,
-        "bandcamp_url": None, "bandcamp_tags": [], "bandcamp_label": None,
+        "bandcamp_url": None, "bandcamp_tags": [], "bandcamp_label": None, "beatport": None,
     }
 
 
@@ -1665,6 +2501,11 @@ def embed_source_ids(audio_file, metadata: dict, context: dict = None, runtime=N
 
         track_title = metadata.get("title", "")
         artist_name = metadata.get("album_artist", "") or metadata.get("artist", "")
+        # #1567: track-level lookups (Last.fm track info, Genius song search)
+        # must key on the TRACK artist, not the album artist — a poisoned
+        # batch album artist stamped .../Nickelback/_/<Track> lastfm_urls on
+        # 11 unrelated tracks. Album-level lookups keep album_artist.
+        track_artist_name = metadata.get("artist", "") or artist_name
         track_info = get_import_track_info(context)
         explicit_artist = (track_info or {}).get("_explicit_artist_context") if isinstance(track_info, dict) else None
         batch_artist_name = None
@@ -1705,6 +2546,7 @@ def embed_source_ids(audio_file, metadata: dict, context: dict = None, runtime=N
             "bandcamp_url": None,
             "bandcamp_tags": [],
             "bandcamp_label": None,
+            "beatport": None,
         }
 
         source_order = cfg.get("metadata_enhancement.post_process_order", None)
@@ -1750,12 +2592,16 @@ def embed_source_ids(audio_file, metadata: dict, context: dict = None, runtime=N
             source_order = [s for s in source_order if s != "jiosaavn"]
         if not is_source_enabled("bandcamp"):
             source_order = [s for s in source_order if s != "bandcamp"]
+        # a saved order from before beatport existed still gets it, last
+        if "beatport" not in source_order:
+            source_order = list(source_order) + ["beatport"]
 
         db = get_database()
 
         for source_name in source_order:
             _process_source_enrichment(source_name, pp, metadata, cfg, runtime, track_title, artist_name,
-                                       provenance=cached_meta, audio_file=audio_file)
+                                       provenance=cached_meta, audio_file=audio_file,
+                                       track_artist_name=track_artist_name)
 
         # #1513: stash the Last.fm client + artist name for the genre fallback
         # in _write_embedded_metadata (opt-in, only fetched if no genre source
@@ -1768,7 +2614,7 @@ def embed_source_ids(audio_file, metadata: dict, context: dict = None, runtime=N
 
         # Skip the early return when the genre fallback is on — there may be
         # genres to write even if no other metadata was enriched.
-        if not fallback_enabled and not pp["id_tags"] and not pp["deezer_bpm"] and not pp["deezer_isrc"] and not pp["tidal_bpm"] and not pp["hifi_bpm"] and not pp["hifi_copyright"] and not pp["audiodb_mood"] and not pp["audiodb_style"] and not pp["bandcamp_url"] and not pp["bandcamp_tags"]:
+        if not fallback_enabled and not pp["id_tags"] and not pp["deezer_bpm"] and not pp["deezer_isrc"] and not pp["tidal_bpm"] and not pp["hifi_bpm"] and not pp["hifi_copyright"] and not pp["audiodb_mood"] and not pp["audiodb_style"] and not pp["bandcamp_url"] and not pp["bandcamp_tags"] and not pp["beatport"]:
             return
 
         release_year = _write_embedded_metadata(audio_file, metadata, pp, cfg, symbols)

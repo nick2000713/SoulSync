@@ -12,7 +12,9 @@ Folders:
     so changing it on either side changes both (one physical download dir, simpler
     Docker mounts). We only READ/WRITE that shared key; no music code is touched.
   - OUTPUT (library) folders are video-specific and live in video.db, one per type:
-      ``movies_path`` / ``tv_path`` / ``youtube_path``.
+      ``movies_path`` / ``tv_path`` / ``youtube_path``, plus an optional
+      ``anime_path``: episodes of anime-type shows import there instead of
+      ``tv_path`` when it is set.
   The engine routes a finished download to the library path matching its type. (Legacy
   single video ``transfer_path`` is migrated into ``movies_path`` on first read.)
 
@@ -45,7 +47,66 @@ logger = get_logger("video_api.downloads")
 
 # Video-specific OUTPUT library folders (video.db). The INPUT folder is the shared
 # music key below — not in this list.
-_PATH_KEYS = ("movies_path", "tv_path", "youtube_path")
+_PATH_KEYS = ("movies_path", "tv_path", "anime_path", "youtube_path")
+
+
+def _series_type_for(db, kind, body) -> str | None:
+    """The series type that decides which library FOLDER a TV download is filed
+    in (``routing_series_type``: set by hand, an anime-marked library, or the
+    stored hint for a show not in any library -- never the genre tag). Read from
+    the body's ``media_id``: a TMDB id when ``media_source`` is 'tmdb', else a
+    library show id (the same reading grab-pack's owned check uses). For a TMDB
+    id the show's hint is made sure of first (one TMDB call, only for a show not
+    in any library that has none yet). None for movies or when the show can't
+    be identified, which routes to the TV folder as before."""
+    if str(kind or "").lower() == "movie":
+        return None
+    mid = (body or {}).get("media_id")
+    if mid in (None, ""):
+        return None
+    try:
+        if str((body or {}).get("media_source") or "").lower() == "tmdb":
+            tmdb = int(mid)
+            if db.get_setting("anime_path"):
+                from core.video.anime_hint import ensure_show_type_hint
+                ensure_show_type_hint(db, tmdb)
+            return db.routing_series_type(tmdb_id=tmdb)
+        return db.routing_series_type(library_id=int(mid))
+    except (ValueError, TypeError):
+        return None
+
+
+def _profile_library_for(db, kind, body) -> str:
+    """The library the title's quality profile files it in ('main' / '4k'):
+    the request's own profile id, else the title's assignment (by TMDB id or
+    library id, the way _series_type_for reads media_id), else Default's."""
+    from core.video.quality_profile import profile_by_id
+    body = body or {}
+    pid = body.get("quality_profile_id")
+    if pid in (None, "", 0, "0"):
+        kind_key = "movie" if str(kind or "").lower() == "movie" else "show"
+        mid = body.get("tmdb_id") or body.get("media_id")
+        try:
+            if mid not in (None, ""):
+                if str(body.get("media_source") or "tmdb").lower() == "tmdb" or body.get("tmdb_id"):
+                    pid = db.quality_profile_id_for(kind_key, tmdb_id=int(mid))
+                else:
+                    pid = db.quality_profile_id_for(kind_key, library_id=int(mid))
+        except (TypeError, ValueError):
+            pid = None
+    return str(profile_by_id(db, pid).get("library") or "main")
+
+
+def _target_for(db, kind, body) -> str:
+    """The library folder a download of this title is filed in: by kind, the
+    show's routing type (the anime folder) and the title's quality profile's
+    library (the 4K folder, when it's switched on)."""
+    from core.video.download_pipeline import target_dir_for
+    from core.video.library_roots import output_paths
+    return target_dir_for(kind, output_paths(db), _series_type_for(db, kind, body),
+                          _profile_library_for(db, kind, body))
+
+
 # The shared input/download dir — the SAME config key the music side reads/writes.
 _SHARED_DOWNLOAD_KEY = "soulseek.download_path"
 
@@ -197,7 +258,8 @@ def _torrent_lane_hits(body, scope, title, want_season, want_episode, source):
 
 
 def _evaluate_hits(raw, profile, scope, want_season, want_episode, blocked=None, want_year=None,
-                   want_title=None, blocked_users=None, want_date=None, want_absolute=None) -> list:
+                   want_title=None, blocked_users=None, want_date=None, want_absolute=None,
+                   want_alt=None) -> list:
     """Parse → evaluate → rank a list of raw indexer hits against the quality profile.
     Shared by the mock search and the live slskd start/poll endpoints.
 
@@ -240,7 +302,8 @@ def _evaluate_hits(raw, profile, scope, want_season, want_episode, blocked=None,
         verdict = evaluate_release(parsed, profile, scope=scope, want_season=want_season,
                                    want_episode=want_episode, size_gb=size_gb, want_year=want_year,
                                    want_title=want_title, want_date=want_date,
-                                   want_absolute=want_absolute, seeders=seeders)
+                                   want_absolute=want_absolute, seeders=seeders,
+                                   want_alt=want_alt)
         # Custom formats: matched formats ADD their (per-profile) score; a
         # summed score under the profile's floor hard-rejects (Radarr's
         # min custom format score).
@@ -381,6 +444,11 @@ def register_routes(bp):
         out["download_path"] = config_manager.get(_SHARED_DOWNLOAD_KEY, "") or ""   # shared w/ music
         from core.video.library_roots import ADDITIONAL_KEYS, additional_paths
         out.update({key: additional_paths(db, key) for key in ADDITIONAL_KEYS})
+        # the optional 4K libraries: a switch and a folder each, off by default
+        from core.video.library_roots import FOUR_K_KEYS, _on
+        for enabled, folder in FOUR_K_KEYS.values():
+            out[enabled] = _on(db.get_setting(enabled))
+            out[folder] = db.get_setting(folder) or ""
         out.update(load_source(db))   # download_mode + hybrid_order
         return jsonify(out)
 
@@ -401,6 +469,12 @@ def register_routes(bp):
         for key in _PATH_KEYS:
             if key in body:
                 db.set_setting(key, (str(body.get(key) or "")).strip())
+        from core.video.library_roots import FOUR_K_KEYS
+        for enabled, folder in FOUR_K_KEYS.values():
+            if enabled in body:
+                db.set_setting(enabled, "1" if body.get(enabled) in (True, 1, "1", "true") else "0")
+            if folder in body:
+                db.set_setting(folder, (str(body.get(folder) or "")).strip())
         if "download_path" in body:   # SHARED with music — write the same config key
             from core.settings import config_manager
             config_manager.set(_SHARED_DOWNLOAD_KEY, (str(body.get("download_path") or "")).strip())
@@ -1085,7 +1159,6 @@ def register_routes(bp):
         from . import get_video_db
         from core.settings import config_manager
         from core.video.download_monitor import ensure_started
-        from core.video.download_pipeline import target_dir_for
         from core.video.slskd_download import start_download
 
         body = request.get_json(silent=True) or {}
@@ -1105,10 +1178,7 @@ def register_routes(bp):
         # 507 took 39.9 seconds to arrive, all of it spent earning a magnet that
         # was then thrown away.
         db = get_video_db()
-        paths = {k: db.get_setting(k) or "" for k in ("movies_path", "tv_path", "youtube_path")}
-        if not paths["movies_path"]:
-            paths["movies_path"] = db.get_setting("transfer_path") or ""
-        target = target_dir_for(body.get("kind"), paths)
+        target = _target_for(db, body.get("kind"), body)
         from core.video import disk_guard, organization
         room = disk_guard.check_room(
             target, organization.load(db),
@@ -1154,19 +1224,7 @@ def register_routes(bp):
 
         import json as _json
         from core.video.slskd_search import build_query
-        ctx = body.get("search_ctx") if isinstance(body.get("search_ctx"), dict) else {}
-        ctx = {**ctx, "user_initiated": True, "import_policy": "user_replace"}
-        _prof, _pid = _profile_for_request(db, body)
-        common = {
-            "kind": str(body.get("kind") or "movie"), "title": body.get("title"),
-            "release_title": body.get("release_title") or body.get("filename") or body.get("title"),
-            "size_bytes": int(body.get("size_bytes") or 0), "quality_label": body.get("quality_label"),
-            "target_dir": target, "status": "downloading",
-            "media_id": (str(body.get("media_id")) if body.get("media_id") is not None else None),
-            "media_source": body.get("media_source"), "year": body.get("year"),
-            "poster_url": body.get("poster_url"), "search_ctx": _json.dumps(ctx), "attempts": 0,
-            "quality_profile_id": _pid,   # the profile this grab is judged under (P2)
-        }
+        common, ctx = _grab_common(db, body, target)
         if source == "soulseek":
             started = start_download(username, filename, body.get("size_bytes") or 0)
             if not started.get("ok"):
@@ -1188,15 +1246,46 @@ def register_routes(bp):
                        fallback_magnet=body.get("magnet_uri"))
             if not res.get("ok"):
                 return jsonify({"ok": False, "error": res.get("error") or "The download client refused it."}), 502
-            dl_id = db.add_video_download({**common, "source": source,
-                                           "username": body.get("username"),   # indexer name (display only)
-                                           # the id is the stable key, that's what the seeding
-                                           # sweep looks this tracker's seed goal up by
-                                           "indexer_id": body.get("indexer_id"),
-                                           "filename": body.get("release_title") or body.get("title"),
-                                           "client_ref": res["ref"],
-                                           "candidates": _json.dumps([]), "tried_queries": _json.dumps([]),
-                                           "tried_files": _json.dumps([])})
+            dl_id = _add_client_row(db, common, body, source, res["ref"])
+        _grab_started(common, ctx, source)
+        ensure_started(get_video_db)
+        return jsonify({"ok": True, "id": dl_id})
+
+    def _grab_common(db, body, target):
+        """The fields every video download row starts with, and its search
+        context. Shared by a grab and a clients-tab match, so a matched download
+        is the same row a grab would have written."""
+        import json as _json
+        ctx = body.get("search_ctx") if isinstance(body.get("search_ctx"), dict) else {}
+        ctx = {**ctx, "user_initiated": True, "import_policy": "user_replace"}
+        _prof, _pid = _profile_for_request(db, body)
+        common = {
+            "kind": str(body.get("kind") or "movie"), "title": body.get("title"),
+            "release_title": body.get("release_title") or body.get("filename") or body.get("title"),
+            "size_bytes": int(body.get("size_bytes") or 0), "quality_label": body.get("quality_label"),
+            "target_dir": target, "status": "downloading",
+            "media_id": (str(body.get("media_id")) if body.get("media_id") is not None else None),
+            "media_source": body.get("media_source"), "year": body.get("year"),
+            "poster_url": body.get("poster_url"), "search_ctx": _json.dumps(ctx), "attempts": 0,
+            "quality_profile_id": _pid,   # the profile this grab is judged under (P2)
+        }
+        return common, ctx
+
+    def _add_client_row(db, common, body, source, client_ref):
+        """A torrent / usenet row: the monitor tracks progress and completion by
+        client_ref. No Soulseek-style alternate requery."""
+        import json as _json
+        return db.add_video_download({**common, "source": source,
+                                      "username": body.get("username"),   # indexer name (display only)
+                                      # the id is the stable key, that's what the seeding
+                                      # sweep looks this tracker's seed goal up by
+                                      "indexer_id": body.get("indexer_id"),
+                                      "filename": body.get("release_title") or body.get("title"),
+                                      "client_ref": client_ref,
+                                      "candidates": _json.dumps([]), "tried_queries": _json.dumps([]),
+                                      "tried_files": _json.dumps([])})
+
+    def _grab_started(common, ctx, source):
         try:      # 'Release Grabbed' automation trigger (Sonarr's On Grab)
             from core.video.download_events import publish
             publish("video_grab_started", {
@@ -1206,8 +1295,111 @@ def register_routes(bp):
                 "season": ctx.get("season"), "episode": ctx.get("episode")})
         except Exception:   # noqa: BLE001 - events never disturb the grab
             logger.exception("grab event publish failed")
+
+    @bp.route("/downloads/adopt", methods=["POST"])
+    def video_downloads_adopt():
+        """Match & import from the clients tab: follow a torrent or usenet job
+        that is already in the client, as if it had been grabbed here.
+
+        Body: {source: torrent|usenet, client_ref, kind: movie|show, title, year,
+        media_id, media_source, poster_url, release_title, size_bytes,
+        search_ctx: {scope: movie|episode|season, title, year, season, episode}}.
+        Writes the same row a grab writes, so the monitor imports it when the
+        client says it is done, and a failure is handled like any grab's.
+        """
+        from . import get_video_db
+        from core.video.download_monitor import ensure_started
+
+        body = request.get_json(silent=True) or {}
+        source = str(body.get("source") or "").lower()
+        client_ref = str(body.get("client_ref") or "").strip()
+        if source == "soulseek":
+            client_ref = str(body.get("username") or "").strip()
+        if source not in ("torrent", "usenet", "soulseek") or not client_ref:
+            return jsonify({"ok": False, "error": "Missing the download to match."}), 400
+        kind = str(body.get("kind") or "").lower()
+        if kind not in ("movie", "show") or not body.get("title"):
+            return jsonify({"ok": False, "error": "Pick what this download is first."}), 400
+
+        db = get_video_db()
+        target = _target_for(db, kind, body)
+        if not target:
+            return jsonify({"ok": False, "error": "Set the library folder for this type on Settings → Downloads."}), 400
+
+        if source == "soulseek":
+            return _adopt_soulseek(db, body, kind, target)
+
+        # already followed: a second match would make a second row importing the
+        # same files
+        for existing in db.list_video_downloads(limit=500):
+            if (str(existing.get("client_ref") or "").lower() == client_ref.lower()
+                    and str(existing.get("status") or "").lower()
+                    not in ("failed", "import_failed", "cancelled")):
+                return jsonify({"ok": False, "error": "SoulSync is already following this download."}), 409
+
+        common, ctx = _grab_common(db, body, target)
+        dl_id = _add_client_row(db, common, body, source, client_ref)
+        _grab_started(common, ctx, source)
         ensure_started(get_video_db)
         return jsonify({"ok": True, "id": dl_id})
+
+    _VIDEO_EXTS = (".mkv", ".mp4", ".avi", ".m4v", ".ts", ".wmv", ".mov", ".webm")
+
+    def _adopt_soulseek(db, body, kind, target):
+        """A folder of slskd transfers. The rows are the ones a soulseek grab
+        (one file) or a pack grab (one row per episode) writes, so the monitor
+        follows each transfer by username + filename the way it always has.
+        Nothing is sent to slskd: the transfers are already there."""
+        import json as _json
+        import os as _os
+        from core.video.download_monitor import ensure_started
+        from core.video.release_parse import parse_release
+        from . import get_video_db
+
+        username = str(body.get("username") or "").strip()
+        files = [f for f in (body.get("files") or []) if isinstance(f, dict) and f.get("filename")
+                 and _os.path.splitext(str(f["filename"]))[1].lower() in _VIDEO_EXTS]
+        if not files:
+            return jsonify({"ok": False, "error": "No video files in that folder."}), 400
+        following = {(str(d.get("username")), str(d.get("filename")))
+                     for d in db.list_video_downloads(limit=500)
+                     if d.get("source") == "soulseek"
+                     and str(d.get("status") or "").lower() not in ("failed", "import_failed", "cancelled")}
+        if any((username, str(f["filename"])) in following for f in files):
+            return jsonify({"ok": False, "error": "SoulSync is already following this download."}), 409
+
+        ctx = body.get("search_ctx") if isinstance(body.get("search_ctx"), dict) else {}
+        picks = []
+        if kind == "show" and ctx.get("scope") == "season":
+            # one row per episode, like a pack grab; files that aren't an
+            # episode (samples, extras) are left alone
+            for f in files:
+                parsed = parse_release(_os.path.basename(str(f["filename"]).replace("\\", "/")))
+                if parsed.get("season") is None or parsed.get("episode") is None:
+                    continue
+                picks.append((f, {**ctx, "scope": "episode", "season": parsed["season"],
+                                  "episode": parsed["episode"]}))
+            if not picks:
+                return jsonify({"ok": False, "error": "Nothing in that folder looked like an episode."}), 400
+        else:
+            biggest = max(files, key=lambda f: int(f.get("size") or 0))
+            picks.append((biggest, ctx))
+
+        ids = []
+        for f, file_ctx in picks:
+            filename = str(f["filename"])
+            row_body = {**body, "search_ctx": file_ctx,
+                        "release_title": _os.path.basename(filename.replace("\\", "/")),
+                        "size_bytes": int(f.get("size") or 0)}
+            common, row_ctx = _grab_common(db, row_body, target)
+            ids.append(db.add_video_download({**common, "source": "soulseek", "username": username,
+                                              "filename": filename,
+                                              "candidates": _json.dumps([]),
+                                              "tried_queries": _json.dumps([]),
+                                              "tried_files": _json.dumps([filename])}))
+            _grab_started(common, row_ctx, "soulseek")
+        ensure_started(get_video_db)
+        return jsonify({"ok": True, "id": ids[0], "ids": ids})
 
     @bp.route("/downloads/grab-pack", methods=["POST"])
     def video_downloads_grab_pack():
@@ -1218,7 +1410,6 @@ def register_routes(bp):
         media_source, year, poster_url, quality_label}."""
         from . import get_video_db
         from core.video.download_monitor import ensure_started
-        from core.video.download_pipeline import target_dir_for
         from core.video.slskd_download import start_download
         from core.video.release_parse import parse_release
         from core.video.slskd_search import build_query
@@ -1232,8 +1423,7 @@ def register_routes(bp):
             return jsonify({"ok": False, "error": "Missing the pack's source info."}), 400
 
         db = get_video_db()
-        paths = {k: db.get_setting(k) or "" for k in ("movies_path", "tv_path", "youtube_path")}
-        target = target_dir_for("show", paths)
+        target = _target_for(db, "show", body)
         from core.video import disk_guard, organization
         room = disk_guard.check_room(target, organization.load(get_video_db()))
         if not room["ok"]:
@@ -1360,7 +1550,7 @@ def register_routes(bp):
         from . import get_video_db
         from core.video.download_monitor import ensure_started
         db = get_video_db()
-        ensure_started(get_video_db)   # also (re)start the monitor when the page is open
+        ensure_started(get_video_db, wake=False)   # (re)start the monitor when the page is open, without interrupting its idle sleep (#1905)
         rows = db.list_video_downloads()
         _annotate_upgrade_watches(db, rows, _request_profile())
         _annotate_packs(rows)
@@ -1375,7 +1565,7 @@ def register_routes(bp):
         from . import get_video_db
         from core.video.download_monitor import ensure_started
         db = get_video_db()
-        ensure_started(get_video_db)
+        ensure_started(get_video_db, wake=False)   # read-only poll: (re)start only, never wake (#1905)
         dl_id = request.args.get("id")
         if dl_id:
             try:
@@ -1407,7 +1597,7 @@ def register_routes(bp):
         cancel_download(dl.get("username"), dl.get("filename"))   # best-effort; mark regardless
         import time
         db.update_video_download(dl["id"], status="cancelled", error="Cancelled",
-                                 completed_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+                                 completed_at=time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()))
         return jsonify({"ok": True})
 
     @bp.route("/downloads/retry", methods=["POST"])

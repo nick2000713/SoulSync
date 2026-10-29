@@ -36,6 +36,18 @@ import {
   usenetClientBulk,
 } from '../-adl.api';
 import { formatBytes } from '../-adl.helpers';
+import { AdlBulkMatchModal } from './adl-bulk-match';
+import { AdlMatchModal, type MatchTarget } from './adl-match-modal';
+import {
+  type DlFact,
+  DlButton,
+  DlFacts,
+  DlGlyph,
+  DlIcon,
+  DlMore,
+  DlRing,
+  DlSegmented,
+} from './dl-parts';
 
 const toast = (message: string, type: string) => window.showToast?.(message, type);
 
@@ -116,8 +128,18 @@ function pct(progress: number): number {
   return Math.max(0, Math.min(100, value));
 }
 
+/** qBittorrent answers 8640000 (100 days) when it has no estimate. Anything
+ * that long is "unknown", never a real time left. */
+const NO_ESTIMATE_SECONDS = 8_640_000;
+
+/** A client's eta, or null when it is the no-estimate sentinel. */
+function etaSeconds(seconds: number | null | undefined): number | null {
+  if (!seconds || seconds <= 0 || seconds >= NO_ESTIMATE_SECONDS) return null;
+  return seconds;
+}
+
 function etaText(seconds: number | null | undefined): string {
-  if (!seconds || seconds <= 0) return '';
+  if (!seconds || seconds <= 0 || seconds >= NO_ESTIMATE_SECONDS) return '';
   if (seconds < 60) return `${Math.round(seconds)}s left`;
   if (seconds < 3600) return `${Math.round(seconds / 60)}m left`;
   return `${Math.floor(seconds / 3600)}h ${Math.round((seconds % 3600) / 60)}m left`;
@@ -136,32 +158,91 @@ function stateBucket(state: string): string {
   return 'other';
 }
 
-function StateChip({ state, error }: { state: string; error?: string | null }) {
+const STATE_WORDS: Record<string, string> = {
+  downloading: 'Downloading',
+  queued: 'Queued',
+  seeding: 'Seeding',
+  completed: 'Complete',
+  paused: 'Paused',
+  stalled: 'Stalled',
+  error: 'Error',
+};
+
+/** The state in plain words. A download with nothing moving and nothing done
+ * is waiting on peers, which "downloading" would hide. */
+function stateWords(state: string, progress: number, speed: number): string {
+  const bucket = stateBucket(state);
+  if (bucket === 'downloading' && !speed && pct(progress) === 0) return 'Waiting for peers';
+  return STATE_WORDS[bucket] ?? state;
+}
+
+const KIND_LABELS: Record<string, string> = {
+  movie: 'Movie',
+  show: 'TV',
+  episode: 'Episode',
+  season: 'Season',
+  video: 'Video',
+  audiobook: 'Audiobook',
+  album: 'Album',
+  track: 'Track',
+};
+
+function KindIcon({ kind }: { kind?: string }) {
+  const common = {
+    width: 22,
+    height: 22,
+    viewBox: '0 0 24 24',
+    fill: 'none',
+    stroke: 'currentColor',
+    strokeWidth: 1.7,
+    strokeLinecap: 'round' as const,
+    strokeLinejoin: 'round' as const,
+    'aria-hidden': true,
+  };
+  if (kind === 'movie')
+    return (
+      <svg {...common}>
+        <rect x="3" y="4" width="18" height="16" rx="2" />
+        <path d="M7 4v16M17 4v16M3 9h4M3 15h4M17 9h4M17 15h4" />
+      </svg>
+    );
+  if (kind === 'show' || kind === 'episode' || kind === 'season' || kind === 'video')
+    return (
+      <svg {...common}>
+        <rect x="3" y="5" width="18" height="12" rx="2" />
+        <path d="M8 21h8M12 17v4" />
+      </svg>
+    );
+  if (kind === 'audiobook')
+    return (
+      <svg {...common}>
+        <path d="M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2z" />
+        <path d="M4 21V5M9 7h6" />
+      </svg>
+    );
+  if (kind === 'album' || kind === 'track')
+    return (
+      <svg {...common}>
+        <path d="M9 18V5l12-2v13" />
+        <circle cx="6" cy="18" r="3" />
+        <circle cx="18" cy="16" r="3" />
+      </svg>
+    );
   return (
-    <span
-      className={`adl-client-state adl-client-state-${stateBucket(state)}`}
-      title={error || state}
-    >
-      {state}
-    </span>
+    <svg {...common}>
+      <path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z" />
+      <path d="M14 3v6h6" />
+    </svg>
   );
 }
 
+/** what SoulSync knows this download as. nothing for one it didn't send. */
 function SoulsyncChip({ item }: { item: { soulsync?: { kind?: string; title?: string } } }) {
-  if (!item.soulsync) {
-    return (
-      <span
-        className="adl-client-owner adl-client-owner-external"
-        title="Not dispatched by SoulSync"
-      >
-        external
-      </span>
-    );
-  }
-  const label = item.soulsync.title || item.soulsync.kind || 'SoulSync';
+  if (!item.soulsync) return null;
+  const kind = item.soulsync.kind ? KIND_LABELS[item.soulsync.kind] : '';
   return (
-    <span className="adl-client-owner" title={`SoulSync dispatched this: ${label}`}>
-      {label}
+    <span className="dlc-tag dlc-tag-hq dlc-owner" title="SoulSync is following this download">
+      {kind ? `SoulSync · ${kind}` : 'SoulSync'}
     </span>
   );
 }
@@ -169,6 +250,43 @@ function SoulsyncChip({ item }: { item: { soulsync?: { kind?: string; title?: st
 /* ── the list view: search, state filter, sort ───────────────────────────── */
 
 export type ClientSort = 'default' | 'speed' | 'progress' | 'name' | 'size';
+
+/** Whose downloads to show: everything, the ones SoulSync follows, or the rest. */
+export type OwnerFilter = 'all' | 'soulsync' | 'external';
+
+export function byOwner<T extends { soulsync?: unknown }>(items: T[], owner: OwnerFilter): T[] {
+  if (owner === 'all') return items;
+  return items.filter((item) => Boolean(item.soulsync) === (owner === 'soulsync'));
+}
+
+/** the client's own category. '' is the torrents that have none. */
+export const ALL_CATEGORIES = '*';
+
+export function byCategory<T extends { category?: string | null }>(
+  items: T[],
+  category: string,
+): T[] {
+  if (category === ALL_CATEGORIES) return items;
+  return items.filter((item) => (item.category || '') === category);
+}
+
+/** every category the client reported, with counts, most used first, the uncategorized last. */
+export function categoryCounts<T extends { category?: string | null }>(
+  items: T[],
+): [string, number][] {
+  const counts = new Map<string, number>();
+  for (const item of items)
+    counts.set(item.category || '', (counts.get(item.category || '') ?? 0) + 1);
+  return [...counts.entries()].sort(
+    (a, b) => Number(!a[0]) - Number(!b[0]) || b[1] - a[1] || a[0].localeCompare(b[0]),
+  );
+}
+
+const OWNER_CHOICES: { key: OwnerFilter; label: string }[] = [
+  { key: 'all', label: 'All' },
+  { key: 'soulsync', label: "SoulSync's" },
+  { key: 'external', label: 'Not in SoulSync' },
+];
 
 interface ViewAccessors<T> {
   name: (item: T) => string;
@@ -219,10 +337,58 @@ const STATE_CHIP_ORDER = [
   'other',
 ];
 
+/**
+ * A row of count chips, one of which is on: the owner switch and the state
+ * filter use the same look as the Downloads filters. single-choice, so it's a
+ * radio group to a screen reader.
+ */
+function CountChips<V extends string>({
+  label,
+  options,
+  value,
+  onChange,
+}: {
+  label: string;
+  options: { value: V; label: string; count: number; bad?: boolean }[];
+  value: V;
+  onChange: (value: V) => void;
+}) {
+  return (
+    <div className="dlh-chips dlc-chips-inline" role="radiogroup" aria-label={label}>
+      {options.map((o) => (
+        <button
+          key={o.value}
+          type="button"
+          role="radio"
+          aria-checked={value === o.value}
+          className={`dlh-chip${value === o.value ? ' dlh-chip-on' : ''}${o.count ? '' : ' dlh-chip-zero'}${o.bad && o.count ? ' dlh-chip-bad' : ''}`}
+          data-chip={o.value}
+          onClick={() => onChange(o.value)}
+        >
+          {o.label}
+          {o.count ? <b>{o.count}</b> : null}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+const STATE_CHIP_LABELS: Record<string, string> = {
+  downloading: 'Downloading',
+  queued: 'Queued',
+  seeding: 'Seeding',
+  paused: 'Paused',
+  stalled: 'Stalled',
+  completed: 'Complete',
+  error: 'Errors',
+  other: 'Other',
+};
+
 function ClientToolbar({
-  items,
-  totalSpeed,
-  upSpeed,
+  lead,
+  owner,
+  onOwner,
+  ownerCounts,
   search,
   onSearch,
   stateFilter,
@@ -230,12 +396,18 @@ function ClientToolbar({
   sort,
   onSort,
   stateOf,
-  link,
-  onRefresh,
+  categories,
+  category,
+  onCategory,
+  shown,
 }: {
-  items: { length: number };
-  totalSpeed: number;
-  upSpeed?: number;
+  /** how many rows the filters leave on screen. */
+  shown: number;
+  /** the slskd downloads/uploads switch, when there is one. */
+  lead?: React.ReactNode;
+  owner: OwnerFilter;
+  onOwner: (value: OwnerFilter) => void;
+  ownerCounts: Record<OwnerFilter, number>;
   search: string;
   onSearch: (value: string) => void;
   stateFilter: string;
@@ -243,67 +415,93 @@ function ClientToolbar({
   sort: ClientSort;
   onSort: (value: ClientSort) => void;
   stateOf: Map<string, number>;
-  link: string;
-  onRefresh: () => void;
+  /** the client's categories; the picker shows only when a torrent has one. */
+  categories?: [string, number][];
+  category?: string;
+  onCategory?: (value: string) => void;
 }) {
+  const showCategories = Boolean(categories?.some(([name]) => name) && onCategory);
+  const total = [...stateOf.values()].reduce((a, b) => a + b, 0);
   return (
-    <div className="adl-client-toolbar">
-      <input
-        type="text"
-        className="adl-client-search"
-        placeholder="Filter by name…"
-        value={search}
-        onChange={(event) => onSearch(event.target.value)}
+    <div className="dlc-toolbar">
+      {lead}
+      <CountChips
+        label="Whose downloads"
+        value={owner}
+        onChange={onOwner}
+        options={OWNER_CHOICES.map((c) => ({
+          value: c.key,
+          label: c.label,
+          count: ownerCounts[c.key],
+        }))}
       />
-      <div className="adl-client-state-chips">
-        <button
-          type="button"
-          className={`adl-client-chip${stateFilter === 'all' ? ' active' : ''}`}
-          onClick={() => onStateFilter('all')}
+      <span className="dlc-vsep" aria-hidden="true" />
+      <CountChips
+        label="State"
+        value={stateFilter}
+        // a second click on the active state goes back to everything
+        onChange={(v) => onStateFilter(v === stateFilter && v !== 'all' ? 'all' : v)}
+        options={[
+          { value: 'all', label: 'Any state', count: total },
+          ...STATE_CHIP_ORDER.filter((bucket) => stateOf.get(bucket)).map((bucket) => ({
+            value: bucket,
+            label: STATE_CHIP_LABELS[bucket] ?? bucket,
+            count: stateOf.get(bucket) ?? 0,
+            bad: bucket === 'error' || bucket === 'stalled',
+          })),
+        ]}
+      />
+      <label className="dlc-search">
+        <svg
+          width="14"
+          height="14"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          aria-hidden="true"
         >
-          all
-        </button>
-        {STATE_CHIP_ORDER.filter((bucket) => stateOf.get(bucket)).map((bucket) => (
-          <button
-            key={bucket}
-            type="button"
-            className={`adl-client-chip${stateFilter === bucket ? ' active' : ''}`}
-            onClick={() => onStateFilter(stateFilter === bucket ? 'all' : bucket)}
-          >
-            {bucket} ({stateOf.get(bucket)})
-          </button>
-        ))}
-      </div>
+          <circle cx="11" cy="11" r="7" />
+          <path d="m20 20-3.5-3.5" />
+        </svg>
+        <input
+          type="text"
+          className="dlc-search-input"
+          placeholder="Filter by name"
+          aria-label="Filter by name"
+          value={search}
+          onChange={(event) => onSearch(event.target.value)}
+        />
+      </label>
+      {showCategories ? (
+        <select
+          className="dlc-select"
+          title="The download client's own category"
+          aria-label="Category"
+          value={category}
+          onChange={(event) => onCategory?.(event.target.value)}
+        >
+          <option value={ALL_CATEGORIES}>All categories</option>
+          {categories?.map(([name, count]) => (
+            <option key={name || '(none)'} value={name}>
+              {name || 'No category'} ({count})
+            </option>
+          ))}
+        </select>
+      ) : null}
       <select
-        className="adl-deleted-retention adl-client-sort"
-        title="Sort"
+        className="dlc-select"
+        aria-label="Sort"
         value={sort}
         onChange={(event) => onSort(event.target.value as ClientSort)}
       >
-        <option value="default">client order</option>
-        <option value="speed">fastest first</option>
-        <option value="progress">most complete</option>
-        <option value="name">name</option>
-        <option value="size">largest</option>
+        <option value="default">Client order</option>
+        <option value="speed">Fastest first</option>
+        <option value="progress">Most complete</option>
+        <option value="name">Name</option>
+        <option value="size">Largest</option>
       </select>
-      <span className="adl-client-aggregate">
-        {items.length} shown · ↓ {formatBytes(totalSpeed) || '0 B'}/s
-        {upSpeed !== undefined ? <> · ↑ {formatBytes(upSpeed) || '0 B'}/s</> : null}
-      </span>
-      <button type="button" className="verif-act" title="Refresh now" onClick={onRefresh}>
-        ⟳
-      </button>
-      {link ? (
-        <a
-          className="verif-act adl-client-open-link"
-          href={link}
-          target="_blank"
-          rel="noreferrer"
-          title="Open the client's own web UI in a new tab"
-        >
-          ↗
-        </a>
-      ) : null}
+      <span className="dlc-toolbar-count">{shown} shown</span>
     </div>
   );
 }
@@ -317,19 +515,16 @@ function bucketCounts<T>(items: T[], stateOf: (item: T) => string): Map<string, 
   return counts;
 }
 
+/** Paste a magnet / .torrent / .nzb url and send it to the client. Opened from the Add button. */
 function AddBox({
-  label,
   placeholder,
   onAdd,
+  onClose,
 }: {
-  /** The reveal button's text ("+ add torrent"). */
-  label: string;
   placeholder: string;
   onAdd: (url: string) => Promise<boolean>;
+  onClose: () => void;
 }) {
-  // Folded by default: a permanently open bare input right under the filter
-  // input read as two lookalike text boxes stacked.
-  const [open, setOpen] = useState(false);
   const [url, setUrl] = useState('');
   const [busy, setBusy] = useState(false);
   const submit = () => {
@@ -339,52 +534,31 @@ function AddBox({
       setBusy(false);
       if (ok) {
         setUrl('');
-        setOpen(false);
+        onClose();
       }
     });
   };
-  if (!open) {
-    return (
-      <button
-        type="button"
-        className="adl-filter-banner-clear adl-client-add-toggle"
-        title={placeholder}
-        onClick={() => setOpen(true)}
-      >
-        {label}
-      </button>
-    );
-  }
   return (
-    <div className="adl-client-addbox">
+    <div className="dlc-addbox">
       <input
         type="text"
-        className="adl-client-search adl-client-add-input"
+        className="dlc-addbox-input"
         placeholder={placeholder}
+        aria-label={placeholder}
         value={url}
         autoFocus
         onChange={(event) => setUrl(event.target.value)}
         onKeyDown={(event) => {
           if (event.key === 'Enter') submit();
-          if (event.key === 'Escape') setOpen(false);
+          if (event.key === 'Escape') onClose();
         }}
       />
-      <button
-        type="button"
-        className="adl-filter-banner-clear"
-        disabled={busy || !url.trim()}
-        onClick={submit}
-      >
-        {busy ? 'Adding…' : '+ Add'}
-      </button>
-      <button
-        type="button"
-        className="adl-filter-banner-clear"
-        title="Close without adding"
-        onClick={() => setOpen(false)}
-      >
-        ✕
-      </button>
+      <DlButton primary disabled={busy || !url.trim()} onClick={submit}>
+        {busy ? 'Adding…' : 'Add'}
+      </DlButton>
+      <DlButton title="Close without adding" onClick={onClose}>
+        Cancel
+      </DlButton>
     </div>
   );
 }
@@ -392,170 +566,338 @@ function AddBox({
 /** [label, value] pairs; empty values are dropped so the grid stays tight. */
 type DetailPairs = [string, string | null | undefined][];
 
+/** the "where" half of a client row's sheet; everything else is the transfer. */
+const WHERE_KEYS = new Set([
+  'Remote path',
+  'Local file',
+  'Save path',
+  'Content path',
+  'Staging path',
+  'Category',
+  'Hash',
+  'Job id',
+  'Transfer id',
+  'SoulSync',
+]);
+const MONO_KEYS = new Set([
+  'Remote path',
+  'Local file',
+  'Save path',
+  'Content path',
+  'Staging path',
+  'Hash',
+  'Job id',
+  'Transfer id',
+]);
+
 function durationText(seconds: number | null | undefined): string {
   if (!seconds || seconds <= 0) return '';
   if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
   return `${Math.floor(seconds / 3600)}h ${Math.round((seconds % 3600) / 60)}m`;
 }
 
+interface MenuAction {
+  label: string;
+  onSelect: () => void;
+  danger?: boolean;
+}
+
+const WarnIcon = (
+  <svg
+    width="18"
+    height="18"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="2.2"
+    strokeLinecap="round"
+    aria-hidden="true"
+  >
+    <circle cx="12" cy="12" r="9" />
+    <path d="M12 8v5M12 16.5h.01" />
+  </svg>
+);
+
 function ClientRow({
   name,
+  title,
   sub,
+  kind,
   state,
+  label,
   error,
   progress,
   detail,
   details,
   owner,
-  actions,
+  primary,
+  menu,
   expanded,
   onToggle,
+  select,
 }: {
+  /** the name the client shows */
   name: string;
+  /** a clean title, when SoulSync knows what this is */
+  title?: string;
   sub?: string;
+  kind?: string;
   state: string;
+  /** the state in plain words */
+  label: string;
   error?: string | null;
   progress: number;
   detail: string;
-  /** everything the client knows, shown when the card is open. */
+  /** everything the client knows, shown when the row is open. */
   details: DetailPairs;
   owner: React.ReactNode;
-  actions: React.ReactNode;
+  /** the one action the row leads with */
+  primary: React.ReactNode;
+  /** everything else, behind the ⋯ button */
+  menu: MenuAction[];
   expanded: boolean;
   onToggle: () => void;
+  /** the bulk-match select box, on a download SoulSync doesn't follow */
+  select?: { checked: boolean; onChange: () => void; label: string };
 }) {
   const bucket = stateBucket(state);
   const shown = details.filter(([, value]) => value != null && String(value).trim() !== '');
+  const heading = title || name;
+  const percent = Math.round(pct(progress));
+  const moving = bucket === 'downloading' && percent > 0 && percent < 100;
+  const toFact = ([k, v]: [string, string | null | undefined]): DlFact => [
+    k,
+    String(v),
+    MONO_KEYS.has(k) ? { mono: true, copy: String(v) } : undefined,
+  ];
+  const transfer = shown.filter(([k]) => !WHERE_KEYS.has(k)).map(toFact);
+  const where = shown.filter(([k]) => WHERE_KEYS.has(k)).map(toFact);
+  const subLine = sub || (heading !== name ? name : '');
   return (
-    <div
-      className={`adl-client-card${expanded ? ' expanded' : ''}`}
-      data-state={bucket}
-      title={expanded ? undefined : 'Click to show everything the client reports'}
-      onClick={onToggle}
-    >
-      <div className="adl-client-card-main">
-        <div className="adl-row-info">
-          <div className="adl-client-row-top">
-            <span className="adl-row-title" title={name}>
-              {name}
-            </span>
+    <>
+      <div
+        className={`dlc-row dlc-client-row${expanded ? ' dlc-row-open' : ''}${select?.checked ? ' dlc-row-sel' : ''}`}
+        data-state={bucket}
+        role="button"
+        tabIndex={0}
+        aria-expanded={expanded}
+        onClick={onToggle}
+        onKeyDown={(e) => {
+          if (e.target !== e.currentTarget) return;
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            onToggle();
+          }
+        }}
+      >
+        <div className="dlc-lead-wrap">
+          <DlGlyph
+            tone={
+              bucket === 'error'
+                ? 'bad'
+                : bucket === 'seeding' || bucket === 'completed'
+                  ? 'ok'
+                  : undefined
+            }
+          >
+            {bucket === 'error' ? WarnIcon : <KindIcon kind={kind} />}
+          </DlGlyph>
+          {moving ? <DlRing pct={percent} /> : null}
+          {select ? (
+            <button
+              type="button"
+              role="checkbox"
+              aria-checked={select.checked}
+              aria-label={select.label}
+              className={`dlc-check${select.checked ? ' dlc-check-on' : ''}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                select.onChange();
+              }}
+            >
+              {select.checked ? DlIcon.check : null}
+            </button>
+          ) : null}
+        </div>
+        <div className="dlc-main">
+          <div className="dlc-title" title={heading}>
+            {heading}
             {owner}
           </div>
-          {sub ? <div className="adl-row-meta">{sub}</div> : null}
-          <div className="adl-client-progress" data-state={bucket}>
-            <div className="adl-client-progress-fill" style={{ width: `${pct(progress)}%` }} />
-          </div>
-          <div className="adl-client-row-stats">
-            <span>{Math.round(pct(progress))}%</span>
-            {detail ? <span>{detail}</span> : null}
-          </div>
+          {error ? (
+            <div className="dlc-sub dlc-sub-bad">{error}</div>
+          ) : subLine ? (
+            <div className={`dlc-sub${subLine === name ? ' dlc-mono' : ''}`} title={subLine}>
+              {subLine}
+            </div>
+          ) : null}
         </div>
-        <div
-          className="verif-actions adl-client-actions"
-          onClick={(event) => event.stopPropagation()}
-        >
-          <StateChip state={state} error={error} />
-          {actions}
-          <span className={`adl-client-chevron${expanded ? ' open' : ''}`} aria-hidden>
-            ▾
+        <div className="dlc-meta">
+          <span className={`dlc-state dlc-cstate-${bucket}`}>
+            {bucket === 'downloading' && percent > 0 ? `${percent}%` : label}
           </span>
+          {detail ? <span>{detail}</span> : null}
         </div>
+        <div className="dlc-acts" onClick={(e) => e.stopPropagation()}>
+          {primary}
+          <DlMore
+            items={menu.map((m, i) => ({
+              key: `${i}`,
+              label: m.label,
+              danger: m.danger,
+              onSelect: m.onSelect,
+            }))}
+            label={`More actions for ${heading}`}
+          />
+        </div>
+        {moving || bucket === 'seeding' ? (
+          <div className="dlc-rowbar" aria-hidden="true">
+            <i
+              className={bucket === 'seeding' ? 'dlc-rowbar-seed' : undefined}
+              style={{ width: `${percent}%` }}
+            />
+          </div>
+        ) : null}
       </div>
       {expanded ? (
-        <div className="adl-client-details" onClick={(event) => event.stopPropagation()}>
-          {error ? <div className="adl-client-details-error">{error}</div> : null}
-          <dl>
-            {shown.map(([label, value]) => (
-              <div className="adl-client-detail" key={label}>
-                <dt>{label}</dt>
-                <dd title={String(value)}>{String(value)}</dd>
-              </div>
-            ))}
-          </dl>
+        <div className="dlc-sheet dlc-client-sheet" onClick={(e) => e.stopPropagation()}>
+          {error ? <div className="dlc-sheet-error">{error}</div> : null}
+          <div className="dlc-sheet-cols">
+            <section>
+              <h4 className="dlc-sheet-h">Transfer</h4>
+              <DlFacts facts={transfer} />
+            </section>
+            <section>
+              <h4 className="dlc-sheet-h">Where</h4>
+              <DlFacts facts={where} />
+            </section>
+          </div>
         </div>
       ) : null}
-    </div>
+    </>
   );
 }
 
+const CLIENT_NAMES: Record<ClientSubTab, string> = {
+  soulseek: 'Soulseek',
+  torrent: 'torrent client',
+  usenet: 'usenet client',
+};
+const CLIENT_PITCH: Record<ClientSubTab, string> = {
+  soulseek:
+    'Connect slskd and its transfers show up here: what SoulSync is pulling, what other people are pulling from you.',
+  torrent:
+    'Connect qBittorrent, Transmission, Deluge or aria2 and its torrents show up here, next to Soulseek. SoulSync can then grab releases from your indexers too.',
+  usenet:
+    'Connect SABnzbd or NZBGet and its queue shows up here, next to Soulseek and your torrent client. SoulSync can then grab from your indexers too.',
+};
+
+const PlugIcon = (
+  <svg
+    width="22"
+    height="22"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.8"
+    strokeLinecap="round"
+    aria-hidden="true"
+  >
+    <path d="M9 2v6M15 2v6M7 8h10v4a5 5 0 0 1-10 0zM12 17v5" />
+  </svg>
+);
+
 function EmptyState({
+  tab,
   health,
   fetchError,
   overview,
   noun,
+  onSettings,
 }: {
+  tab: ClientSubTab;
   health: Health;
   fetchError: string | null;
   overview: ClientOverview<unknown> | null;
   noun: string;
+  onSettings: () => void;
 }) {
-  if (health === 'wait') return <div className="adl-client-empty">loading…</div>;
+  if (health === 'wait') return <div className="dlc-loading">Checking the client…</div>;
   if (overview === null) {
-    // every fetch so far failed - say WHY instead of spinning forever
+    // every fetch so far failed. say WHY instead of spinning forever
     return (
-      <div className="adl-client-empty adl-client-empty-error">
-        couldn't load this from the SoulSync server{fetchError ? ` — ${fetchError}` : ''}
+      <div className="dlc-emptycard">
+        <DlGlyph tone="bad">{WarnIcon}</DlGlyph>
+        <div>
+          <h3>Couldn&apos;t ask the SoulSync server</h3>
+          <p>{fetchError || 'The request failed.'} It tries again every 10 seconds.</p>
+        </div>
       </div>
     );
   }
   if (!overview.configured) {
     return (
-      <div className="adl-client-empty">
-        nothing set up — configure a client in Settings and it shows up here
+      <div className="dlc-emptycard">
+        <DlGlyph>{PlugIcon}</DlGlyph>
+        <div>
+          <h3>No {CLIENT_NAMES[tab]} connected</h3>
+          <p>{CLIENT_PITCH[tab]}</p>
+          <DlButton primary onClick={onSettings}>
+            Set it up in Settings
+          </DlButton>
+        </div>
       </div>
     );
   }
   if (!overview.connected) {
     return (
-      <div className="adl-client-empty adl-client-empty-error">
-        {overview.error || 'could not reach the client'}
+      <div className="dlc-emptycard">
+        <DlGlyph tone="bad">{WarnIcon}</DlGlyph>
+        <div>
+          <h3>Can&apos;t reach the {CLIENT_NAMES[tab]}</h3>
+          <p>
+            {overview.error || 'It is set up, but it is not answering.'} SoulSync tries again every
+            10 seconds.
+          </p>
+          <DlButton onClick={onSettings}>Check the connection</DlButton>
+        </div>
       </div>
     );
   }
-  return <div className="adl-client-empty">no {noun} right now — all quiet</div>;
+  return <div className="dlc-empty-line">No {noun} right now. All quiet.</div>;
 }
 
-function PauseResumeRemove({
-  item,
-  onAction,
-}: {
-  item: { id: string; name: string; state: string };
-  onAction: (id: string, action: ClientAction, deleteFiles: boolean) => void;
-}) {
-  const paused = stateBucket(item.state) === 'paused';
-  return (
-    <>
-      <button
-        type="button"
-        className="verif-act"
-        title={paused ? 'Resume' : 'Pause'}
-        onClick={() => onAction(item.id, paused ? 'resume' : 'pause', false)}
-      >
-        {paused ? '▶' : '⏸'}
-      </button>
-      <button
-        type="button"
-        className="verif-act verif-act-del"
-        title="Remove from the client (asks about the files)"
-        onClick={() => {
-          void (async () => {
-            const withFiles = await window.showConfirmDialog?.({
-              title: 'Remove Download',
-              message: `Remove "${item.name}" from the client? Choose whether the downloaded files are deleted too.`,
-              confirmText: 'Remove + delete files',
-              cancelText: 'Remove only',
-              destructive: true,
-            });
-            // ESC closes the dialog and resolves undefined - do nothing then.
-            if (withFiles === undefined) return;
-            onAction(item.id, 'remove', Boolean(withFiles));
-          })();
-        }}
-      >
-        🗑
-      </button>
-    </>
-  );
+/** Pause or resume, then remove (which asks about the files). */
+function clientActions(
+  item: { id: string; name: string; state: string },
+  onAction: (id: string, action: ClientAction, deleteFiles: boolean) => void,
+): MenuAction[] {
+  // an errored download restarts the same way a paused one does
+  const paused = ['paused', 'error'].includes(stateBucket(item.state));
+  return [
+    {
+      label: paused ? 'Resume' : 'Pause',
+      onSelect: () => onAction(item.id, paused ? 'resume' : 'pause', false),
+    },
+    {
+      label: 'Remove…',
+      danger: true,
+      onSelect: () => {
+        void (async () => {
+          const withFiles = await window.showConfirmDialog?.({
+            title: 'Remove Download',
+            message: `Remove "${item.name}" from the client? Choose whether the downloaded files are deleted too.`,
+            confirmText: 'Remove + delete files',
+            cancelText: 'Remove only',
+            destructive: true,
+          });
+          // ESC closes the dialog and resolves undefined - do nothing then.
+          if (withFiles === undefined) return;
+          onAction(item.id, 'remove', Boolean(withFiles));
+        })();
+      },
+    },
+  ];
 }
 
 /* ── the tab ─────────────────────────────────────────────────────────────── */
@@ -570,8 +912,18 @@ export function AdlClientsTab() {
   const [search, setSearch] = useState('');
   const [stateFilter, setStateFilter] = useState('all');
   const [sort, setSort] = useState<ClientSort>('default');
+  // kept across client tabs: "show me what SoulSync isn't following" is a
+  // question about every client at once
+  const [owner, setOwner] = useState<OwnerFilter>('all');
+  const [category, setCategory] = useState(ALL_CATEGORIES);
   const [slskdView, setSlskdView] = useState<'downloads' | 'uploads'>('downloads');
   const [links, setLinks] = useState<ClientLinks | null>(null);
+  // the download being matched by hand, or null when the window is closed
+  const [matching, setMatching] = useState<MatchTarget | null>(null);
+  // bulk match & import: the checked downloads, by `${client}:${id}`
+  const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
+  const [bulkTargets, setBulkTargets] = useState<MatchTarget[] | null>(null);
+  const [addOpen, setAddOpen] = useState(false);
 
   useEffect(() => {
     let live = true;
@@ -592,8 +944,23 @@ export function AdlClientsTab() {
     });
   }, []);
 
+  const toggleSelected = useCallback((key: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
+
+  // a selection belongs to the client it was made in
+  useEffect(() => {
+    setSelected(new Set());
+  }, [tab]);
+
   const switchTab = useCallback((next: ClientSubTab) => {
     setTab(next);
+    setAddOpen(false);
     setSearch('');
     setStateFilter('all');
   }, []);
@@ -622,9 +989,9 @@ export function AdlClientsTab() {
     label: string;
     state: ClientState<unknown>;
   }[] = [
-    { key: 'soulseek', label: '🎧 Soulseek', state: slskd },
-    { key: 'torrent', label: '🧲 Torrents', state: torrent },
-    { key: 'usenet', label: '📰 Usenet', state: usenet },
+    { key: 'soulseek', label: 'Soulseek', state: slskd },
+    { key: 'torrent', label: 'Torrents', state: torrent },
+    { key: 'usenet', label: 'Usenet', state: usenet },
   ];
 
   const activeState = tab === 'soulseek' ? slskd : tab === 'torrent' ? torrent : usenet;
@@ -640,7 +1007,7 @@ export function AdlClientsTab() {
   /* filtered views per kind */
   const slskdSource =
     slskdView === 'uploads' ? (slskd.overview?.uploads ?? []) : (slskd.overview?.items ?? []);
-  const slskdVisible = applyView(slskdSource, search, stateFilter, sort, {
+  const slskdVisible = applyView(byOwner(slskdSource, owner), search, stateFilter, sort, {
     name: (t) => t.filename,
     speed: (t) => t.speed,
     size: (t) => t.size,
@@ -648,93 +1015,208 @@ export function AdlClientsTab() {
     state: (t) => t.state,
     haystack: (t) => t.username,
   });
-  const torrentVisible = applyView(torrent.overview?.items ?? [], search, stateFilter, sort, {
-    name: (t) => t.name,
-    speed: (t) => t.download_speed,
-    size: (t) => t.size,
-    progress: (t) => t.progress,
-    state: (t) => t.state,
-  });
-  const usenetVisible = applyView(usenet.overview?.items ?? [], search, stateFilter, sort, {
-    name: (t) => t.name,
-    speed: (t) => t.download_speed,
-    size: (t) => t.size,
-    progress: (t) => t.progress,
-    state: (t) => t.state,
-  });
-
-  const slskdRow = (item: ClientSlskdItem, readOnly: boolean) => (
-    <ClientRow
-      key={`${readOnly ? 'up' : 'dl'}:${item.username}:${item.id}`}
-      name={item.filename.split(/[\\/]/).pop() || item.filename}
-      sub={readOnly ? `to ${item.username}` : `from ${item.username}`}
-      state={item.state}
-      progress={item.progress}
-      detail={[
-        item.size ? formatBytes(item.size) : '',
-        speedText(item.speed),
-        etaText(item.time_remaining),
-      ]
-        .filter(Boolean)
-        .join(' · ')}
-      details={[
-        ['Remote path', item.filename],
-        [readOnly ? 'Peer' : 'Uploader', item.username],
-        ['State', item.state],
-        ['Size', item.size ? formatBytes(item.size) : ''],
-        ['Transferred', item.transferred ? formatBytes(item.transferred) : ''],
-        ['Speed', speedText(item.speed)],
-        ['Time left', durationText(item.time_remaining)],
-        ['Local file', item.file_path],
-        ['Transfer id', item.id],
-        ['SoulSync', item.soulsync?.title],
-      ]}
-      expanded={openCards.has(`soulseek:${slskdView}:${item.username}:${item.id}`)}
-      onToggle={() => toggleCard(`soulseek:${slskdView}:${item.username}:${item.id}`)}
-      owner={<SoulsyncChip item={item} />}
-      actions={
-        readOnly ? null : (
-          <button
-            type="button"
-            className="verif-act verif-act-del"
-            title="Cancel this transfer in slskd"
-            onClick={() =>
-              void runAction(
-                'Cancel',
-                () => slskdClientCancel(item.id, item.username, true),
-                slskd.reload,
-              )
-            }
-          >
-            ✕
-          </button>
-        )
-      }
-    />
+  const torrentCategories = categoryCounts(torrent.overview?.items ?? []);
+  // a category the client no longer reports (last one removed, client
+  // switched) would otherwise leave the list empty with nothing to undo it
+  const activeCategory =
+    category === ALL_CATEGORIES || torrentCategories.some(([name]) => name === category)
+      ? category
+      : ALL_CATEGORIES;
+  const torrentVisible = applyView(
+    byOwner(byCategory(torrent.overview?.items ?? [], activeCategory), owner),
+    search,
+    stateFilter,
+    sort,
+    {
+      name: (t) => t.name,
+      speed: (t) => t.download_speed,
+      size: (t) => t.size,
+      progress: (t) => t.progress,
+      state: (t) => t.state,
+    },
+  );
+  const usenetVisible = applyView(
+    byOwner(usenet.overview?.items ?? [], owner),
+    search,
+    stateFilter,
+    sort,
+    {
+      name: (t) => t.name,
+      speed: (t) => t.download_speed,
+      size: (t) => t.size,
+      progress: (t) => t.progress,
+      state: (t) => t.state,
+    },
   );
 
-  const torrentRow = (item: ClientTorrentItem) => (
-    <ClientRow
-      key={item.id}
-      name={item.name}
-      state={item.state}
-      error={item.error}
-      progress={item.progress}
-      detail={[
+  /* bulk match & import: only what is on screen and not followed yet, so a
+     filter change quietly drops anything it hides */
+  const selectable: MatchTarget[] =
+    tab === 'soulseek'
+      ? []
+      : (tab === 'torrent' ? torrentVisible : usenetVisible)
+          .filter((item) => !item.soulsync)
+          .map((item) => ({ client: tab, id: item.id, name: item.name, size: item.size }));
+  const selectedTargets = selectable.filter((t) => selected.has(`${t.client}:${t.id}`));
+  const showSelectionBar =
+    selectable.length > 0 && (owner === 'external' || selectedTargets.length > 0);
+
+  /** A download SoulSync didn't send leads with matching it. */
+  const matchButton = (target: MatchTarget) => (
+    <DlButton
+      primary
+      title="Match it to your library and import it"
+      onClick={() => setMatching(target)}
+    >
+      Match &amp; import
+    </DlButton>
+  );
+
+  /** slskd lists files, but a release is a folder: the target is every
+   * transfer from this peer in this folder that SoulSync isn't following. */
+  const soulseekFolder = (item: ClientSlskdItem): MatchTarget => {
+    const dirOf = (path: string) => path.replace(/[\\/][^\\/]*$/, '');
+    const dir = dirOf(item.filename);
+    const files = (slskd.overview?.items ?? []).filter(
+      (other) =>
+        other.username === item.username && dirOf(other.filename) === dir && !other.soulsync,
+    );
+    return {
+      client: 'soulseek',
+      id: '',
+      name: dir.split(/[\\/]/).pop() || item.filename,
+      size: files.reduce((sum, file) => sum + (file.size || 0), 0),
+      folder: {
+        username: item.username,
+        files: files.map((file) => ({ filename: file.filename, size: file.size })),
+      },
+    };
+  };
+
+  const slskdRow = (item: ClientSlskdItem, readOnly: boolean) => {
+    const key = `soulseek:${slskdView}:${item.username}:${item.id}`;
+    const expanded = openCards.has(key);
+    const toggle = () => toggleCard(key);
+    const matchable = !readOnly && !item.soulsync;
+    const cancel: MenuAction = {
+      label: 'Cancel transfer',
+      danger: true,
+      onSelect: () =>
+        void runAction(
+          'Cancel',
+          () => slskdClientCancel(item.id, item.username, true),
+          slskd.reload,
+        ),
+    };
+    return (
+      <ClientRow
+        key={`${readOnly ? 'up' : 'dl'}:${item.username}:${item.id}`}
+        name={item.filename.split(/[\\/]/).pop() || item.filename}
+        sub={readOnly ? `to ${item.username}` : `from ${item.username}`}
+        kind={item.soulsync?.kind}
+        state={item.state}
+        label={stateWords(item.state, item.progress, item.speed)}
+        progress={item.progress}
+        detail={[
+          item.size ? formatBytes(item.size) : '',
+          speedText(item.speed),
+          etaText(item.time_remaining),
+        ]
+          .filter(Boolean)
+          .join(' · ')}
+        details={[
+          ['Remote path', item.filename],
+          [readOnly ? 'Peer' : 'Uploader', item.username],
+          ['State', item.state],
+          ['Size', item.size ? formatBytes(item.size) : ''],
+          ['Transferred', item.transferred ? formatBytes(item.transferred) : ''],
+          ['Speed', speedText(item.speed)],
+          ['Time left', durationText(item.time_remaining)],
+          ['Local file', item.file_path],
+          ['Transfer id', item.id],
+          ['SoulSync', item.soulsync?.title],
+        ]}
+        expanded={expanded}
+        onToggle={toggle}
+        owner={<SoulsyncChip item={item} />}
+        primary={matchable ? matchButton(soulseekFolder(item)) : null}
+        menu={readOnly ? [] : [cancel]}
+      />
+    );
+  };
+
+  /** The torrent or usenet card: the same card, different numbers. */
+  const jobRow = (
+    client: 'torrent' | 'usenet',
+    item: ClientTorrentItem | ClientUsenetItem,
+    detail: string,
+    details: DetailPairs,
+    onAction: (id: string, action: ClientAction, deleteFiles: boolean) => void,
+  ) => {
+    const key = `${client}:${item.id}`;
+    const expanded = openCards.has(key);
+    const toggle = () => toggleCard(key);
+    const tracked = Boolean(item.soulsync);
+    const actions = clientActions(item, onAction);
+    return (
+      <ClientRow
+        key={item.id}
+        name={item.name}
+        title={item.soulsync?.title || undefined}
+        kind={item.soulsync?.kind}
+        state={item.state}
+        label={stateWords(item.state, item.progress, item.download_speed)}
+        error={item.error}
+        progress={item.progress}
+        detail={detail}
+        details={details}
+        expanded={expanded}
+        onToggle={toggle}
+        owner={<SoulsyncChip item={item} />}
+        // a followed download leads with pause/resume; one SoulSync didn't
+        // send leads with matching it
+        primary={
+          tracked ? (
+            <DlButton onClick={actions[0].onSelect}>{actions[0].label}</DlButton>
+          ) : (
+            matchButton({ client, id: item.id, name: item.name, size: item.size })
+          )
+        }
+        select={
+          tracked
+            ? undefined
+            : {
+                checked: selected.has(key),
+                onChange: () => toggleSelected(key),
+                label: `Select ${item.name}`,
+              }
+        }
+        menu={tracked ? actions.slice(1) : actions}
+      />
+    );
+  };
+
+  const torrentRow = (item: ClientTorrentItem) => {
+    const bucket = stateBucket(item.state);
+    return jobRow(
+      'torrent',
+      item,
+      [
         item.size ? formatBytes(item.size) : '',
+        bucket === 'seeding' && item.ratio != null ? `ratio ${item.ratio.toFixed(2)}` : '',
         speedText(item.download_speed),
-        etaText(item.eta),
+        bucket === 'downloading' ? etaText(item.eta) : '',
         item.seeders ? `${item.seeders} seeders` : '',
       ]
         .filter(Boolean)
-        .join(' · ')}
-      details={[
+        .join(' · '),
+      [
         ['State', item.state],
         ['Size', item.size ? formatBytes(item.size) : ''],
         ['Downloaded', item.downloaded ? formatBytes(item.downloaded) : ''],
         ['Down speed', speedText(item.download_speed)],
         ['Up speed', speedText(item.upload_speed)],
-        ['ETA', durationText(item.eta)],
+        ['ETA', bucket === 'downloading' ? durationText(etaSeconds(item.eta)) : ''],
         ['Seeders', item.seeders ? String(item.seeders) : ''],
         ['Peers', item.peers ? String(item.peers) : ''],
         ['Ratio', item.ratio != null ? item.ratio.toFixed(2) : ''],
@@ -743,68 +1225,42 @@ export function AdlClientsTab() {
         ['Content path', item.content_path],
         ['Hash', item.id],
         ['SoulSync', item.soulsync?.title],
-      ]}
-      expanded={openCards.has(`torrent:${item.id}`)}
-      onToggle={() => toggleCard(`torrent:${item.id}`)}
-      owner={<SoulsyncChip item={item} />}
-      actions={
-        <PauseResumeRemove
-          item={item}
-          onAction={(id, action, deleteFiles) =>
-            void runAction(
-              action === 'remove' ? 'Remove' : action === 'pause' ? 'Pause' : 'Resume',
-              () => torrentClientAction(id, action, deleteFiles),
-              torrent.reload,
-            )
-          }
-        />
-      }
-    />
-  );
+      ],
+      (id, action, deleteFiles) =>
+        void runAction(
+          action === 'remove' ? 'Remove' : action === 'pause' ? 'Pause' : 'Resume',
+          () => torrentClientAction(id, action, deleteFiles),
+          torrent.reload,
+        ),
+    );
+  };
 
-  const usenetRow = (item: ClientUsenetItem) => (
-    <ClientRow
-      key={item.id}
-      name={item.name}
-      state={item.state}
-      error={item.error}
-      progress={item.progress}
-      detail={[
-        item.size ? formatBytes(item.size) : '',
-        speedText(item.download_speed),
-        etaText(item.eta),
-      ]
+  const usenetRow = (item: ClientUsenetItem) =>
+    jobRow(
+      'usenet',
+      item,
+      [item.size ? formatBytes(item.size) : '', speedText(item.download_speed), etaText(item.eta)]
         .filter(Boolean)
-        .join(' · ')}
-      details={[
+        .join(' · '),
+      [
         ['State', item.state],
         ['Size', item.size ? formatBytes(item.size) : ''],
         ['Downloaded', item.downloaded ? formatBytes(item.downloaded) : ''],
         ['Speed', speedText(item.download_speed)],
-        ['ETA', durationText(item.eta)],
+        ['ETA', durationText(etaSeconds(item.eta))],
         ['Category', item.category],
         ['Save path', item.save_path],
         ['Staging path', item.incomplete_path],
         ['Job id', item.id],
         ['SoulSync', item.soulsync?.title],
-      ]}
-      expanded={openCards.has(`usenet:${item.id}`)}
-      onToggle={() => toggleCard(`usenet:${item.id}`)}
-      owner={<SoulsyncChip item={item} />}
-      actions={
-        <PauseResumeRemove
-          item={item}
-          onAction={(id, action, deleteFiles) =>
-            void runAction(
-              action === 'remove' ? 'Remove' : action === 'pause' ? 'Pause' : 'Resume',
-              () => usenetClientAction(id, action, deleteFiles),
-              usenet.reload,
-            )
-          }
-        />
-      }
-    />
-  );
+      ],
+      (id, action, deleteFiles) =>
+        void runAction(
+          action === 'remove' ? 'Remove' : action === 'pause' ? 'Pause' : 'Resume',
+          () => usenetClientAction(id, action, deleteFiles),
+          usenet.reload,
+        ),
+    );
 
   const connectedWithItems = (state: ClientState<unknown>) => Boolean(state.overview?.connected);
 
@@ -814,9 +1270,15 @@ export function AdlClientsTab() {
     tab === 'soulseek'
       ? slskdSource
       : tab === 'torrent'
-        ? (torrent.overview?.items ?? [])
+        ? byCategory(torrent.overview?.items ?? [], activeCategory)
         : (usenet.overview?.items ?? []);
   const stateCounts = bucketCounts(activeAll as { state: string }[], (item) => item.state);
+  const owned = (activeAll as { soulsync?: unknown }[]).filter((item) => item.soulsync).length;
+  const ownerCounts: Record<OwnerFilter, number> = {
+    all: activeAll.length,
+    soulsync: owned,
+    external: activeAll.length - owned,
+  };
   const downSpeed = activeVisible.reduce(
     (sum, item) =>
       sum +
@@ -858,90 +1320,201 @@ export function AdlClientsTab() {
           : ''
       : '';
 
+  const typeName = typeLabel || (tab === 'soulseek' ? 'slskd' : '');
+  const buckets = stateCounts;
+  const n = (bucket: string) => buckets.get(bucket) ?? 0;
+  const ratios =
+    tab === 'torrent'
+      ? torrentVisible.map((t) => t.ratio).filter((r): r is number => r != null)
+      : [];
+  const avgRatio = ratios.length ? ratios.reduce((x, y) => x + y, 0) / ratios.length : null;
+  const barTotal = Math.max(1, activeAll.length);
+  const barPct = (count: number) => `${(count / barTotal) * 100}%`;
+  const summaryBits = [
+    n('downloading') ? `${n('downloading')} downloading` : '',
+    n('queued') ? `${n('queued')} queued` : '',
+    n('seeding') ? `${n('seeding')} seeding` : '',
+    n('paused') ? `${n('paused')} paused` : '',
+    n('stalled') ? `${n('stalled')} stalled` : '',
+    n('error') ? `${n('error')} with errors` : '',
+  ].filter(Boolean);
+
+  const menu = [
+    ...(tab === 'soulseek' && connectedWithItems(slskd)
+      ? [
+          {
+            key: 'clear',
+            label: 'Clear finished transfers',
+            title: 'Tell slskd to drop every finished transfer from its list',
+            onSelect: () =>
+              void runAction('Clear completed', () => slskdClearCompleted(), slskd.reload),
+          },
+        ]
+      : []),
+    ...(tab !== 'soulseek' && activeVisible.length > 0
+      ? [
+          {
+            key: 'pause',
+            label: `Pause all shown (${activeVisible.length})`,
+            onSelect: () => bulk('pause'),
+          },
+          {
+            key: 'resume',
+            label: `Resume all shown (${activeVisible.length})`,
+            onSelect: () => bulk('resume'),
+          },
+        ]
+      : []),
+    { key: 'refresh', label: 'Refresh now', onSelect: () => void activeState.reload() },
+  ];
+
+  const addTorrent = async (url: string) => {
+    try {
+      const data = await torrentClientAdd(url);
+      if (data.success) {
+        toast('Sent to the torrent client', 'success');
+        void torrent.reload();
+        return true;
+      }
+      toast(data.error || 'Add failed', 'error');
+    } catch {
+      toast('Add failed', 'error');
+    }
+    return false;
+  };
+  const addNzb = async (url: string) => {
+    try {
+      const data = await usenetClientAdd(url);
+      if (data.success) {
+        toast('Sent to the usenet client', 'success');
+        void usenet.reload();
+        return true;
+      }
+      toast(data.error || 'Add failed', 'error');
+    } catch {
+      toast('Add failed', 'error');
+    }
+    return false;
+  };
+  const canAdd = tab !== 'soulseek' && activeHealth === 'ok';
+
   return (
-    <div className="adl-clients" id="adl-clients">
-      <div className="adl-batch-filter-banner adl-clients-banner">
-        {pills.map((pill) => {
-          const health = healthOf(pill.state);
-          const count = pill.state.overview?.items.length ?? null;
-          return (
-            <button
-              key={pill.key}
-              type="button"
-              className={`adl-pill${tab === pill.key ? ' active' : ''}`}
-              data-client-tab={pill.key}
-              title={HEALTH_TEXT[health]}
-              onClick={() => switchTab(pill.key)}
+    <div className="dlc-stack" id="adl-clients">
+      <div className="dlc-subbar">
+        <DlSegmented
+          label="Download clients"
+          value={tab}
+          onChange={(v) => switchTab(v as ClientSubTab)}
+          segments={pills.map((pill) => {
+            const health = healthOf(pill.state);
+            return {
+              value: pill.key,
+              label: pill.label,
+              title: HEALTH_TEXT[health],
+              dot: health === 'ok' ? 'ok' : health === 'bad' ? 'bad' : 'off',
+              count: health === 'ok' ? (pill.state.overview?.items.length ?? null) : null,
+            };
+          })}
+        />
+        <div className="dlc-subbar-side">
+          {canAdd ? (
+            <DlButton primary icon={DlIcon.plus} onClick={() => setAddOpen((v) => !v)}>
+              {tab === 'torrent' ? 'Add torrent' : 'Add nzb'}
+            </DlButton>
+          ) : null}
+          {activeLink && activeHealth === 'ok' ? (
+            <a
+              className="dlc-btn"
+              href={activeLink}
+              target="_blank"
+              rel="noreferrer"
+              title="Open the client's own page in a new tab"
             >
-              <span className={`adl-client-dot adl-client-dot-${health}`} />
-              {pill.label}
-              {count !== null && health === 'ok' ? ` (${count})` : ''}
-            </button>
-          );
-        })}
-        <span className="verif-banner-spacer" />
-        {tab === 'soulseek' && connectedWithItems(slskd) ? (
-          <button
-            type="button"
-            className="adl-filter-banner-clear"
-            title="Tell slskd to drop every finished transfer from its list"
-            onClick={() =>
-              void runAction('Clear completed', () => slskdClearCompleted(), slskd.reload)
-            }
-          >
-            🧹 Clear completed
-          </button>
-        ) : null}
-        {tab !== 'soulseek' && activeVisible.length > 0 ? (
-          <>
-            <button
-              type="button"
-              className="adl-filter-banner-clear"
-              title="Pause everything currently listed (respects the filter)"
-              onClick={() => bulk('pause')}
-            >
-              ⏸ Pause all
-            </button>
-            <button
-              type="button"
-              className="adl-filter-banner-clear"
-              title="Resume everything currently listed (respects the filter)"
-              onClick={() => bulk('resume')}
-            >
-              ▶ Resume all
-            </button>
-          </>
-        ) : null}
-        {typeLabel ? <span className="adl-client-section-type">{typeLabel}</span> : null}
-        <span className={`adl-client-health adl-client-health-${activeHealth}`}>
-          {HEALTH_TEXT[activeHealth]}
-        </span>
+              {typeName || 'Open client'}
+              {DlIcon.open}
+            </a>
+          ) : null}
+          <span className="dlh-more">
+            <DlMore items={menu} label="Client actions" />
+          </span>
+        </div>
       </div>
 
-      {tab === 'soulseek' && connectedWithItems(slskd) ? (
-        <div className="adl-client-viewswitch">
-          <button
-            type="button"
-            className={`adl-client-chip${slskdView === 'downloads' ? ' active' : ''}`}
-            onClick={() => setSlskdView('downloads')}
-          >
-            ⬇ downloads ({slskd.overview?.items.length ?? 0})
-          </button>
-          <button
-            type="button"
-            className={`adl-client-chip${slskdView === 'uploads' ? ' active' : ''}`}
-            onClick={() => setSlskdView('uploads')}
-          >
-            ⬆ uploads ({slskd.overview?.uploads?.length ?? 0})
-          </button>
+      {addOpen && canAdd ? (
+        <AddBox
+          placeholder={
+            tab === 'torrent' ? 'Paste a magnet link or .torrent url' : 'Paste an .nzb url'
+          }
+          onAdd={tab === 'torrent' ? addTorrent : addNzb}
+          onClose={() => setAddOpen(false)}
+        />
+      ) : null}
+
+      {activeHealth === 'ok' ? (
+        <div className={`dlc-strip${n('downloading') ? ' dlc-strip-accent' : ''}`}>
+          <div className="dlc-strip-big">
+            <strong>↓ {speedText(downSpeed) || '0 B/s'}</strong>
+            <span>
+              {upSpeed !== undefined ? `↑ ${speedText(upSpeed) || '0 B/s'} · ` : ''}
+              {HEALTH_TEXT[activeHealth]}
+            </span>
+          </div>
+          <div className="dlc-strip-line">
+            {typeName ? <b>{typeName}</b> : null}
+            {typeName && summaryBits.length ? ' · ' : ''}
+            {summaryBits.join(', ') || 'Nothing in the list'}
+            {avgRatio != null ? ` · average ratio ${avgRatio.toFixed(2)}` : ''}
+            {activeAll.length ? (
+              <>
+                <div className="dlh-bar" aria-hidden="true">
+                  <i className="dlh-bar-active" style={{ width: barPct(n('downloading')) }} />
+                  <i
+                    className="dlc-bar-seed"
+                    style={{ width: barPct(n('seeding') + n('completed')) }}
+                  />
+                  <i
+                    className="dlc-bar-idle"
+                    style={{ width: barPct(n('paused') + n('queued') + n('other')) }}
+                  />
+                  <i
+                    className="dlh-bar-fail"
+                    style={{ width: barPct(n('error') + n('stalled')) }}
+                  />
+                </div>
+              </>
+            ) : null}
+            {trimmedNote ? <div className="dlc-strip-note">{trimmedNote}</div> : null}
+          </div>
+          <span />
         </div>
       ) : null}
 
       {activeHealth === 'ok' ? (
         <ClientToolbar
-          items={activeVisible}
-          totalSpeed={downSpeed}
-          upSpeed={upSpeed}
+          lead={
+            tab === 'soulseek' ? (
+              <DlSegmented
+                label="Direction"
+                value={slskdView}
+                onChange={(v) => setSlskdView(v as 'downloads' | 'uploads')}
+                segments={[
+                  {
+                    value: 'downloads',
+                    label: 'Downloads',
+                    count: slskd.overview?.items.length ?? 0,
+                  },
+                  {
+                    value: 'uploads',
+                    label: 'Uploads',
+                    count: slskd.overview?.uploads?.length ?? 0,
+                  },
+                ]}
+              />
+            ) : undefined
+          }
+          owner={owner}
+          onOwner={setOwner}
+          ownerCounts={ownerCounts}
           search={search}
           onSearch={setSearch}
           stateFilter={stateFilter}
@@ -949,88 +1522,94 @@ export function AdlClientsTab() {
           sort={sort}
           onSort={setSort}
           stateOf={stateCounts}
-          link={activeLink}
-          onRefresh={() => void activeState.reload()}
+          categories={tab === 'torrent' ? torrentCategories : undefined}
+          category={activeCategory}
+          onCategory={setCategory}
+          shown={activeVisible.length}
         />
       ) : null}
 
-      {tab === 'torrent' && activeHealth === 'ok' ? (
-        <AddBox
-          label="+ add torrent"
-          placeholder="paste a magnet link or .torrent url to send it to the client…"
-          onAdd={async (url) => {
-            try {
-              const data = await torrentClientAdd(url);
-              if (data.success) {
-                toast('Sent to the torrent client', 'success');
-                void torrent.reload();
-                return true;
-              }
-              toast(data.error || 'Add failed', 'error');
-            } catch {
-              toast('Add failed', 'error');
+      {activeHealth === 'ok' && activeVisible.length > 0 ? (
+        <div className="dlc-list">
+          {tab === 'soulseek'
+            ? slskdVisible.map((item) => slskdRow(item, slskdView === 'uploads'))
+            : tab === 'torrent'
+              ? torrentVisible.map(torrentRow)
+              : usenetVisible.map(usenetRow)}
+        </div>
+      ) : (
+        <EmptyState
+          tab={tab}
+          health={activeHealth}
+          fetchError={activeState.fetchError}
+          overview={activeState.overview}
+          noun={
+            tab === 'soulseek'
+              ? slskdView === 'uploads'
+                ? 'uploads'
+                : 'transfers'
+              : tab === 'torrent'
+                ? 'torrents'
+                : 'jobs'
+          }
+          // settings is still a classic page: the shell navigates there
+          onSettings={() => void window.navigateToPage?.('settings')}
+        />
+      )}
+
+      {showSelectionBar ? (
+        <div className="dlc-selbar" role="toolbar" aria-label="Selection">
+          <span className="dlc-selbar-n">
+            {selectedTargets.length
+              ? `${selectedTargets.length} selected`
+              : 'Select downloads to match'}
+          </span>
+          <DlButton
+            onClick={() =>
+              setSelected(
+                selectedTargets.length === selectable.length
+                  ? new Set()
+                  : new Set(selectable.map((t) => `${t.client}:${t.id}`)),
+              )
             }
-            return false;
-          }}
-        />
-      ) : null}
-      {tab === 'usenet' && activeHealth === 'ok' ? (
-        <AddBox
-          label="+ add nzb"
-          placeholder="paste an .nzb url to send it to the client…"
-          onAdd={async (url) => {
-            try {
-              const data = await usenetClientAdd(url);
-              if (data.success) {
-                toast('Sent to the usenet client', 'success');
-                void usenet.reload();
-                return true;
-              }
-              toast(data.error || 'Add failed', 'error');
-            } catch {
-              toast('Add failed', 'error');
-            }
-            return false;
-          }}
-        />
+          >
+            {selectedTargets.length === selectable.length
+              ? 'Clear'
+              : `Select all shown (${selectable.length})`}
+          </DlButton>
+          <DlButton
+            primary
+            disabled={selectedTargets.length === 0}
+            onClick={() => setBulkTargets(selectedTargets)}
+          >
+            Match &amp; import{selectedTargets.length ? ` ${selectedTargets.length}` : ''}
+          </DlButton>
+        </div>
       ) : null}
 
-      {trimmedNote ? <div className="adl-client-trimnote">{trimmedNote}</div> : null}
-
-      <div className="adl-list adl-clients-list">
-        {tab === 'soulseek' ? (
-          connectedWithItems(slskd) && slskdVisible.length > 0 ? (
-            slskdVisible.map((item) => slskdRow(item, slskdView === 'uploads'))
-          ) : (
-            <EmptyState
-              health={activeHealth}
-              fetchError={slskd.fetchError}
-              overview={slskd.overview}
-              noun={slskdView === 'uploads' ? 'uploads' : 'transfers'}
-            />
-          )
-        ) : tab === 'torrent' ? (
-          connectedWithItems(torrent) && torrentVisible.length > 0 ? (
-            torrentVisible.map(torrentRow)
-          ) : (
-            <EmptyState
-              health={activeHealth}
-              fetchError={torrent.fetchError}
-              overview={torrent.overview}
-              noun="torrents"
-            />
-          )
-        ) : connectedWithItems(usenet) && usenetVisible.length > 0 ? (
-          usenetVisible.map(usenetRow)
-        ) : (
-          <EmptyState
-            health={activeHealth}
-            fetchError={usenet.fetchError}
-            overview={usenet.overview}
-            noun="jobs"
-          />
-        )}
-      </div>
+      <AdlBulkMatchModal
+        targets={bulkTargets}
+        onClose={() => setBulkTargets(null)}
+        onFinished={(imported) => {
+          if (imported) {
+            setSelected(new Set());
+            void (tab === 'usenet' ? usenet.reload() : torrent.reload());
+          }
+        }}
+      />
+      <AdlMatchModal
+        target={matching}
+        onClose={() => setMatching(null)}
+        onMatched={(message) => {
+          setMatching(null);
+          toast(message, 'success');
+          void (matching?.client === 'usenet'
+            ? usenet.reload()
+            : matching?.client === 'soulseek'
+              ? slskd.reload()
+              : torrent.reload());
+        }}
+      />
     </div>
   );
 }

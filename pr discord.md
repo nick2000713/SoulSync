@@ -1,13 +1,13 @@
-**SoulSync 3.5.1 is out** :musical_note:
+**SoulSync 3.6.1 is out** :musical_note:
 
-Download Discography now has a Wishlist + Watchlist button: grab the releases you picked and start watching the artist in one go, with release types and filters set right in the modal. A new edition preference stops the watchlist from grabbing both the standard and deluxe of the same album.
+The video side moves onto the new React pages. The video dashboard now matches the music one, the calendar says where every episode stands, video tools shares the Tools page, and movie and show pages read like a streaming app with a new Your library tab for every copy you own. Fix match sticks, and you can mark one episode or season watched.
 
-Non-admin profiles can request music videos and single episodes, approved from the same requests page as music. The dashboard got a visual refresh plus a weekly listening digest built from your real plays.
+Optional 4K libraries: a separate Movies 4K and TV 4K folder, off until you turn one on, filled by quality profiles set to save to 4K. And every folder in Settings now checks itself as you type: free space, write access, nested folders and unmapped Docker volumes. Audiobooks can read extra folders on other drives too.
 
-Playlist sync: wishlisted tracks download as a playlist-named batch so the library scan runs after them, new mirrors get their server playlist on the first sync, completion stops claiming 100% when tracks still need identifying, and ListenBrainz weekly playlists stop getting stuck on an old week (thanks @ifedan-ed).
+Playlists: every source tab imports into SoulSync and lands you on the playlist, you can keep your own editable copy instead of a mirror (#1913), and Download missing can retry unidentified tracks first (#1912).
 
-Tagging: MusicBrainz stops matching the wrong same-named band, wishlist downloads keep featured artists, sort tags follow the primary source, "hip hop" and "hip-hop" merge, full-depth re-tag actually writes, and versioned recordings can be told apart. New opt-in artist.nfo for Jellyfin/Kodi/Emby, original date as DATE, and $label in album paths.
+The Library page gets a Songs tab with filters, sorts, copies side by side and bulk actions (#1906), and match search takes a pasted link or ID (#1901). Daily mixes are rebuilt on what you actually play together, and interactive search lets you listen before you pick (#1911).
 
-Fixes: singles no longer show owned because the album has the same song, single-file audiobook torrents import instead of stalling (thanks SeadogsBooty), audiobook search finds "Series 03" volumes (thanks @SimpleSimonLA), Soulseek cleanup only touches its own transfers (thanks @splitsec2), and repair and tools fixes from @mandos21.
+Sign in with OIDC only, plus OIDC fixes and video naming fixes (thanks @PapaBearDoes). Navidrome scans finish on time and the hourly update stops missing albums (#1899), idle CPU is down (#1905), the lyrics filler stops repeating LRCLib lookups (#1902), and staged downloads no longer look missing to the watchlist (thanks @SimpleSimonLA). Plus a lot of fixes.
 
 Full notes on GitHub.

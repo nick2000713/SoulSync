@@ -9,6 +9,7 @@ with the reason they lost, capped so a 400-hit Soulseek search doesn't ship
 from __future__ import annotations
 
 import os
+from copy import copy
 from typing import Any, Callable, Iterable, Optional
 
 from core.downloads.decisions import Decision, reject, rejection_counts
@@ -20,6 +21,10 @@ _DISPLAY_FORMATS = ('FLAC', 'MP3', 'OPUS', 'OGG', 'M4A', 'WAV')
 _SERVICE_USERNAMES = frozenset({
     'youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon',
 })
+# Every source whose filename is an `id||name` dispatch key rather than a
+# path — the eight above plus the two release sources, whose token is an
+# opaque candidate-store id that must never be displayed either.
+DECODE_USERNAMES = _SERVICE_USERNAMES | frozenset({'torrent', 'usenet'})
 
 
 def _audio_label(candidate) -> str:
@@ -29,12 +34,54 @@ def _audio_label(candidate) -> str:
         return ''
 
 
+def display_name_for(filename: str, username: str = '') -> str:
+    """The human name a candidate row should show for ``filename``.
+
+    Streaming sources don't hand back paths — their filename is a dispatch
+    key, ``id||name`` (SoundCloud: ``id||url||name``, because its worker
+    needs the permalink). Basename-splitting a key showed the inspector the
+    raw id and, for SoundCloud, the permalink slug glued to the title with
+    the separator still in it (#1911) — the returned songs read as machine
+    IDs, not songs. The shape recognition matches the completed-file
+    finder's (file_finder._encoded_display_name, #1239/#835) with one
+    deliberate difference: a display name keeps everything after the
+    second separator, where the finder's on-disk search target takes the
+    last segment only. A key with extra segments and a non-URL middle
+    reads everything after the first separator as the name. The URL-middle
+    check applies to every dispatch-key source, not just SoundCloud: a
+    middle segment that is a URL is a permalink, never part of a title.
+    It only applies to dispatch-key usernames, whose filenames are always
+    dispatch keys; a Soulseek peer's real remote path keeps the basename
+    rule, ``||`` in a folder name and all.
+    """
+    filename = str(filename or '')
+    if username in DECODE_USERNAMES and '||' in filename:
+        parts = filename.split('||')
+        if len(parts) > 2 and parts[1].startswith(('http://', 'https://')):
+            # SoundCloud's three parts, split the way its own worker splits
+            # them (maxsplit=2): a title containing '||' survives whole.
+            name = filename.split('||', 2)[2]
+        else:
+            name = filename.split('||', 1)[1]
+        if name.strip():
+            return name
+        # The key encodes no name at all: show the key, not a fragment of
+        # it (the basename rule would carve a slug out of the URL part).
+        return filename
+    return os.path.basename(filename.replace('\\', '/'))
+
+
 def candidate_row(candidate, decision: Decision, *, source_name: str, query: str) -> dict:
     filename = str(getattr(candidate, 'filename', '') or '')
-    display_name = os.path.basename(filename.replace('\\', '/'))
-    ext = os.path.splitext(display_name)[1].lstrip('.').upper()
-    quality = ext if ext in _DISPLAY_FORMATS else (getattr(candidate, 'quality', '') or '')
     username = getattr(candidate, 'username', '') or ''
+    display_name = display_name_for(filename, username)
+    # A decoded dispatch key's "name" is a title, not a file name: a dot in
+    # it ('Artist - Song.Mp3') must not override the candidate's own format.
+    if username in DECODE_USERNAMES and '||' in filename:
+        quality = getattr(candidate, 'quality', '') or ''
+    else:
+        ext = os.path.splitext(display_name)[1].lstrip('.').upper()
+        quality = ext if ext in _DISPLAY_FORMATS else (getattr(candidate, 'quality', '') or '')
     service = source_name if source_name != 'default' else 'hybrid'
     if username in _SERVICE_USERNAMES:
         service = username
@@ -63,6 +110,14 @@ def candidate_row(candidate, decision: Decision, *, source_name: str, query: str
         'queue_length': getattr(candidate, 'queue_length', 0),
         'decision': decision.to_dict(),
     }
+
+
+
+def _collapse_release_pairs(pairs):
+    from core.download_plugins.release_identity import dedupe_release_candidates
+    by_endpoint = {(item[0].username, item[0].filename): item for item in pairs}
+    return [(c, *by_endpoint[(c.username, c.filename)][1:])
+            for c in dedupe_release_candidates([item[0] for item in pairs])]
 
 
 def build_source_rows(
@@ -115,6 +170,7 @@ def build_source_rows(
         (accepted if decision.accepted else rejected).append((candidate, decision, query))
 
     accepted.sort(key=lambda t: -(t[1].score or 0))
+    accepted = _collapse_release_pairs(accepted)
     rejected.sort(key=lambda t: float('inf') if t[1].score is None else -t[1].score)
     counts = rejection_counts(d for _, d, _ in rejected)
     shown = rejected[:max(0, reject_cap)]
@@ -157,12 +213,21 @@ ALTERNATIVES_KEPT = 10
 
 
 def _brief(candidate, decision: Decision) -> dict:
-    """The few fields a stored decision needs; paths reduced to the file name."""
+    """The few fields a stored decision needs.
+
+    ``filename`` rides along in full — a peer's whole remote path, a
+    service's whole dispatch key — as the row's identity: for a service
+    source the username is a constant and several hits can share one
+    decoded display name (same song, different uploads), so (username,
+    display_name) alone cannot tell two stored rows apart (#1911 review).
+    It is persisted with the decision record and reaches the track-detail
+    payload verbatim; nothing renders it, it is identity only.
+    """
     username = getattr(candidate, 'username', '') or ''
-    source = username if username in _SERVICE_USERNAMES | {'torrent', 'usenet'} else 'soulseek'
+    source = username if username in DECODE_USERNAMES else 'soulseek'
     row = candidate_row(candidate, decision, source_name=source, query='')
     return {k: row[k] for k in (
-        'username', 'display_name', 'source_service', 'quality', 'quality_label',
+        'username', 'filename', 'display_name', 'source_service', 'quality', 'quality_label',
         'bitrate', 'size', 'duration', 'confidence', 'decision',
     )}
 
@@ -184,11 +249,29 @@ def summarize_pool(pairs: Iterable[tuple], chosen_key: Optional[tuple] = None,
             picked[key] = (candidate, decision)
 
     chosen = picked.pop(tuple(chosen_key), None) if chosen_key else None
+    if chosen is None and chosen_key:
+        from core.download_plugins.release_identity import release_sources
+        for root_key, (root, decision) in list(picked.items()):
+            endpoint = next((s for s in release_sources(root)
+                             if (s.username, s.filename) == tuple(chosen_key)), None)
+            if endpoint is not None:
+                # The root's validated metadata/quality belongs to this release;
+                # the selected endpoint supplies its opaque download token.
+                selected = copy(root)
+                selected.username, selected.filename = endpoint.username, endpoint.filename
+                chosen = (selected, decision)
+                picked.pop(root_key)
+                break
     rest = sorted(
         picked.values(),
         key=lambda t: (not t[1].accepted,
                        float('inf') if t[1].score is None else -t[1].score),
     )
+    grouped = _collapse_release_pairs(([chosen] if chosen else []) + rest)
+    if chosen:
+        chosen, rest = grouped[0], grouped[1:]
+    else:
+        rest = grouped
     rejected = [d for _, d in rest if not d.accepted]
     return {
         'chosen': _brief(*chosen) if chosen else None,

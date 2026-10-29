@@ -3,8 +3,10 @@ import { useEffect, useRef, useState } from 'react';
 import type { EnrichmentOutcome, MatchSearchResult } from '../-artist-detail.enrich-match';
 
 import {
+  announceWatchlistFollow,
   applyManualMatchRequest,
   clearMatchRequest,
+  matchSearchPlaceholder,
   matchServiceLabel,
   searchServiceRequest,
 } from '../-artist-detail.enrich-match';
@@ -91,7 +93,8 @@ export function ManualMatchModal({
         serviceId: result.id,
         artistId,
       });
-      window.showToast?.(`Manually matched to ${service} ID: ${result.id}`, 'success');
+      const followed = announceWatchlistFollow(outcome, label);
+      window.showToast?.(`Manually matched to ${service} ID: ${result.id}${followed}`, 'success');
       onClose();
       onUpdated(outcome);
     } catch (error) {
@@ -139,13 +142,7 @@ export function ManualMatchModal({
           <input
             type="text"
             className="enhanced-match-search-input"
-            placeholder={
-              service === 'musicbrainz'
-                ? `Search ${label}… or paste a MusicBrainz ID/URL`
-                : service === 'deezer'
-                  ? `Search ${label}… or paste a Deezer URL`
-                  : `Search ${label}...`
-            }
+            placeholder={matchSearchPlaceholder(service, label)}
             value={query}
             autoFocus
             onChange={(e) => setQuery(e.target.value)}
@@ -160,7 +157,11 @@ export function ManualMatchModal({
             className="enhanced-enrich-btn enhanced-clear-match-btn"
             type="button"
             title="Remove the current match — reverts to Not Found"
-            style={{ background: 'rgba(255,80,80,0.12)', color: '#ff6b6b', marginLeft: 6 }}
+            style={{
+              background: 'rgba(var(--danger-rgb), 0.12)',
+              color: 'var(--danger-light)',
+              marginLeft: 6,
+            }}
             onClick={() => void clearMatch()}
           >
             Clear Match

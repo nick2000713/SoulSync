@@ -120,6 +120,7 @@ class ConfigManager:
         'lastfm.api_secret',
         'lastfm.session_key',
         'genius.access_token',
+        'pollinations.api_key',
         # Deezer OAuth
         'deezer.app_id',
         'deezer.app_secret',
@@ -127,6 +128,12 @@ class ConfigManager:
         # Other
         'hydrabase.api_key',
         'discogs.token',
+        # MetaSync (pool key is the user's SIN account key; the local API key
+        # is issued by their MetaSync node during pairing)
+        'metasync.pool_key',
+        'metasync.local_api_key',
+        # Sign in with OIDC
+        'security.oidc_client_secret',
     })
 
     def _get_fernet(self) -> Fernet:
@@ -566,7 +573,7 @@ class ConfigManager:
                 "hybrid_primary": "soulseek",  # Legacy: primary source for hybrid mode
                 "hybrid_secondary": "youtube",  # Legacy: fallback source for hybrid mode
                 "hybrid_order": [],  # Ordered list of sources for hybrid mode (overrides primary/secondary)
-                "stream_source": "youtube",  # Options: "youtube" (instant, default), "active" (use download source; falls back to youtube if soulseek)
+                "stream_source": "youtube",  # Options: "youtube" (instant, default), "active" (use download source; falls back to youtube if soulseek), "deezer_preview" (30s deezer clip, youtube when there is none)
                 # Album-bundle (torrent / usenet single-source) poll tuning.
                 # Downloader is polled every N seconds until the release
                 # lands; whole job aborts at the timeout. Defaults match
@@ -575,6 +582,13 @@ class ConfigManager:
                 # editing source.
                 "album_bundle_poll_interval_seconds": 2.0,
                 "album_bundle_timeout_seconds": 6 * 60 * 60,    # 6 hours
+                # Let YouTube fetch a whole album from YouTube Music's own album
+                # playlist (artist + album must match) instead of searching for
+                # its songs one by one. Helps for albums whose songs the catalogue
+                # lists as unavailable. Off by default: it changes how every
+                # YouTube album is fetched. Only applies where YouTube is a
+                # source in the chain; a miss falls back to the per-track flow.
+                "youtube_album_bundle": False,
                 # Stalled-torrent handling (noldevin): abandon a torrent that
                 # makes zero download progress for this long (dead magnet
                 # stuck on "downloading metadata", no seeders) instead of
@@ -659,6 +673,16 @@ class ConfigManager:
                     "copyright": True,
                 }
             },
+            # soulsync answering as lidarr for request apps (#1799). off by
+            # default, requests land on profile_id's wishlist
+            "lidarr_compat": {
+                "enabled": False,
+                "profile_id": 1,
+            },
+            # ai clients over /mcp, with an api key. off by default
+            "mcp": {
+                "enabled": False,
+            },
             "lidarr_download": {
                 "url": "",
                 "api_key": "",
@@ -683,6 +707,17 @@ class ConfigManager:
                 # 0 on either knob disables that half of the budget.
                 "search_min_gap_seconds": 2.0,
                 "max_searches_per_minute": 20,
+            },
+            # LRCLib — the community lyrics service behind the Lyrics
+            # Filler, imports, retag and the player (core.lyrics_client).
+            # Pacing for core.lrclib_throttle: LRCLib's allowances are
+            # approximate (~45 req/min generic, ~90/min with an
+            # identifying User-Agent) and unpaced bursts earn 429/503s,
+            # which used to be misreported as "no lyrics" (#1879).
+            # 0 on either knob disables that half of the budget.
+            "lrclib": {
+                "request_min_gap_seconds": 0.75,
+                "max_requests_per_minute": 80,
             },
             # Torrent client — receives .torrent / magnet URIs from the
             # torrent download plugin. ``type`` picks which adapter to
@@ -719,6 +754,7 @@ class ConfigManager:
                 "username": "",
                 "password": "",
                 "category": "soulsync",
+                "acquisition_monitor_interval_seconds": 15,
             },
             "soundcloud_download": {
                 # Anonymous-only for now — SoundCloud Go+ OAuth tier could be
@@ -753,6 +789,11 @@ class ConfigManager:
             },
             "genius": {
                 "access_token": ""
+            },
+            # optional. cover art works without it (one image every 45s with
+            # their logo); a key from enter.pollinations.ai lifts both
+            "pollinations": {
+                "api_key": ""
             },
             # Two providers answering two different questions: Ticketmaster for
             # upcoming dates, Setlist.fm for what was actually played. Both
@@ -879,6 +920,9 @@ class ConfigManager:
                 "music_videos_path": "",
                 "podcasts_path": default_podcast_path,
                 "audiobooks_path": default_audiobook_path,
+                # extra folders an existing audiobook collection lives in (a
+                # second drive). scanned and managed, never downloaded into.
+                "audiobooks_additional_paths": [],
                 # Sample Studio output folders (Phase 6): where saved chops
                 # are rendered. A list like music_paths — the first entry is
                 # the default destination; the save dialog lets the user pick
@@ -899,6 +943,10 @@ class ConfigManager:
                 # the artist instead of guessing by name. Off by default —
                 # the Artist NFO Backfill repair job covers existing folders.
                 "write_artist_nfo": False,
+                # Library v2: a monitored track whose file was deleted outside
+                # SoulSync is downloaded again (Lidarr behaviour). Off, the
+                # deletion counts as "don't download again" for that track.
+                "redownload_externally_deleted": True,
             },
             "file_organization": {
                 "enabled": True,
@@ -972,11 +1020,16 @@ class ConfigManager:
                 # setting, read directly by `core/auto_import_worker.py` — a
                 # Staging folder-layout quirk, not a quality preference, so it
                 # deliberately does NOT live on a quality profile.
-                "folder_artist_override": True
+                "folder_artist_override": True,
+                # off: staging keeps whatever an import didn't move (the user's
+                # own files). on: a folder whose every track was imported or
+                # found already in the library is removed from staging.
+                "clear_finished_from_staging": False
             },
             "m3u_export": {
                 "enabled": False,
                 "entry_base_path": "",
+                "relative_paths": False,
                 "library_enabled": False,
                 "library_path": ""
             },
@@ -1052,6 +1105,12 @@ class ConfigManager:
                     # GraphicAudio and the like. On by default because they are
                     # already shown-but-outranked; turning this off removes them.
                     "allow_dramatized": True,
+                    # Formats a release may be in at all; empty allows every
+                    # format. Unlike format_order this rejects, not ranks.
+                    "allowed_formats": [],
+                    # "single", "multiple" or "any": whether a book arrives as
+                    # one file or several. Rejects only where the count is known.
+                    "file_layout": "any",
                 },
                 # How long a short book is kept staged before giving up. Torrents
                 # finish late and uploaders repair releases, so patience is right;
@@ -1067,6 +1126,11 @@ class ConfigManager:
                 # Off keeps an owned book on the wishlist as "In library";
                 # on drops it, like the music wishlist does.
                 "remove_owned_from_wishlist": False,
+                # Optional post-import fold of multi-file books into one
+                # chaptered .m4b. Off by default: it rewrites the library
+                # copy, and a listener who prefers the per-file layout opts
+                # out by leaving this off.
+                "merge_m4b": False,
             },
             "podcasts": {
                 "download_path": default_podcast_path,
@@ -1416,43 +1480,29 @@ class ConfigManager:
         return self.get('active_media_server', 'plex')
 
     def set_active_media_server(self, server: str):
-        """Set the active media server (plex, jellyfin, navidrome, or soulsync)"""
-        if server not in ['plex', 'jellyfin', 'navidrome', 'soulsync']:
+        """Set the active media server. Valid names come from the
+        server descriptors (core.media_server.specs)."""
+        from core.media_server import specs
+        if not specs.is_known(server):
             raise ValueError(f"Invalid media server: {server}")
         self.set('active_media_server', server)
 
     def get_active_media_server_config(self) -> Dict[str, str]:
         """Get configuration for the currently active media server"""
-        active_server = self.get_active_media_server()
-        if active_server == 'plex':
-            return self.get_plex_config()
-        elif active_server == 'jellyfin':
-            return self.get_jellyfin_config()
-        elif active_server == 'navidrome':
-            return self.get_navidrome_config()
-        elif active_server == 'soulsync':
-            return {'transfer_path': self.get('soulseek.transfer_path', './Transfer')}
-        else:
-            return {}
+        from core.media_server import specs
+        descriptor = specs.describe(self.get_active_media_server())
+        return descriptor.config_from(self) if descriptor else {}
 
     def is_configured(self) -> bool:
         spotify = self.get_spotify_config()
         active_server = self.get_active_media_server()
         soulseek = self.get_soulseek_config()
 
-        # Check active media server configuration
-        media_server_configured = False
-        if active_server == 'plex':
-            plex = self.get_plex_config()
-            media_server_configured = bool(plex.get('base_url')) and bool(plex.get('token'))
-        elif active_server == 'jellyfin':
-            jellyfin = self.get_jellyfin_config()
-            media_server_configured = bool(jellyfin.get('base_url')) and bool(jellyfin.get('api_key'))
-        elif active_server == 'navidrome':
-            navidrome = self.get_navidrome_config()
-            media_server_configured = bool(navidrome.get('base_url')) and bool(navidrome.get('username')) and bool(navidrome.get('password'))
-        elif active_server == 'soulsync':
-            media_server_configured = True  # SoulSync standalone is always configured
+        # Check active media server configuration. The descriptor knows
+        # which keys make a server configured.
+        from core.media_server import specs
+        descriptor = specs.describe(active_server)
+        media_server_configured = bool(descriptor) and descriptor.is_configured_in(self)
 
         return (
             bool(spotify.get('client_id')) and
@@ -1470,10 +1520,9 @@ class ConfigManager:
         }
 
         # Validate all server types but mark active one
-        validation['plex'] = bool(self.get('plex.base_url')) and bool(self.get('plex.token'))
-        validation['jellyfin'] = bool(self.get('jellyfin.base_url')) and bool(self.get('jellyfin.api_key'))
-        validation['navidrome'] = bool(self.get('navidrome.base_url')) and bool(self.get('navidrome.username')) and bool(self.get('navidrome.password'))
-        validation['soulsync'] = True  # Standalone mode is always valid
+        from core.media_server import specs
+        for descriptor in specs.iter_descriptors():
+            validation[descriptor.name] = descriptor.is_configured_in(self)
         validation['active_media_server'] = active_server
 
         return validation

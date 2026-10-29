@@ -48,6 +48,20 @@ _SAMPLE = re.compile(r"(^|[.\-_ ])sample([.\-_ ]|$)", re.I)
 # short get caught.
 _RUNTIME_FLOOR = {"movie": 15 * 60, "episode": 90}
 
+
+def _episode_sample_limit(expected_sec: float) -> float:
+    """Below this a file is a sample, not the episode. Sonarr's own tiers, keyed
+    off the show's runtime: 15s for a short under 3 min, 90s up to 10 min, 5 min
+    up to 30 min, 10 min for anything longer."""
+    minutes = (expected_sec or 0) / 60
+    if minutes <= 3:
+        return 15
+    if minutes <= 10:
+        return 90
+    if minutes <= 30:
+        return 300
+    return 600
+
 # Source ranking for the upgrade comparison (mirrors the quality ladder order).
 _SRC_RANK = {"remux": 6, "bluray": 5, "web-dl": 4, "webrip": 3, "hdtv": 2, "dvd": 1}
 
@@ -132,6 +146,10 @@ def _ctx(dl: dict) -> dict:
         "video_title": sc.get("video_title"),
         "published_at": sc.get("published_at"),
         "youtube_id": sc.get("youtube_id"),
+        # the scene (TVDB) numbering, when it differs (core/video/numbering.py)
+        "alt_season": sc.get("alt_season"),
+        "alt_episode": sc.get("alt_episode"),
+        "alt_exclusive": sc.get("alt_exclusive"),
     }
 
 
@@ -196,10 +214,29 @@ def _existing_match(scope: str, dest_dir: str, ctx: dict, list_dir: Callable) ->
     return None
 
 
+def _fallback_ids(dl: dict, override: dict, force: bool) -> dict:
+    """Ids for the naming template when the caller resolved none: only a TMDB
+    id we can be sure of. A download's ``media_id`` is a TMDB id only when it
+    was grabbed from TMDB (a library re-grab carries SoulSync's own row id),
+    and a manual placement's ``media_id`` is the picked result's TMDB id."""
+    mid = override.get("media_id") if force else dl.get("media_id")
+    src = "tmdb" if force else str(dl.get("media_source") or "").lower()
+    return {"tmdb_id": mid} if (mid and src == "tmdb") else {}
+
+
+def _naming_year(ctx_year, ids):
+    """The year the template names a title by: the grab's own, else the one
+    resolved for the title (``ids['year']``). Empty values count as missing."""
+    if ctx_year not in (None, ""):
+        return ctx_year
+    return (ids or {}).get("year")
+
+
 def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | None = None,
                 settings: dict | None = None, force: bool = False,
                 override: dict | None = None, library_dir: str | None = None,
-                expected_duration_sec: float | None = None) -> dict:
+                expected_duration_sec: float | None = None,
+                ids: dict | None = None) -> dict:
     """Decide what to do with a finished download. Returns one of:
 
       {"action": "import",  "dest": {...}, "quality_label": str}
@@ -212,7 +249,9 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
     too-short junk. ``settings`` are the user's organisation settings (naming templates
     + replace policy); None = defaults. ``expected_duration_sec`` is the item's known
     runtime (TMDB, resolved by the caller): a probed file running far shorter is a
-    truncated download or the wrong file entirely, and is rejected.
+    truncated download or the wrong file entirely, and is rejected. ``ids`` are
+    the title's {tmdb_id, imdb_id, tvdb_id} for the $tmdbid/$imdbid/$tvdbid
+    tokens (an episode's are its show's); None = only a TMDB id we're sure of.
 
     MANUAL placement: ``force=True`` with an ``override`` ({scope, title, year, season,
     episode, episode_title, target_dir, media_id}) trusts the user's chosen identity —
@@ -231,6 +270,9 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
         for k in ("title", "year", "season", "episode", "episode_title"):
             if override.get(k) is not None:
                 ctx[k] = override.get(k)
+        if override.get("season") is not None or override.get("episode") is not None:
+            # a hand-picked episode: the stored scene numbering was for another one
+            ctx["alt_season"] = ctx["alt_episode"] = None
 
     if not is_video(src_path):   # can't place a non-video, even on a forced import
         return _reject("Not a video file (%s)" % (ext or "no extension"), bad_release=True)
@@ -249,6 +291,18 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
                 span_end = parsed.get("episode_end") or parsed.get("episode")
                 numbering_ok = (parsed.get("season") == ctx.get("season")
                                 and parsed.get("episode") <= ctx.get("episode") <= span_end)
+                from core.video.numbering import ctx_alt
+                alt = ctx_alt(ctx)
+                alt_ok = bool(alt and parsed.get("season") == alt[0]
+                              and parsed.get("episode") <= alt[1] <= span_end)
+                if alt and len(alt) > 2 and alt[2]:
+                    # the wished number is another episode in the scene's
+                    # numbering: only the scene number is this one
+                    numbering_ok = alt_ok
+                elif not numbering_ok:
+                    # named by the scene's (TVDB) numbering for this episode:
+                    # still this episode, filed under the number it was wished as
+                    numbering_ok = alt_ok
                 date_ok = bool(ctx.get("air_date")
                                and parsed.get("air_date") == ctx.get("air_date"))
                 if not numbering_ok and not date_ok:
@@ -261,9 +315,11 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
                 # came via air date (the year token there is the air date, and the
                 # date itself is the stronger identity).
                 if numbering_ok:
+                    from core.video.quality_eval import tv_year_mismatch
+                    from core.video.release_parse import title_region_year
                     want_year = _as_int(ctx.get("year"))
-                    rel_year = parsed.get("year")
-                    if want_year and rel_year and (rel_year < want_year or rel_year > want_year + 1):
+                    rel_year = title_region_year(parsed.get("title"))
+                    if tv_year_mismatch(rel_year, want_year):
                         return _reject("Release is from %s, not %s (%s)"
                                        % (rel_year, ctx.get("title") or "this show", want_year))
     else:
@@ -293,23 +349,27 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
         if probe.get("video_codec") and not parsed.get("codec"):
             parsed["codec"] = probe["video_codec"]
 
-    # Duration-vs-expected: the probed runtime against the item's known runtime.
-    # A file running far shorter than the film/episode is a truncated download or
-    # the wrong file wearing the right name — reject it instead of filing a broken
-    # item. Multi-episode spans scale the expectation (S01E01E02 ≈ 2× one episode).
-    # Unknown expected runtime → no judgement (never reject on a guess).
-    # Episodes get a looser bar than movies: TV metadata runtimes are the broadcast
-    # slot WITH commercials (~60 min), while the files are the commercial-free cut
-    # (~42 min) — 0.70 of "expected" is a healthy episode, not a truncation.
+    # Duration-vs-expected. TV runtime metadata cannot be trusted to reject a file:
+    # a new episode carries a placeholder (Name That Tune S06E02 listed at 159 min,
+    # title "TBA"), a slot-length runtime gets stored for one episode (Halloween
+    # Baking Championship S12E04 at 85 min for a 43 min show), and specials are
+    # whatever length they are. Every one of those failed a perfectly good file,
+    # over and over. So episodes do what Sonarr does: the expected runtime only
+    # picks a SAMPLE threshold (a 10 min floor for an hour show, not "65% of 85").
+    # Movies keep a check, because a film's runtime is reliable, but only for a
+    # file under half of it: a truncated download or the wrong file, never a cut.
+    # Soulseek truncations are caught by the advertised-size check either way.
+    # Unknown expected runtime: the absolute floor above has already run.
     if probe is not None and not force and expected_duration_sec:
         actual = probe.get("duration_sec") or 0
         if probe.get("ok") and actual > 0:
-            span = 1
-            if scope == "episode" and parsed.get("episode") and parsed.get("episode_end"):
-                span = max(1, (parsed.get("episode_end") or 0) - parsed["episode"] + 1)
-            want = float(expected_duration_sec) * span
-            ratio = 0.65 if scope == "episode" else 0.75
-            if want > 0 and actual < ratio * want:
+            want = float(expected_duration_sec)
+            if scope == "episode":
+                limit = _episode_sample_limit(want)
+                if actual < limit:
+                    return _reject("Runtime is only %d min — looks like a sample/clip, not the episode"
+                                   % int(actual // 60), bad_release=True)
+            elif scope == "movie" and want > 0 and actual < 0.5 * want:
                 return _reject("Runs %d of %d min — truncated download or the wrong file"
                                % (int(actual // 60), int(want // 60)))
 
@@ -318,6 +378,8 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
         return _reject("No library folder configured for this type")
 
     media_id = override.get("media_id") if force else dl.get("media_id")
+    if ids is None:
+        ids = _fallback_ids(dl, override, force)
     quality = quality_full(parsed)
     # A multi-episode file is NAMED by its full span (S01E01-E02, the Sonarr/Plex
     # convention) even though the download row's identity is one episode of it.
@@ -335,14 +397,16 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
         }
     else:
         fields = {
-            "title": ctx.get("title"), "year": ctx.get("year"),
+            # the grab's own year wins; a show not in the library yet and a
+            # repair grab carry none, so the title's year is used to NAME it
+            "title": ctx.get("title"), "year": _naming_year(ctx.get("year"), ids),
             "series": ctx.get("title"), "season": ctx.get("season"),
             "episode": ep, "episode_end": ep_end, "episode_title": ctx.get("episode_title"),
             "air_date": ctx.get("air_date"),
             "quality": quality, "resolution": parsed.get("resolution"),
             "source": parsed.get("source"), "codec": parsed.get("codec"),
-            "tmdbid": media_id if scope == "movie" else None,
-            "tvdbid": media_id if scope == "episode" else None,
+            "tmdbid": ids.get("tmdb_id"), "imdbid": ids.get("imdb_id"),
+            "tvdbid": ids.get("tvdb_id") if scope == "episode" else None,
         }
     dest = organization.render_path(scope, root, fields, settings, ext)
     # The library already owns this item at a REAL, resolved location
@@ -433,7 +497,7 @@ def run_import(dl: dict, src_path: str, *, fs: Any, prober: Callable | None = No
                override: dict | None = None, library_dir: str | None = None,
                recycle: Callable | None = None,
                expected_duration_sec: float | None = None,
-               plan: dict | None = None) -> dict:
+               plan: dict | None = None, ids: dict | None = None) -> dict:
     """Execute the import and return a DB patch dict for the download row.
 
     ``fs`` is an injected facade with: ``list_dir(dir)->iterable[name]``,
@@ -466,7 +530,8 @@ def run_import(dl: dict, src_path: str, *, fs: Any, prober: Callable | None = No
                 probe_info = None
         plan = plan_import(dl, src_path, list_dir=fs.list_dir, probe=probe_info,
                            settings=settings, force=force, override=override,
-                           library_dir=library_dir, expected_duration_sec=expected_duration_sec)
+                           library_dir=library_dir, expected_duration_sec=expected_duration_sec,
+                           ids=ids)
     if plan["action"] == "reject":
         # Leave the file where it is; remember WHERE so manual import can find it.
         # _bad_release is transient (stripped by update_video_download): it tells

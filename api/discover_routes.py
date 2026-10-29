@@ -24,7 +24,7 @@ import re
 import types
 
 import requests
-from flask import Blueprint, Response, jsonify, make_response, request, send_file
+from flask import Blueprint, Response, jsonify, make_response, redirect, request, send_file
 
 from api.source_playlists import (
     _get_deezer_client,
@@ -67,7 +67,8 @@ def _discover_shelf_cache(key_extra=None):
             key = (fn.__name__, request.full_path, get_current_profile_id(), extra)
             hit = _DISCOVER_SHELF_CACHE.get(key)
             now = _t.time()
-            if hit and now < hit[0]:
+            from core.discovery.warm_refresh import refreshing
+            if hit and now < hit[0] and not refreshing():
                 body, status, ctype = hit[1]
                 return Response(body, status=status, content_type=ctype)
             out = fn(*args, **kwargs)
@@ -145,6 +146,15 @@ get_database = None
 config_manager = None
 download_orchestrator = None
 _get_active_discovery_source = None
+
+
+def _catalogue_name_key(name):
+    """The catalogue's folded artist key. SQLite's LOWER() is ASCII-only, so a
+    stored "Björk" never answered a searched "björk" (iss29-D13)."""
+    from core.library2.importer import normalize_name
+
+    return normalize_name(str(name or ""))
+
 _spotify_client = None
 _tidal_client = None
 _hydrabase_client = None
@@ -406,16 +416,8 @@ def _discover_genre_taste(database, profile_id):
     cached = _discover_taste_cache.get(profile_id)
     if cached and now < cached[0]:
         return cached[1]
-    profile = {}
-    try:
-        from core.discovery.listening_recommendations import build_genre_taste_profile
-        top = database.get_top_artists('all', 300, profile_id=profile_id) or []
-        genres_by_name = database.get_artist_genres_by_name([t.get('name') for t in top if t.get('name')])
-        weighted = [(genres_by_name.get((t.get('name') or '').strip().lower(), []),
-                     t.get('play_count', 1) or 1) for t in top]
-        profile = build_genre_taste_profile(weighted)
-    except Exception as e:
-        logger.debug(f"discover genre taste profile failed: {e}")
+    from core.personalized_playlists import PersonalizedPlaylistsService
+    profile = PersonalizedPlaylistsService(database).genre_taste_profile(profile_id)
     _discover_taste_cache[profile_id] = (now + 300, profile)
     return profile
 
@@ -716,6 +718,10 @@ def _autostart_popularity_backfill():
     _t.sleep(90)  # let the server finish its own startup work first
     while True:
         try:
+            from core.library2.migration_gate import migration_required
+            if migration_required(get_database()):
+                _t.sleep(30)
+                continue
             _popularity_backfill_tick()
         except Exception as e:
             logger.debug(f"popularity backfill tick skipped: {e}")
@@ -1317,13 +1323,20 @@ def _profile_count(database) -> int:
 
 
 def _artist_thumb(database, name):
+    """Seed image for a legacy BYLT slot, read from the v2 catalogue.
+
+    Upstream reads `artists.thumb_url` here; that table is gone. The key is
+    the folded name rather than LOWER(name) for the reason _catalogue_name_key
+    documents - SQLite's LOWER() is ASCII-only, so a stored "Bjork" spelled
+    with the diacritic never answered its own lookup (iss29-D13).
+    """
     if not name:
         return None
     try:
         with database._get_connection() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT thumb_url FROM artists WHERE LOWER(name) = LOWER(?) LIMIT 1",
-                        (name,))
+            cur.execute("SELECT image_url FROM lib2_artists WHERE name_key = ? LIMIT 1",
+                        (_catalogue_name_key(name),))
             row = cur.fetchone()
             return row[0] if row and row[0] else None
     except Exception as e:
@@ -1371,7 +1384,11 @@ def get_discover_undiscovered_albums():
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT LOWER(al.title), LOWER(ar.name)
-                FROM albums al JOIN artists ar ON ar.id = al.artist_id
+                FROM lib2_albums al
+                JOIN lib2_artists ar ON ar.id = al.primary_artist_id
+                WHERE EXISTS (SELECT 1 FROM lib2_tracks t JOIN lib2_track_files f
+                              ON f.track_id=t.id WHERE t.album_id=al.id
+                              AND f.file_state='active' AND TRIM(f.path)<>'')
             """)
             library_keys = {(r[0].strip(), r[1].strip()) for r in cursor.fetchall()}
 
@@ -1426,7 +1443,7 @@ def get_discover_label_explorer():
 @_hide_blocked({'tracks': WORKS})
 @_discover_shelf_cache()
 def get_discover_deep_cuts():
-    """Low-popularity tracks from artists you listen to — from cache."""
+    """Low-popularity tracks by the artists you listen to — from cache."""
     try:
         database = get_database()
         cache = get_metadata_cache()
@@ -1802,18 +1819,25 @@ def get_seasonal_albums(season_key):
         logger.error(f"Error getting seasonal albums: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
+@bp.route('/api/discover/seasonal/current/playlist', methods=['GET'])
+@bp.route('/api/discover/seasonal-playlist', methods=['GET'])
 @bp.route('/api/discover/seasonal/<season_key>/playlist', methods=['GET'])
 @_hide_blocked({'tracks': WORKS})
-def get_seasonal_playlist(season_key):
-    """Get curated playlist for a specific season"""
+def get_seasonal_playlist(season_key='current'):
+    """Get curated playlist for a specific season (or current season)."""
     try:
         from core.seasonal_discovery import get_seasonal_discovery_service, SEASONAL_CONFIG
 
-        if season_key not in SEASONAL_CONFIG:
-            return jsonify({"success": False, "error": "Invalid season"}), 400
-
         database = get_database()
         seasonal_service = get_seasonal_discovery_service(_spotify_client(), database)
+
+        if season_key == 'current':
+            season_key = seasonal_service.get_current_season()
+            if not season_key:
+                return jsonify({"success": True, "tracks": []})
+
+        if season_key not in SEASONAL_CONFIG:
+            return jsonify({"success": False, "error": "Invalid season"}), 400
 
         # Get curated track IDs for active source
         active_source = _get_active_discovery_source()
@@ -1965,6 +1989,7 @@ def get_decade_playlist(decade):
         logger.error(f"Error getting decade playlist: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
+@bp.route('/api/discover/popular-picks', methods=['GET'])
 @bp.route('/api/discover/personalized/popular-picks', methods=['GET'])
 @_hide_blocked({'tracks': WORKS})
 def get_popular_picks_playlist():
@@ -1986,6 +2011,7 @@ def get_popular_picks_playlist():
         logger.error(f"Error getting popular picks playlist: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
+@bp.route('/api/discover/hidden-gems', methods=['GET'])
 @bp.route('/api/discover/personalized/hidden-gems', methods=['GET'])
 @_hide_blocked({'tracks': WORKS})
 def get_hidden_gems_playlist():
@@ -2107,6 +2133,7 @@ def get_mood_mixes():
         logger.error(f"Error building mood mixes: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
+@bp.route('/api/discover/discovery-shuffle', methods=['GET'])
 @bp.route('/api/discover/personalized/discovery-shuffle', methods=['GET'])
 @_hide_blocked({'tracks': WORKS})
 def get_discovery_shuffle():
@@ -3184,26 +3211,34 @@ def get_your_artist_info(artist_id):
             cursor = conn.cursor()
             # Check by various ID columns
             cursor.execute("""
-                SELECT * FROM artists WHERE id = ? OR spotify_artist_id = ? OR itunes_artist_id = ?
-                OR deezer_id = ? OR discogs_id = ? LIMIT 1
+                SELECT * FROM lib2_artists WHERE id = ? OR spotify_id = ?
+                   OR json_extract(external_ids, '$.itunes') = ?
+                   OR json_extract(external_ids, '$.deezer') = ?
+                   OR json_extract(external_ids, '$.discogs') = ? LIMIT 1
             """, (artist_id, artist_id, artist_id, artist_id, artist_id))
             row = cursor.fetchone()
             if row:
                 r = dict(row)
+                from core.library2.provider_ids import parse_external_ids
+                ids = parse_external_ids(r.get('external_ids'))
+                try:
+                    lastfm = (json.loads(r.get('enrichment') or '{}').get('lastfm') or {})
+                except (TypeError, ValueError):
+                    lastfm = {}
                 result.update({
                     'name': r.get('name', artist_name),
                     'genres': json.loads(r['genres']) if r.get('genres') else [],
                     'summary': r.get('summary', ''),
-                    'image_url': r.get('thumb_url', ''),
-                    'spotify_artist_id': r.get('spotify_artist_id'),
+                    'image_url': r.get('image_url', ''),
+                    'spotify_artist_id': r.get('spotify_id'),
                     'musicbrainz_id': r.get('musicbrainz_id'),
-                    'deezer_id': r.get('deezer_id'),
-                    'itunes_artist_id': r.get('itunes_artist_id'),
-                    'discogs_id': r.get('discogs_id'),
-                    'lastfm_url': r.get('lastfm_url'),
-                    'tidal_id': r.get('tidal_id'),
-                    'lastfm_listeners': r.get('lastfm_listeners', 0),
-                    'lastfm_playcount': r.get('lastfm_playcount', 0),
+                    'deezer_id': ids.get('deezer'),
+                    'itunes_artist_id': ids.get('itunes'),
+                    'discogs_id': ids.get('discogs'),
+                    'lastfm_url': ids.get('lastfm') or lastfm.get('url'),
+                    'tidal_id': ids.get('tidal'),
+                    'lastfm_listeners': lastfm.get('listeners', 0),
+                    'lastfm_playcount': lastfm.get('playcount', 0),
                 })
                 return jsonify(result)
         except Exception as e:
@@ -3408,8 +3443,29 @@ def serve_cached_image(cache_key):
         response.headers['X-SoulSync-Image-Cache'] = cached.status
         return response
     except Exception as exc:
-        logger.debug("cached image serve failed for %s: %s", cache_key, exc)
-        return '', 404
+        # An empty 404 made every distinct failure look identical from the
+        # browser — "key not found", "upstream refused", "host unreachable" and
+        # "not an image" were indistinguishable, so a production report could
+        # only say "218 images 404" without saying why. The reason travels in a
+        # header (secrets redacted) rather than a body so nothing about the
+        # response contract changes for the <img> that requested it.
+        from core.metadata.artwork import _redact_url_secrets
+        reason = ' '.join(_redact_url_secrets(str(exc)).split())[:200] \
+            or exc.__class__.__name__
+        logger.debug("cached image serve failed for %s: %s", cache_key, reason)
+        try:
+            # send the browser to the original instead of a 404 (#1763), but
+            # never hand it a URL that carries a server token
+            from core.image_cache import get_image_cache
+            orig_url = get_image_cache().get_original_url(cache_key)
+            if orig_url and _redact_url_secrets(orig_url) == orig_url:
+                return redirect(orig_url, code=302)
+        except Exception as redirect_exc:
+            logger.debug("original URL redirect lookup failed for %s: %s", cache_key, redirect_exc)
+        response = Response('', status=404)
+        response.headers['X-SoulSync-Image-Error'] = reason
+        response.headers['Cache-Control'] = 'no-store'
+        return response
 
 
 from core.artists.map import (
@@ -3575,12 +3631,13 @@ def get_available_decades():
                     COUNT(*) as track_count
                 FROM discovery_pool
                 WHERE release_date IS NOT NULL
+                  AND profile_id = ?
                   AND CAST(SUBSTR(release_date, 1, 4) AS INTEGER) >= 1950
                   AND CAST(SUBSTR(release_date, 1, 4) AS INTEGER) <= 2029
                 GROUP BY decade
                 HAVING track_count >= 10
                 ORDER BY decade ASC
-            """)
+            """, (get_current_profile_id(),))
 
             rows = cursor.fetchall()
             decades = []

@@ -415,12 +415,12 @@ describe('the findings inbox', () => {
 
   it('shows the blurb and the served verb, and no fix button for an unfixable type', async () => {
     routes({
-      [GROUPS]: { groups: [group({ finding_type: 'fake_lossless', pending: 4 })] },
+      [GROUPS]: { groups: [group({ finding_type: 'album_needs_enrichment', pending: 4 })] },
       [TYPES]: {
         types: [
           typeInfo({
-            type: 'fake_lossless',
-            label: 'Fake Lossless',
+            type: 'album_needs_enrichment',
+            label: 'Needs Enrichment',
             verb: null,
             fixable: false,
             destructive: false,
@@ -431,7 +431,7 @@ describe('the findings inbox', () => {
     renderSurface();
     await flush();
 
-    expect(document.querySelector('.repair-inbox-blurb')?.textContent).toContain('upscaled');
+    expect(document.querySelector('.repair-inbox-blurb')?.textContent).toContain('enrichment');
     expect(document.querySelector('.repair-inbox-btn')?.textContent).toBe('Dismiss all');
   });
 
@@ -586,25 +586,28 @@ describe('the findings inbox', () => {
     });
   });
 
-  it('dismisses a whole group by type rather than by shipping ids', async () => {
-    routes({
-      [GROUPS]: { groups: [group({ pending: 900 })] },
-      [TYPES]: { types: [typeInfo()] },
-      '/api/repair/findings/bulk': { success: true, updated: 900 },
-    });
-    renderSurface();
-    await flush();
+  it.each(['orphan_file', 'native_duplicate_releases'])(
+    'dismisses a whole %s group by type rather than by shipping ids',
+    async (findingType) => {
+      routes({
+        [GROUPS]: { groups: [group({ finding_type: findingType, pending: 900 })] },
+        [TYPES]: { types: [typeInfo({ type: findingType })] },
+        '/api/repair/findings/bulk': { success: true, updated: 900 },
+      });
+      renderSurface();
+      await flush();
 
-    fireEvent.click(screen.getByText('Dismiss all'));
-    await flush();
-    expect(confirmSpy).toHaveBeenCalledWith(
-      expect.objectContaining({ message: expect.stringContaining('never raised again') }),
-    );
-    expect(bodyOf('/api/repair/findings/bulk')).toEqual({
-      finding_type: 'orphan_file',
-      action: 'dismiss',
-    });
-  });
+      fireEvent.click(screen.getByText('Dismiss all'));
+      await flush();
+      expect(confirmSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ message: expect.stringContaining('never raised again') }),
+      );
+      expect(bodyOf('/api/repair/findings/bulk')).toEqual({
+        finding_type: findingType,
+        action: 'dismiss',
+      });
+    },
+  );
 
   it('says All Clear when no group survives the filters', async () => {
     routes({ [GROUPS]: { groups: [] } });
@@ -776,8 +779,12 @@ describe('the finding list', () => {
     // dashboard chips — the raw snake_case id meant one job went by two
     // names on the same screen.
     expect(meta).toContain('Orphan File Detector');
-    expect(meta).toContain('track');
-    expect(meta).toContain('ID: abc123');
+    // the entity id is for us, not the user: it moved to the tooltip
+    expect(meta).not.toContain('ID: abc123');
+    expect(meta).toContain('found');
+    expect(document.querySelector('.repair-finding-meta span')?.getAttribute('title')).toBe(
+      'track abc123',
+    );
   });
 
   it('shows the action badge on a non-pending finding and hides the fix buttons', async () => {
@@ -922,6 +929,174 @@ describe('per-finding actions', () => {
     });
     expect(toastSpy).toHaveBeenCalledWith('Moved', 'success');
     expect(onStatusChanged).toHaveBeenCalled();
+  });
+
+  it('offers a corrupt file with no track behind it a delete, not a re-download', async () => {
+    // The corruption detector walks the library folders as well as the
+    // catalogue. Those rows carry `entity_type: 'file'` and no id, had no
+    // per-row button at all, and the group button said "Re-download" over a
+    // fix that could only answer "No track ID associated with this finding".
+    routes({
+      [FINDINGS]: page([
+        finding({
+          id: 4,
+          job_id: 'audio_corruption_detector',
+          finding_type: 'corrupt_audio',
+          severity: 'error',
+          title: 'Corrupt file: Unknown - 01 - Miss YOU!',
+          entity_type: 'file',
+          entity_id: null,
+        }),
+      ]),
+      '/api/repair/findings/4/fix': { success: true, message: 'Deleted the corrupt file.' },
+    });
+    await renderList();
+    await flush();
+
+    const button = document.querySelector('.repair-finding-btn.fix') as HTMLElement;
+    expect(button?.textContent).toBe('Delete File');
+
+    fireEvent.click(button);
+    await flush();
+
+    expect(confirmSpy).toHaveBeenCalled();
+    expect(String(confirmSpy.mock.calls[0]?.[0]?.message)).not.toContain('re-download');
+    expect(fetchMock.mock.calls.some((c) => String(c[0]).endsWith('/4/fix'))).toBe(true);
+  });
+
+  it('does not delete the file when that confirm is declined', async () => {
+    confirmSpy.mockResolvedValue(false);
+    routes({
+      [FINDINGS]: page([
+        finding({ id: 4, finding_type: 'corrupt_audio', entity_type: 'file', entity_id: null }),
+      ]),
+    });
+    await renderList();
+    await flush();
+
+    fireEvent.click(document.querySelector('.repair-finding-btn.fix') as HTMLElement);
+    await flush();
+
+    expect(fetchMock.mock.calls.some((c) => String(c[0]).endsWith('/fix'))).toBe(false);
+  });
+
+  it('lets a re-tag with a hand-set field be settled per row', async () => {
+    // lib2 keeps a per-field override layer, and a re-tag respects it. That is
+    // the right default and the wrong thing to make silent: someone who fixed
+    // a title months ago and has since fixed the catalogue needs a way to say
+    // "the catalogue wins now".
+    routes({
+      [FINDINGS]: page([
+        finding({
+          id: 6,
+          job_id: 'library_retag',
+          finding_type: 'library_retag',
+          title: 'Tags out of date: Drake - One Dance',
+          entity_type: 'track',
+          entity_id: 'lib2:6',
+          details: { has_manual_conflict: true, manual_fields: ['Title'] },
+        }),
+      ]),
+      '/api/repair/findings/6/fix': { success: true, message: 'Wrote tags' },
+    });
+    await renderList();
+    await flush();
+
+    fireEvent.click(document.querySelector('.repair-finding-btn.fix') as HTMLElement);
+    await flush();
+    clickPrompt('_retag-overwrite');
+    await flush();
+
+    expect(bodyOf('/6/fix')).toEqual({ fix_action: 'overwrite_manual' });
+  });
+
+  it('does not stop to ask when nothing on the row was hand-set', async () => {
+    routes({
+      [FINDINGS]: page([
+        finding({
+          id: 7,
+          job_id: 'library_retag',
+          finding_type: 'library_retag',
+          entity_type: 'track',
+          entity_id: 'lib2:7',
+          details: { has_manual_conflict: false },
+        }),
+      ]),
+      '/api/repair/findings/7/fix': { success: true, message: 'Wrote tags' },
+    });
+    await renderList();
+    await flush();
+
+    fireEvent.click(document.querySelector('.repair-finding-btn.fix') as HTMLElement);
+    await flush();
+
+    // No fix_action at all: keeping hand-set fields is what the handler does
+    // with none, so sending 'safe' would add a string nothing reads.
+    expect(bodyOf('/7/fix')).toEqual({});
+  });
+
+  /** answers the first fix with `first`, every later one with `rest`. */
+  function fixAnswers(first: unknown, rest: unknown) {
+    let calls = 0;
+    const listing = page([finding({ id: 1 })]);
+    fetchMock.mockImplementation((url: string) => {
+      const body = String(url).endsWith('/1/fix')
+        ? calls++ === 0
+          ? first
+          : rest
+        : String(url).includes(FINDINGS)
+          ? listing
+          : {};
+      return Promise.resolve({ ok: true, status: 200, json: async () => body } as never);
+    });
+  }
+
+  const SAME_NAME = {
+    success: false,
+    needs_confirm: true,
+    library_paths: ['/music/Artist/Album (Deluxe)/01 - Intro.flac'],
+    error: 'A library track has the same filename in another folder.',
+  };
+
+  it('a same-filename orphan shows the library copy and deletes on yes', async () => {
+    // lake: both buttons refused these with no way past
+    fixAnswers(SAME_NAME, { success: true, message: 'Deleted orphan file from disk' });
+    await renderList();
+    await flush();
+
+    fireEvent.click(document.querySelector('.repair-finding-btn.fix') as HTMLElement);
+    await flush();
+    clickPrompt('_orphan-delete');
+    await flush();
+    await flush();
+
+    const ask = confirmSpy.mock.calls[0]?.[0] as { message: string; confirmText: string };
+    expect(ask.message).toContain('/music/Artist/Album (Deluxe)/01 - Intro.flac');
+    expect(ask.confirmText).toBe('Delete anyway');
+    const fixBodies = fetchMock.mock.calls
+      .filter((c) => String(c[0]).endsWith('/1/fix'))
+      .map((c) => JSON.parse((c[1] as RequestInit).body as string));
+    expect(fixBodies).toEqual([{ fix_action: 'delete' }, { fix_action: 'delete_confirmed' }]);
+    expect(toastSpy).toHaveBeenCalledWith('Deleted orphan file from disk', 'success');
+  });
+
+  it('a same-filename orphan is left alone when the user says no', async () => {
+    fixAnswers(SAME_NAME, { success: true });
+    confirmSpy.mockResolvedValue(false);
+    await renderList();
+    await flush();
+
+    fireEvent.click(document.querySelector('.repair-finding-btn.fix') as HTMLElement);
+    await flush();
+    clickPrompt('_orphan-delete');
+    await flush();
+    await flush();
+
+    expect(fetchMock.mock.calls.filter((c) => String(c[0]).endsWith('/1/fix'))).toHaveLength(1);
+    expect(toastSpy).not.toHaveBeenCalled();
+    expect(
+      (document.querySelector('.repair-finding-btn.fix') as HTMLButtonElement | null)?.disabled,
+    ).not.toBe(true);
   });
 
   it('sends nothing when the prompt is cancelled', async () => {
@@ -1133,6 +1308,69 @@ describe('per-finding actions', () => {
     expect(document.getElementById('reid-modal')).not.toBeNull();
     expect(document.getElementById('reid-hero-title')?.textContent).toBe('Song');
   });
+
+  // #1567: a poisoned album holds 11 songs by 9 artists. the single-track
+  // modal searched "Music Nickelback" for all of them, which can't work.
+  const poisonedAlbum = (details: Record<string, unknown>) =>
+    finding({
+      id: 43,
+      finding_type: 'suspect_album_tag',
+      entity_type: 'album',
+      // the native subject; the library route gets the bare album id
+      entity_id: 'lib2:700',
+      title: 'Suspect album: "Music" may be a poisoned batch',
+      details: {
+        album_id: 700,
+        album_title: 'Music',
+        album_artist_name: 'Nickelback',
+        reidentify_query: 'Music Nickelback',
+        ...details,
+      },
+    });
+
+  it('opens a poisoned album in the library instead of the track modal', async () => {
+    const navigateToPage = vi.fn().mockResolvedValue(true);
+    Object.assign(window, { SoulSyncWebRouter: { navigateToPage } });
+    routes({ [FINDINGS]: page([poisonedAlbum({ artist_id: 2 })]) });
+    await renderList();
+    await flush();
+
+    const fixBtn = document.querySelector('.repair-finding-btn.fix') as HTMLElement;
+    expect(fixBtn.textContent).toBe('Open album');
+    fireEvent.click(fixBtn);
+    await flush();
+
+    expect(document.getElementById('reid-modal')).toBeNull();
+    expect(navigateToPage).toHaveBeenCalledWith('artist-detail', {
+      artistId: '2',
+      artistName: 'Nickelback',
+      focusAlbumId: '700',
+    });
+    expect(fetchMock.mock.calls.some((c) => String(c[0]).includes('/fix'))).toBe(false);
+  });
+
+  it('finds the artist by name for an album finding stored before the id was', async () => {
+    const navigateToPage = vi.fn().mockResolvedValue(true);
+    Object.assign(window, { SoulSyncWebRouter: { navigateToPage } });
+    routes({
+      [FINDINGS]: page([poisonedAlbum({})]),
+      '/api/library/artists?search=Nickelback': {
+        success: true,
+        artists: [{ id: 'nav-2', name: 'Nickelback' }],
+      },
+    });
+    await renderList();
+    await flush();
+
+    fireEvent.click(document.querySelector('.repair-finding-btn.fix') as HTMLElement);
+    await flush();
+
+    expect(navigateToPage).toHaveBeenCalledWith('artist-detail', {
+      artistId: 'nav-2',
+      artistName: 'Nickelback',
+      focusAlbumId: '700',
+    });
+  });
 });
 
 // ── Bulk paths ───────────────────────────────────────────────────────────────
@@ -1195,7 +1433,32 @@ describe('bulk selection', () => {
       ids: [1, 2],
       action: 'dismiss',
     });
-    expect(toastSpy).toHaveBeenCalledWith('2 findings dismissed', 'success');
+    // dismiss is "never raise this again", so it comes with a way back
+    expect(document.querySelector('.repair-undo-bar')?.textContent).toContain(
+      '2 findings dismissed',
+    );
+  });
+
+  it('undo after a bulk dismiss reopens exactly the dismissed ids', async () => {
+    routes({
+      [FINDINGS]: page([finding({ id: 1 }), finding({ id: 2 })]),
+      '/api/repair/findings/1/reopen': { success: true },
+      '/api/repair/findings/2/reopen': { success: true },
+    });
+    await renderList();
+    await flush();
+    fireEvent.click(document.getElementById('repair-select-all-cb') as HTMLElement);
+    await flush();
+    fireEvent.click(screen.getByText('Dismiss Selected'));
+    await flush();
+    fireEvent.click(screen.getByText('Undo'));
+    await flush();
+    const reopened = fetchMock.mock.calls
+      .map(([url]) => String(url))
+      .filter((url) => url.endsWith('/reopen'));
+    expect(reopened).toEqual(['/api/repair/findings/1/reopen', '/api/repair/findings/2/reopen']);
+    expect(toastSpy).toHaveBeenCalledWith('Brought back 2 findings', 'success');
+    expect(document.querySelector('.repair-undo-bar')).toBeNull();
   });
 
   it('asks once per finding KIND, then fixes each id with its own action', async () => {
@@ -1223,9 +1486,9 @@ describe('bulk selection', () => {
     await flush();
 
     const bodyFor = (id: number) => bodyOf(`/${id}/fix`);
-    expect(bodyFor(1)).toEqual({ fix_action: 'staging' });
-    expect(bodyFor(2)).toEqual({ fix_action: 'staging' });
-    expect(bodyFor(3)).toEqual({ fix_action: 'remove' });
+    expect(bodyFor(1)).toEqual({ fix_action: 'staging', bulk: true });
+    expect(bodyFor(2)).toEqual({ fix_action: 'staging', bulk: true });
+    expect(bodyFor(3)).toEqual({ fix_action: 'remove', bulk: true });
     expect(toastSpy).toHaveBeenCalledWith('Fixed 3', 'success');
   });
 
@@ -1555,7 +1818,7 @@ describe('clear findings', () => {
       target: { value: 'dead_file_cleaner' },
     });
     await flush();
-    fireEvent.click(screen.getByText('Clear Findings'));
+    fireEvent.click(screen.getByText('Delete matching…'));
     await flush();
 
     // `renderList` types 'a' into the search box, so this test has always run
@@ -1580,7 +1843,7 @@ describe('clear findings', () => {
     routes({ [FINDINGS]: page([finding()]) });
     await renderList();
     await flush();
-    fireEvent.click(screen.getByText('Clear Findings'));
+    fireEvent.click(screen.getByText('Delete matching…'));
     await flush();
     expect(confirmSpy).toHaveBeenCalledWith(
       expect.objectContaining({ message: expect.stringContaining('for all jobs (pending)') }),
@@ -1592,7 +1855,7 @@ describe('clear findings', () => {
     routes({ [FINDINGS]: page([finding()]) });
     await renderList();
     await flush();
-    fireEvent.click(screen.getByText('Clear Findings'));
+    fireEvent.click(screen.getByText('Delete matching…'));
     await flush();
     expect(fetchMock.mock.calls.some((c) => String(c[0]).endsWith('/findings/clear'))).toBe(false);
   });

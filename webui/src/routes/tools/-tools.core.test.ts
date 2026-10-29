@@ -24,6 +24,8 @@ import {
   cacheSourceLabel,
   findingFilePath,
   findingFixLabel,
+  findingRedownloadTrackId,
+  findingRowFixLabel,
   findingSeverityClass,
   findingSeverityIcon,
   findingStatusBadge,
@@ -49,10 +51,26 @@ import {
   repairJobBadge,
   repairJobCardClass,
   repairJobDot,
+  repairSettingText,
   scoreBar,
   timeAgo,
   linkedJobId,
 } from './-tools.core';
+
+describe('repairSettingText', () => {
+  it.each([
+    [null, ''],
+    [undefined, ''],
+    ['plain text', 'plain text'],
+    [0, '0'],
+    [false, 'false'],
+    [{ limit: 5 }, '{"limit":5}'],
+    [[1, 2], '[1,2]'],
+    [Symbol('unsupported'), ''],
+  ])('formats %s without changing the stored value', (value, expected) => {
+    expect(repairSettingText(value)).toBe(expected);
+  });
+});
 
 describe('prettifyRepairSettingKey', () => {
   it('spells out the ffmpeg cost for deep_audio_verify instead of Title Casing it', () => {
@@ -178,9 +196,16 @@ describe('finding labels', () => {
     // know only `critical`, which nothing has ever emitted. Both map to the
     // same icon and the same CSS class while old rows exist.
     expect(Object.keys(FINDING_SEVERITY_ICONS)).toHaveLength(4);
-    expect(Object.keys(FINDING_TYPE_LABELS)).toHaveLength(24);
-    expect(Object.keys(FINDING_FIXABLE_TYPES)).toHaveLength(22);
-    expect(Object.keys(FINDING_ACTION_LABELS)).toHaveLength(14);
+    expect(FINDING_TYPE_LABELS.quality_upgrade_review).toBe('Quality Upgrade Review');
+    expect(FINDING_TYPE_LABELS.quality_format_not_targeted).toBe('Format Not in Profile');
+    expect(FINDING_TYPE_LABELS.quality_unknown).toBe('Quality Unknown');
+    expect(FINDING_FIXABLE_TYPES.quality_upgrade_review).toBe('Monitor & Upgrade');
+    expect(FINDING_FIXABLE_TYPES.quality_format_not_targeted).toBe('Leave As-is');
+    expect(FINDING_FIXABLE_TYPES.quality_unknown).toBe('Leave As-is');
+    expect(Object.keys(FINDING_TYPE_LABELS)).toHaveLength(30);
+    expect(Object.keys(FINDING_FIXABLE_TYPES)).toHaveLength(29);
+    // 16 music + obsolete + the 10 video fix actions + the scan retirement
+    expect(Object.keys(FINDING_ACTION_LABELS)).toHaveLength(28);
   });
 
   it('labels known finding types', () => {
@@ -199,8 +224,44 @@ describe('finding labels', () => {
     expect(findingFixLabel('duplicate_tracks')).toBe('Keep Best');
     expect(findingFixLabel('genre_enrichment')).toBe('Apply Genres');
     expect(findingFixLabel('comma_artist_split')).toBe('Split Artists');
-    expect(findingFixLabel('fake_lossless')).toBeNull();
+    expect(findingFixLabel('fake_lossless')).toBe('Re-download');
+    expect(findingFixLabel('album_needs_enrichment')).toBeNull();
     expect(findingFixLabel('path_mismatch')).toBeNull();
+  });
+
+  it('names the delete for a finding with no track behind it', () => {
+    // The corruption detector walks the library folders too, so it raises rows
+    // with `entity_type: 'file'` and no id. There is no track to re-request,
+    // and the button used to promise one anyway — over a fix that could only
+    // answer "No track ID associated with this finding".
+    const stray = { finding_type: 'corrupt_audio', entity_type: 'file', entity_id: null };
+    expect(findingRowFixLabel(stray)).toBe('Delete File');
+    expect(findingRowFixLabel({ ...stray, finding_type: 'short_preview_track' })).toBe(
+      'Delete File',
+    );
+    expect(findingRowFixLabel({ ...stray, finding_type: 'fake_lossless' })).toBe('Delete File');
+  });
+
+  it('searches a file finding by the track behind the file, never by the file id', () => {
+    const fake = {
+      entity_type: 'file',
+      entity_id: 'lib2:31',
+      details: { library_v2: { file_id: 31, track_id: 7 } },
+    };
+    expect(findingRedownloadTrackId(fake)).toBe('lib2:7');
+    expect(findingRedownloadTrackId({ ...fake, details: {} })).toBeNull();
+    expect(findingRedownloadTrackId({ ...fake, entity_id: null })).toBeNull();
+    expect(findingRedownloadTrackId({ entity_type: 'track', entity_id: 'lib2:9' })).toBe('lib2:9');
+  });
+
+  it('leaves a finding that DOES name a track on the re-download wording', () => {
+    expect(
+      findingRowFixLabel({
+        finding_type: 'short_preview_track',
+        entity_type: 'track',
+        entity_id: 'lib2:7',
+      }),
+    ).toBe('Re-download');
   });
 
   it('knows missing_discography_track is fixable despite having no type label', () => {
@@ -744,8 +805,53 @@ describe('bulkFixRunMessage', () => {
     );
   });
 
+  it('appends the run-level note when a completed mixed run carries one (#1879 breaker)', () => {
+    expect(
+      bulkFixRunMessage({
+        fixed: 2,
+        failed: 5,
+        total: 9,
+        note: 'LRCLib stopped answering reliably — remaining lyrics findings stay pending',
+        errors: [{ error: 'LRCLib rate-limited (429) — retry later' }],
+      }).message,
+    ).toBe(
+      'Fixed 2, 5 failed of 9: LRCLib stopped answering reliably — remaining lyrics findings stay pending',
+    );
+  });
+
+  it('prefers the run-level error when a stopped run carries one (#1879 breaker)', () => {
+    expect(
+      bulkFixRunMessage({
+        fixed: 0,
+        failed: 5,
+        total: 30,
+        stopped: true,
+        error: 'LRCLib stopped answering reliably — bulk fix stopped early',
+        errors: [{ error: 'LRCLib rate-limited (429) — retry later' }],
+      }).message,
+    ).toBe(
+      'Bulk fix stopped — fixed 0, 5 failed of 30: LRCLib stopped answering reliably — bulk fix stopped early',
+    );
+  });
+
   it('is an error when nothing was fixed, even with no failures', () => {
     expect(bulkFixRunMessage({ fixed: 0, failed: 0, total: 4 }).type).toBe('error');
+  });
+
+  it('reports findings skipped by design apart from failures', () => {
+    expect(
+      bulkFixRunMessage({
+        fixed: 0,
+        failed: 0,
+        skipped: 3,
+        total: 3,
+        note: '2 track(s) by other artists were not added to the wishlist. Fix those albums on their own to add them.',
+      }),
+    ).toEqual({
+      message:
+        'Fixed 0, 3 skipped of 3: 2 track(s) by other artists were not added to the wishlist. Fix those albums on their own to add them.',
+      type: 'success',
+    });
   });
 });
 
@@ -758,6 +864,16 @@ describe('bulkFixLoopMessage', () => {
     expect(bulkFixLoopMessage(4, 1, 'nope').message).toBe('Fixed 4, 1 failed: nope');
     expect(bulkFixLoopMessage(4, 1, '').message).toBe('Fixed 4, 1 failed');
     expect(bulkFixLoopMessage(0, 2, 'nope').type).toBe('error');
+    expect(bulkFixLoopMessage(0, 0, '', 2)).toEqual({
+      message: 'Fixed 0, 2 skipped',
+      type: 'success',
+    });
+    // skipped-by-design does not turn a run with real failures green
+    expect(bulkFixLoopMessage(0, 5, 'nope', 1).type).toBe('error');
+    // a partial gate on a fixed finding is reported, not silent
+    expect(bulkFixLoopMessage(3, 0, '', 0, 2).message).toBe(
+      'Fixed 3: 2 track(s) by other artists were not added to the wishlist. To add them, fix the album on its own (reopen its finding first if it resolved)',
+    );
     // The `failed` half of the guard is load-bearing even though the caller only
     // ever sets lastError alongside a failure — a stale error must not surface
     // on a clean run.

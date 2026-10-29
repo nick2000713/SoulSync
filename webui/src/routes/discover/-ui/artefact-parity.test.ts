@@ -77,13 +77,17 @@ const NEW_IDS = [
   // Deezer's editors publish curated playlists and the public api serves them
   // with no key. A shelf the vanilla never had, so its section anchor is new.
   'deezer-editorial',
+  // the SoulSync network's weekly charts (MetaSync): a shelf the vanilla never had
+  'sin-charts',
   'build-a-playlist',
   // the generated playlist's name box (#1421): the vanilla never let you name it
   'build-playlist-name',
   'lastfm-radio',
   'listenbrainz',
   'recent-releases',
-  // the 3.3.0 zone regroup: anchors for the four recommendation zones
+  // The four zone anchors upstream's Discover redesign added (3.2.5, regrouped
+  // in 3.3.0). They are scroll targets the page's own zone map jumps to, not
+  // vanilla artefacts — the vanilla had no zones at all.
   'discover-zone-for-you',
   'discover-zone-library',
   'discover-zone-new-missing',
@@ -129,7 +133,9 @@ const DELETED_MARKUP_IDS = [
   // 'your-albums-section' left this ledger when the rails redesign gave it
   // real CSS (the wrapping-grid exemption) — the parity test caught the
   // stale claim, exactly as designed.
-  'your-artists-carousel',
+  // 'your-artists-carousel' left the same way in the Oct 13 mobile batch:
+  // mobile.css now carries real rules for the id (the fluid 2-up grid),
+  // which makes it a KNOWN_ID via the stylesheet scan.
   'your-artists-section',
 ];
 const DELETED_MARKUP_CLASSES = ['artweb-size-btn', 'watch-all-text'];
@@ -146,7 +152,10 @@ const DELETED_MARKUP_CLASSES = ['artweb-size-btn', 'watch-all-text'];
  * only pass through here on its way to a stylesheet.
  */
 const NEW_CLASSES: string[] = [
-  // 3.3.0 zone regroup: the tools zone's grid modifier, styled in style.css
+  // 3.3.0 zone regroup: the tools zone's grid modifier, styled in style.css.
+  // It arrived in 3.2.5 as a modifier on the styled `.discovery-zone-section`
+  // base with no rule of its own; it leaves this list the moment the scan can
+  // see the rule that now exists.
   'discovery-zone-section--map-tools',
   // NOTE: the Deezer editorial shelf adds no entry here on purpose. Its chips
   // and its progress bar are styled in style.css, which makes them KNOWN

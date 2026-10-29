@@ -70,6 +70,7 @@ _recover_youtube_artist_cleaned = None
 _run_full_missing_tracks_process = None
 _tracks_with_mirrored_quality_profile = None
 _update_and_save_sync_status = None
+_invalidate_sync_fingerprint = None
 _update_automation_progress = None
 is_wishlist_actually_processing = None
 get_tidal_client_for_profile = None
@@ -144,6 +145,23 @@ def search_spotify():
         logger.error(f"Error searching Spotify: {e}")
         return jsonify({"error": str(e)}), 500
 
+_SPOTIFY_ID_RE = re.compile(r'[A-Za-z0-9]{22}')
+
+
+def _is_spotify_id(track_id) -> bool:
+    """spotify ids are 22 base62 chars. deezer, itunes and discogs ids are
+    numbers, so a fallback result can't pass for a spotify one."""
+    return bool(_SPOTIFY_ID_RE.fullmatch(str(track_id or '')))
+
+
+def _spotify_fallback_source() -> str:
+    try:
+        name = _spotify_client()._fallback_source
+    except Exception:  # noqa: BLE001 - same default the client uses
+        name = None
+    return name if isinstance(name, str) and name else 'deezer'
+
+
 @bp.route('/api/spotify/search_tracks', methods=['GET'])
 def search_spotify_tracks():
     """Search for tracks on Spotify - used by discovery fix modal"""
@@ -173,7 +191,15 @@ def search_spotify_tracks():
         else:
             if _hydrabase_worker() and _dev_mode_enabled():
                 _hydrabase_worker().enqueue(query, 'tracks')
-            tracks = _spotify_client().search_tracks(query, limit=limit)
+            client = _spotify_client()
+            # with a title to aim at, spotify answers first and the fallback
+            # source gets search_song, not the plain free-text search the
+            # client falls back to. deezer's free text leaves originals out
+            # and the rerank can't surface what never came back (#1601).
+            tracks = client.search_tracks(query, limit=limit, allow_fallback=not track_q)
+            if not tracks and track_q:
+                from core.metadata.song_search import search_song
+                tracks = search_song(client._fallback, track_q, artist_q, limit=limit)
 
         # Local rerank — same helper Deezer + iTunes use. Spotify's
         # ranking is usually clean but karaoke / cover variants do
@@ -187,6 +213,10 @@ def search_spotify_tracks():
                 expected_artist=artist_q,
             )
 
+        # spotify falls back to the configured metadata source when its api
+        # errors, so say where each result really came from. the fix modal
+        # saves it, instead of stamping a deezer id as spotify (#1565).
+        fallback_name = 'hydrabase' if use_hydrabase else _spotify_fallback_source()
         tracks_dict = [{
             'id': t.id,
             'name': t.name,
@@ -194,6 +224,7 @@ def search_spotify_tracks():
             'album': t.album,
             'duration_ms': t.duration_ms,
             'image_url': getattr(t, 'image_url', None),
+            'source': 'spotify' if _is_spotify_id(t.id) else fallback_name,
         } for t in tracks]
 
         return jsonify({'tracks': tracks_dict})
@@ -1411,6 +1442,51 @@ def get_tidal_playlists():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# a big tidal playlist takes minutes to page through (1s between pages). the
+# sync page's background crawl, the modal opening it and start identifying
+# each used to fetch it again from scratch, so start sat behind a second
+# multi-minute fetch while the modal showed nothing. one fetch per playlist
+# at a time, and start takes the one that just landed.
+_TIDAL_FETCH_HANDOFF_SECONDS = 300
+_tidal_fetch_lock = threading.Lock()
+_tidal_fetch_inflight = {}  # (id(client), playlist_id) -> Event
+_tidal_fetch_recent = {}  # playlist_id -> (client, fetched_at, playlist)
+
+
+def _fetch_tidal_playlist(client, playlist_id, *, reuse_recent=False):
+    """client.get_playlist, shared. an identical fetch already running is
+    waited on, not repeated. reuse_recent takes a fetch from the last few
+    minutes (once, so a re-run after that still gets fresh tracks)."""
+    key = (id(client), playlist_id)
+    while True:
+        with _tidal_fetch_lock:
+            if reuse_recent:
+                recent = _tidal_fetch_recent.get(playlist_id)
+                if (recent and recent[0] is client
+                        and time.time() - recent[1] < _TIDAL_FETCH_HANDOFF_SECONDS):
+                    del _tidal_fetch_recent[playlist_id]
+                    return recent[2]
+            pending = _tidal_fetch_inflight.get(key)
+            if pending is None:
+                done = threading.Event()
+                _tidal_fetch_inflight[key] = done
+                break
+        # someone else is fetching it. wait, then take theirs (or fetch, if
+        # theirs failed). a fresh fetch only waits; it does not reuse.
+        pending.wait()
+        reuse_recent = True
+    playlist = None
+    try:
+        playlist = client.get_playlist(playlist_id)
+        return playlist
+    finally:
+        with _tidal_fetch_lock:
+            if playlist is not None and playlist.tracks:
+                _tidal_fetch_recent[playlist_id] = (client, time.time(), playlist)
+            _tidal_fetch_inflight.pop(key, None)
+        done.set()
+
+
 @bp.route('/api/tidal/playlist/<playlist_id>', methods=['GET'])
 def get_tidal_playlist_tracks(playlist_id):
     """Fetches full track details for a specific Tidal playlist (matches sync.py pattern)."""
@@ -1424,7 +1500,7 @@ def get_tidal_playlist_tracks(playlist_id):
         # `get_playlist` recognizes the virtual `tidal-favorites` ID and
         # dispatches to the userCollectionTracks endpoint internally, so
         # the rest of this handler treats it identically to a real playlist.
-        full_playlist = client.get_playlist(playlist_id)
+        full_playlist = _fetch_tidal_playlist(client, playlist_id)
         if not full_playlist:
             return jsonify({"error": "Playlist not found or unable to access. This may be due to privacy settings or Tidal API restrictions."}), 404
 
@@ -1441,6 +1517,8 @@ def get_tidal_playlist_tracks(playlist_id):
             'owner': getattr(full_playlist, 'owner', 'Unknown'),
             'track_count': len(full_playlist.tracks),
             'image_url': getattr(full_playlist, 'image_url', None),
+            # what tidal never handed over, so the mirror can say so (#1613)
+            'source_skipped': _playlist_skipped_counts(full_playlist),
             'tracks': []
         }
 
@@ -1468,42 +1546,74 @@ def get_tidal_playlist_tracks(playlist_id):
 tidal_discovery_states = {}  # Key: playlist_id, Value: discovery state
 tidal_discovery_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="tidal_discovery")
 
+def _ensure_tidal_mirror(playlist_id, playlist, profile_id):
+    """the mirror for this tidal playlist: its skipped counts brought up to
+    date, or the whole mirror made from the playlist in hand when there is
+    none. an existing mirror's tracks are left to its own refresh."""
+    from core.playlists.sources.base import to_mirror_track_dict
+    from core.playlists.sources.tidal import TidalPlaylistSource
+    from database.music_database import get_database as _get_db
+
+    database = _get_db()
+    skipped = _playlist_skipped_counts(playlist)
+    if database.get_mirrored_playlist_by_source('tidal', str(playlist_id), profile_id):
+        database.set_mirrored_playlist_source_skipped(
+            'tidal', playlist_id, skipped, profile_id=profile_id)
+        return
+    source = TidalPlaylistSource(lambda: None)
+    meta = source._meta_from_playlist(playlist)
+    tracks = [to_mirror_track_dict(source._track_from_tidal(t, i))
+              for i, t in enumerate(playlist.tracks or [])]
+    database.mirror_playlist(
+        source='tidal',
+        source_playlist_id=str(playlist_id),
+        name=meta.name,
+        tracks=tracks,
+        profile_id=profile_id,
+        description=meta.description,
+        owner=meta.owner,
+        image_url=getattr(playlist, 'image_url', None),
+        source_skipped=skipped,
+    )
+    logger.info("mirrored tidal playlist '%s' at discovery start (%s tracks)", meta.name, len(tracks))
+
+
 @bp.route('/api/tidal/discovery/start/<playlist_id>', methods=['POST'])
 def start_tidal_discovery(playlist_id):
     """Start Spotify discovery process for a Tidal playlist"""
     try:
-        # Get playlist data from Tidal
-        if not _tidal_client() or not _tidal_client().is_authenticated():
+        # the same client the page listed and fetched the playlist with, or a
+        # profile's own private playlist 404s
+        client = get_tidal_client_for_profile() or _tidal_client()
+        if not client or not client.is_authenticated():
             return jsonify({"error": "Tidal not authenticated."}), 401
 
-        # Fetch this single playlist directly — no need to re-fetch all playlists
-        target_playlist = _tidal_client().get_playlist(playlist_id)
-
-        if not target_playlist:
-            return jsonify({"error": "Tidal playlist not found"}), 404
-
-        if not target_playlist.tracks:
-            return jsonify({"error": "Playlist has no tracks"}), 400
-
-        # Initialize discovery state if it doesn't exist, or update existing state
+        # the playlist fetch happens in the worker, not here. a big playlist
+        # takes minutes to page through and a reverse proxy gives up on the
+        # request long before that (TheHomeGuy: 504 on 1218 tracks, then
+        # discovery started on its own minutes later)
         if playlist_id in tidal_discovery_states:
             existing_state = tidal_discovery_states[playlist_id]
             if existing_state['phase'] == 'discovering':
                 return jsonify({"error": "Discovery already in progress"}), 400
-            # Update existing state for discovery
+            existing_state['spotify_matches'] = 0
+            existing_state['discovery_progress'] = 0
+            existing_state['discovery_results'] = []
+            existing_state['wing_it_count'] = 0
             existing_state['phase'] = 'discovering'
             existing_state['status'] = 'discovering'
             existing_state['last_accessed'] = time.time()
             state = existing_state
         else:
-            # Create new state for first-time discovery
+            # Create new state for first-time discovery. playlist lands once
+            # the worker has fetched it
             state = {
-                'playlist': target_playlist,
+                'playlist': None,
                 'phase': 'discovering', # fresh -> discovering -> discovered -> syncing -> sync_complete -> downloading -> download_complete
                 'status': 'discovering',
                 'discovery_progress': 0,
                 'spotify_matches': 0,
-                'spotify_total': len(target_playlist.tracks),
+                'spotify_total': 0,
                 'discovery_results': [],
                 'sync_playlist_id': None,
                 'converted_spotify_playlist_id': None,
@@ -1515,20 +1625,57 @@ def start_tidal_discovery(playlist_id):
             }
             tidal_discovery_states[playlist_id] = state
 
-        # Add activity for discovery start
-        add_activity_item("", "Tidal Discovery Started", f"'{target_playlist.name}' - {len(target_playlist.tracks)} tracks", "Now")
-
         # Start discovery worker (capture profile ID while we have Flask context)
         state['_profile_id'] = get_current_profile_id()
-        future = tidal_discovery_executor.submit(_run_tidal_discovery_worker, playlist_id)
+        future = tidal_discovery_executor.submit(_fetch_and_run_tidal_discovery, playlist_id, client)
         state['discovery_future'] = future
 
-        logger.info(f"Started Spotify discovery for Tidal playlist: {target_playlist.name}")
+        logger.info(f"Started Spotify discovery for Tidal playlist: {playlist_id}")
         return jsonify({"success": True, "message": "Discovery started"})
 
     except Exception as e:
         logger.error(f"Error starting Tidal discovery: {e}")
         return jsonify({"error": str(e)}), 500
+
+
+def _fetch_and_run_tidal_discovery(playlist_id, client):
+    """the slow half of start: fetch the playlist (or take the one the modal
+    or the page's crawl just made), mirror it, then discover."""
+    state = tidal_discovery_states[playlist_id]
+    try:
+        target_playlist = _fetch_tidal_playlist(client, playlist_id, reuse_recent=True)
+        if not target_playlist:
+            raise ValueError("Tidal playlist not found")
+        if not target_playlist.tracks:
+            raise ValueError("Playlist has no tracks")
+    except Exception as e:
+        logger.error(f"Error fetching Tidal playlist {playlist_id} for discovery: {e}")
+        state['phase'] = 'error'
+        state['status'] = f'error: {e}'
+        add_activity_item("", "Tidal Discovery Failed", f"Couldn't load the playlist: {e}", "Now")
+        return
+
+    # reset or deleted while the fetch ran
+    if tidal_discovery_states.get(playlist_id) is not state or state['phase'] != 'discovering':
+        return
+
+    # a fresh fetch has fresh counts, keep the mirror's note current. and
+    # a playlist with no mirror yet gets one here: the sync page only
+    # mirrors from its background crawl, which a big playlist (minutes to
+    # page through) could lose, and it then synced but never showed in
+    # the mirrored list
+    try:
+        _ensure_tidal_mirror(playlist_id, target_playlist, state.get('_profile_id', 1))
+    except Exception as e:
+        logger.debug("tidal mirror not saved at discovery start: %s", e)
+
+    # take the playlist we just fetched, or a re-run walks the old track
+    # list (#1613)
+    state['playlist'] = target_playlist
+    state['spotify_total'] = len(target_playlist.tracks)
+
+    add_activity_item("", "Tidal Discovery Started", f"'{target_playlist.name}' - {len(target_playlist.tracks)} tracks", "Now")
+    _run_tidal_discovery_worker(playlist_id)
 
 @bp.route('/api/tidal/discovery/status/<playlist_id>', methods=['GET'])
 def get_tidal_discovery_status(playlist_id):
@@ -1666,7 +1813,8 @@ def _sync_discovery_results_to_mirrored(source_type, source_playlist_id, discove
             db_id_to_track[mt['id']] = mt
             sid = mt.get('source_track_id', '')
             if sid:
-                source_id_to_db_id[str(sid)] = mt['id']
+                # a playlist can hold the same track twice, one row each
+                source_id_to_db_id.setdefault(str(sid), []).append(mt['id'])
             pos = mt.get('position')
             if pos is not None:
                 position_to_db_id[pos] = mt['id']
@@ -1693,8 +1841,11 @@ def _sync_discovery_results_to_mirrored(source_type, source_playlist_id, discove
             # Method 1: match by source track ID
             source_track = result.get('tidal_track') or result.get('source_track') or {}
             source_tid = str(source_track.get('id', '')) if source_track else ''
-            if source_tid and source_tid in source_id_to_db_id:
-                db_track_id = source_id_to_db_id[source_tid]
+            if source_tid and source_id_to_db_id.get(source_tid):
+                # hand the rows out in order so each duplicate gets one result,
+                # the last row keeps answering if results outnumber rows
+                rows = source_id_to_db_id[source_tid]
+                db_track_id = rows.pop(0) if len(rows) > 1 else rows[0]
 
             # Method 2: match by position/index
             if not db_track_id:
@@ -1816,10 +1967,19 @@ def _join_artist_names(artists):
     """Join artist names from a list that may contain dicts or strings."""
     return ', '.join(_extract_artist_names(artists))
 
+def _get_matching_engine():
+    engine = _matching_engine() if callable(_matching_engine) else _matching_engine
+    if engine is None:
+        from core.matching_engine import MusicMatchingEngine
+        return MusicMatchingEngine()
+    return engine
+
+
 def _get_discovery_cache_key(title, artist):
     """Normalize title/artist for discovery cache lookup using _matching_engine()."""
-    norm_title = _matching_engine().clean_title(title)
-    norm_artist = _matching_engine().clean_artist(_extract_artist_name(artist))
+    engine = _get_matching_engine()
+    norm_title = engine.clean_title(title)
+    norm_artist = engine.clean_artist(_extract_artist_name(artist))
     return (norm_title, norm_artist)
 
 
@@ -1827,7 +1987,8 @@ def _validate_discovery_cache_artist(source_artist, cached_match):
     """Check if a cached discovery match has a valid artist. Returns False if the
     cached result's artist doesn't match the source artist (stale/wrong cache entry)."""
     min_artist_similarity = 0.5
-    source_artist_cleaned = _matching_engine().clean_artist(source_artist)
+    engine = _get_matching_engine()
+    source_artist_cleaned = engine.clean_artist(source_artist)
     if not source_artist_cleaned:
         return True  # No source artist to validate against
 
@@ -1844,11 +2005,11 @@ def _validate_discovery_cache_artist(source_artist, cached_match):
             cand_artist = cand_artist.get('name', '')
             if not cand_artist:
                 continue
-        cand_normalized = _matching_engine().normalize_string(cand_artist)
+        cand_normalized = engine.normalize_string(cand_artist)
         if source_artist_cleaned in cand_normalized:
             return True
-        cand_cleaned = _matching_engine().clean_artist(cand_artist)
-        sim = _matching_engine().similarity_score(source_artist_cleaned, cand_cleaned)
+        cand_cleaned = engine.clean_artist(cand_artist)
+        sim = engine.similarity_score(source_artist_cleaned, cand_cleaned)
         if sim > best_sim:
             best_sim = sim
 
@@ -1882,6 +2043,7 @@ from core.discovery.endpoints import (
     update_playlist_phase as _update_playlist_phase_core,
     save_bubble_snapshot as _save_bubble_snapshot_core,
     playlist_name_attr_or_unknown as _pl_name_attr_or_unknown,
+    playlist_skipped_counts as _playlist_skipped_counts,
     playlist_name_strict as _pl_name_strict,
     playlist_name_safe as _pl_name_safe,
     playlist_name_obj as _pl_name_obj,
@@ -1959,12 +2121,11 @@ def _submit_sync_task(sync_playlist_id, playlist_name, spotify_tracks, playlist_
     Used by ALL per-source discovery syncs (Spotify-Public/Tidal/Deezer/Qobuz/
     YouTube/iTunes-link/ListenBrainz/Beatport). These have no per-request mode
     selector, so honor the configured default (Settings > Playlist sync mode) —
-    otherwise they always ran 'replace' regardless of the setting (#792)."""
-    from core.sync.playlist_edit import normalize_sync_mode
-    _mode = normalize_sync_mode(None, config_manager.get('playlist_sync.mode', 'reconcile'))
+    otherwise they always ran 'replace' regardless of the setting (#792).
+    No mode passed: _run_sync_task resolves the global one."""
     return sync_executor.submit(
         _run_sync_task, sync_playlist_id, playlist_name, spotify_tracks,
-        None, get_current_profile_id(), playlist_image_url, _mode,
+        None, get_current_profile_id(), playlist_image_url, None,
     )
 
 
@@ -5229,12 +5390,33 @@ def _build_sync_deps():
         record_sync_history_start=_record_sync_history_start,
         update_automation_progress=_update_automation_progress,
         update_and_save_sync_status=_update_and_save_sync_status,
+        invalidate_sync_fingerprint=_invalidate_sync_fingerprint,
         sync_states=sync_states,
         sync_lock=sync_lock,
         process_wishlist_automatically=_process_wishlist_automatically,
         run_playlist_organize_download=_run_playlist_organize_download,
         is_wishlist_actually_processing=is_wishlist_actually_processing,
     )
+
+
+def _mirror_behind_sync_id(playlist_id):
+    """The mirror row behind an auto_mirror_<id> sync id, or None (not a
+    mirror, or the lookup failed)."""
+    m = re.fullmatch(r'auto_mirror_(\d+)', str(playlist_id or ''))
+    if not m:
+        return None
+    try:
+        from database.music_database import get_database
+        return get_database().get_mirrored_playlist(int(m.group(1)))
+    except Exception as e:
+        logger.debug("mirror lookup for %s: %s", playlist_id, e)
+        return None
+
+
+def _mirror_own_sync_mode(playlist_id):
+    """The stored sync mode of the mirror behind an auto_mirror_<id> sync id,
+    or None (not a mirror, no mode of its own, or the lookup failed)."""
+    return (_mirror_behind_sync_id(playlist_id) or {}).get('sync_mode')
 
 
 def _run_sync_task(
@@ -5246,6 +5428,11 @@ def _run_sync_task(
     playlist_image_url='',
     sync_mode=None,
     skip_wishlist_add=False,
+    organize_by_playlist=False,
+    user_initiated=None,
+    is_request_list=False,
+    auto_remove_fulfilled=False,
+    **kwargs,
 ):
     # When a caller doesn't specify a mode — the mirrored auto-sync + Playlist
     # Pipeline (auto_sync_playlist), iTunes-link sync, Wing It — honor the user's
@@ -5255,9 +5442,9 @@ def _run_sync_task(
     # Append/Reconcile (#823 carlosjfcasero). The global default is now
     # 'reconcile' (#1289), so default users get the safer behavior; only users
     # who explicitly set a mode get something different. (Mirrors _submit_sync_task.)
-    if sync_mode is None:
-        from core.sync.playlist_edit import normalize_sync_mode
-        sync_mode = normalize_sync_mode(None, config_manager.get('playlist_sync.mode', 'reconcile'))
+    # a mode a mirror or pipeline stored itself (#1704) wins, junk means global
+    from core.sync.playlist_edit import resolve_sync_mode
+    sync_mode = resolve_sync_mode(sync_mode, config_manager.get('playlist_sync.mode', 'reconcile'))
     tracks_json, _quality_profile_id = _tracks_with_mirrored_quality_profile(
         playlist_id,
         playlist_name,
@@ -5269,6 +5456,10 @@ def _run_sync_task(
         _build_sync_deps(),
         sync_mode=sync_mode,
         skip_wishlist_add=skip_wishlist_add,
+        organize_by_playlist=organize_by_playlist,
+        user_initiated=user_initiated,
+        is_request_list=is_request_list,
+        auto_remove_fulfilled=auto_remove_fulfilled,
     )
 
 
@@ -5316,9 +5507,14 @@ def start_playlist_sync_from_payload(data):
     # Per-request sync_mode wins; otherwise use the configured default
     # (Settings > Playlist sync mode). Default 'reconcile' (#1289) preserves
     # server edits.
-    from core.sync.playlist_edit import normalize_sync_mode
-    sync_mode = normalize_sync_mode(data.get('sync_mode'),
-                                    config_manager.get('playlist_sync.mode', 'reconcile'))
+    # a mirror re-synced from history (auto_mirror_<id>, no mode sent) keeps
+    # its own mode, or an append-only mirror got reconciled (#1704)
+    from core.sync.playlist_edit import normalize_sync_mode, resolve_sync_mode
+    _global_mode = config_manager.get('playlist_sync.mode', 'reconcile')
+    if data.get('sync_mode'):
+        sync_mode = normalize_sync_mode(data.get('sync_mode'), _global_mode)
+    else:
+        sync_mode = resolve_sync_mode(_mirror_own_sync_mode(playlist_id), _global_mode)
 
     if not all([playlist_id, playlist_name, tracks_json]):
         return jsonify({"success": False, "error": "Missing playlist_id, name, or tracks."}), 400
@@ -5350,7 +5546,15 @@ def start_playlist_sync_from_payload(data):
         # Submit the task to the thread pool (capture profile_id while still in request context)
         _sync_profile_id = get_current_profile_id()
         thread_submit_time = time.time()
-        future = sync_executor.submit(_run_sync_task, playlist_id, playlist_name, tracks_json, None, _sync_profile_id, playlist_image_url, sync_mode)
+        # a request list re-synced from history or the dashboard is still a
+        # request list: no server playlist, same auto-remove setting
+        _mirror = _mirror_behind_sync_id(playlist_id) or {}
+        future = sync_executor.submit(
+            _run_sync_task, playlist_id, playlist_name, tracks_json, None, _sync_profile_id,
+            playlist_image_url, sync_mode,
+            is_request_list=bool(_mirror.get('is_request_list')),
+            auto_remove_fulfilled=bool(_mirror.get('auto_remove_fulfilled')),
+        )
         active_sync_workers[playlist_id] = future
         thread_submit_duration = (time.time() - thread_submit_time) * 1000
         logger.info(f"⏱️ [TIMING] Thread submitted at {time.strftime('%H:%M:%S')} (took {thread_submit_duration:.1f}ms)")
@@ -5366,6 +5570,12 @@ def get_sync_status(playlist_id):
     with sync_lock:
         state = sync_states.get(playlist_id)
         if not state:
+            # a page-load probe asking "is anything running?" gets a 200. idle
+            # is the normal answer, and a burst of 404s on every load trips
+            # crowdsec / fail2ban probing rules (#1763). pollers keep the 404,
+            # they give up on it.
+            if request.args.get('probe') == '1':
+                return jsonify({"status": "idle"})
             return jsonify({"status": "not_found"}), 404
 
         # If the task is finished but the state hasn't been updated, check the future
